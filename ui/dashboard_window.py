@@ -14,7 +14,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QScrollArea,
     QSizePolicy,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect,
+    QStackedWidget
 )
 
 from PyQt6.QtCore import (
