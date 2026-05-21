@@ -952,7 +952,6 @@ class DashboardWindw(AnimatedBackground):
         shap_layout.addWidget(shap_title)
 
         shap_layout.addSpacing(10)
-        #New comment for GIt
 
         shap_layout.addWidget(shap_text)
 
