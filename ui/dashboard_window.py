@@ -417,16 +417,26 @@ class DashboardWindw(AnimatedBackground):
         # MAIN LAYOUT
         #  =====================================
 
-        main_layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
 
         main_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0
+        )
+
+        main_layout.setSpacing(0)
+        
+        # Create horizontal layout for sidebar and content
+        content_h_layout = QHBoxLayout()
+        content_h_layout.setContentsMargins(
             20,
             20,
             20,
             20
         )
-
-        main_layout.setSpacing(20)
+        content_h_layout.setSpacing(20)
 
         #  =====================================
         # SIDEBAR
@@ -610,7 +620,17 @@ class DashboardWindw(AnimatedBackground):
 
         content_layout.setSpacing(20)
 
-        #HEADER
+        # =====================================
+        # FIXED HEADER PANEL (NOT SCROLLABLE)
+        # =====================================
+        
+        fixed_header_container = QFrame()
+        fixed_header_container.setObjectName("fixedHeaderContainer")
+        fixed_header_layout = QVBoxLayout()
+        fixed_header_layout.setContentsMargins(20, 20, 20, 20)
+        fixed_header_layout.setSpacing(20)
+        
+        # HEADER
 
         header_layout = QHBoxLayout()
 
@@ -634,15 +654,11 @@ class DashboardWindw(AnimatedBackground):
 
         header_layout.addLayout(header_text_layout)
         header_layout.addStretch()
-        content_layout.addLayout(header_layout)
         
         # Model Status
 
         model_card = QFrame()
         model_card.setObjectName("modelCard")
-
-
-
 
         model_layout = QHBoxLayout()
         model_layout.setContentsMargins(
@@ -696,6 +712,10 @@ class DashboardWindw(AnimatedBackground):
 
         header_layout.addStretch()
         header_layout.addWidget(model_card)
+        
+        # Add header layout to fixed container
+        fixed_header_layout.addLayout(header_layout)
+        fixed_header_container.setLayout(fixed_header_layout)
 
 
         # METRIC CARDS  
@@ -1243,9 +1263,23 @@ class DashboardWindw(AnimatedBackground):
         # =====================================
         # ADD TO MAIN LAYOUT
         # =====================================
-
-        main_layout.addWidget(self.sidebar)
-        main_layout.addWidget(scroll)
+        
+        # Create vertical layout for fixed header and scrollable content
+        right_side_layout = QVBoxLayout()
+        right_side_layout.setContentsMargins(20, 20, 20, 20)
+        right_side_layout.setSpacing(0)
+        
+        # Add fixed header
+        right_side_layout.addWidget(fixed_header_container)
+        
+        # Add scrollable content
+        right_side_layout.addWidget(scroll)
+        
+        # Add sidebar and right side to main layout
+        content_h_layout.addWidget(self.sidebar)
+        content_h_layout.addLayout(right_side_layout)
+        
+        main_layout.addLayout(content_h_layout)
 
         self.setLayout(main_layout)
 
