@@ -1,0 +1,22 @@
+# Python bytecode / cache (Compiled files)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments (Local dependencies)
+venv/
+.venv/
+env/
+ENV/
+
+# Development environments & IDEs
+.vscode/
+.idea/
+
+# Operating System junk files
+.DS_Store
+Thumbs.db
+
+# Local environment variables / secrets
+.env
