@@ -1,0 +1,802 @@
+
+           * {
+                font-family: 'Segoe UI';
+                color: white;
+            }
+            #sidebar, #contentArea {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 25px;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+            }
+            #pageShell {
+                background: transparent;
+                border: none;
+            }
+            #fixedHeaderContainer {
+                background: transparent;
+                border: none;
+            }
+            #adminCard {
+                background: transparent;
+                border: none;
+            }
+            #adminName {
+                font-size: 13px;
+                font-weight: 600;
+                color: white;
+            }
+            #adminRole {
+                font-size: 11px;
+                color: rgba(255, 255, 255, 0.55);
+            }
+            #sidebarScroll {
+                background: transparent;
+                border: none;
+            }
+            #sidebarNavContent {
+                background: transparent;
+            }
+            #sidebarScroll > QWidget > QWidget {
+                background: transparent;
+            }
+            #systemTitle {
+                font-size: 24px;
+                font-weight: bold;
+                color: white;
+            }
+            #subtitle {
+                font-size: 13px;
+                color: rgba(255,255,255,0.7);
+            }
+            #sectionLabel {
+                font-size: 11px;
+                color: rgba(255,255,255,0.5);
+                font-weight: bold;
+                margin-top: 10px;
+            }
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 5px 10px;
+                text-align: left;
+            }
+            #runButton {
+                background-color: #1A73E8; 
+                color: #FFFFFF;
+                font-family: 'Segoe UI';
+                font-size: 11px;
+                font-weight: 500;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 8px 15px;
+                text-align: left;
+            }
+            #runButton:hover {
+                background-color: #2980B9;
+            }
+            #runButton:checked {
+                background-color: #0E2F1A;
+                color: #2ECC71;
+                font-weight: bold;
+                border: 1px solid #2ECC71;
+            }               
+            #header {
+                font-size: 24px;
+                font-weight: bold;
+            }
+            #subHeader {
+                font-size: 14px;
+                color: rgba(255, 255, 255, 0.7);
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.15);
+            }
+            QPushButton:checked {
+                background-color: rgba(255, 255, 255, 0.25);
+                font-weight: bold;
+            }
+            #metricCard, #loadingCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                padding: 15px;
+                border-top: 4px solid #2ecc71;
+            }
+            #analyticsPanel {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                padding: 15px;
+                border-top: 4px solid #FFFF00;
+            }
+            #metricValue {
+                font-size: 20px;
+                font-weight: bold;
+            }
+            #cardTitle {
+                font-size: 16px;
+                font-weight: bold;
+            }
+            #factorItem {
+                font-size: 13px;
+                padding: 10px;
+                border-radius: 10px;
+                background-color: rgba(255,255,255,0.06);
+                margin-top: 4px;
+            }
+            #alertItem {
+                font-size: 13px;
+                padding: 10px;
+                border-radius: 10px;
+                background-color: rgba(255, 99, 71, 0.15);
+                margin-top: 4px;
+            }
+            #stackedWidget {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            #page {
+                background: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }                          
+                QScrollBar:vertical {
+                background: transparent;
+                width: 12px;
+                margin: 4px;
+            }
+
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.18);
+                border-radius: 6px;
+                min-height: 40px;
+            }
+
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255,255,255,0.32);
+            }
+
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            #coverageCard {
+                background-color: rgba(255,255,255,0.06);
+                border-radius: 24px;
+                border: 1px solid rgba(255,255,255,0.08);
+            }
+
+            #coverageTitle {
+                font-size: 15px;
+                font-weight: bold;
+                color: rgba(255,255,255,0.65);
+                letter-spacing: 1px;
+            }
+
+            #sourceHeader {
+                font-size: 14px;
+                font-weight: bold;
+                color: white;
+            }
+
+            #sourceStatus {
+                font-size: 13px;
+                color: rgba(255,255,255,0.55);
+            }
+
+            QProgressBar {
+                background-color: rgba(255,255,255,0.08);
+                border-radius: 6px;
+                height: 10px;
+                text-align: center;
+                border: none;
+            }
+
+            QProgressBar::chunk {
+                border-radius: 6px;
+            }
+
+            #greenProgress::chunk {
+                background-color: #34d399;
+            }
+
+            #orangeProgress::chunk {
+                background-color: #f59e0b;
+            }
+            #shapLabel {
+                font-size: 14px;
+                color: #d6deff;
+            }
+
+            #shapPercent {
+                font-size: 13px;
+                font-weight: bold;
+                color: #9fb3ff;
+            }
+
+
+/* ======================================================
+   Data Pipeline Styles
+====================================================== */
+
+            #pipelineModelCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }
+            #pipelineModelStatus {
+                color: #2ecc71;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            #pipelineSemesterPill {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 8px 14px;
+            }
+            #pipelineSectionTitle {
+                font-size: 18px;
+                font-weight: bold;
+                color: white;
+            }
+            #pipelineSectionDesc {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #pipelineRunBtn {
+                background-color: #1a73e8;
+                border: none;
+                border-radius: 8px;
+                color: white;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 10px 18px;
+            }
+            #pipelineRunBtn:hover {
+                background-color: #2980d9;
+            }
+            #pipelineCard {
+                background-color: rgba(0, 0, 0, 0.22);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+            }
+            #pipelineCardTitle {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 11px;
+                font-weight: bold;
+                letter-spacing: 1px;
+            }
+            #pipelineStage {
+                background-color: rgba(46, 204, 113, 0.12);
+                border: 1px solid rgba(46, 204, 113, 0.35);
+                border-radius: 8px;
+            }
+            #pipelineStageIcon {
+                font-size: 22px;
+            }
+            #pipelineStageLabel {
+                color: rgba(255, 255, 255, 0.75);
+                font-size: 11px;
+                font-weight: 600;
+            }
+            #pipelineStageArrow {
+                color: rgba(46, 204, 113, 0.6);
+                font-size: 18px;
+            }
+            #pipelineMetricLabel {
+                color: rgba(255, 255, 255, 0.65);
+                font-size: 12px;
+            }
+            #pipelineMetricValue {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #pipelineQualityFooter {
+                color: rgba(255, 255, 255, 0.55);
+                font-size: 12px;
+            }
+            #pipelineQualityScore {
+                color: #34d399;
+                font-weight: bold;
+            }
+            #pipelinePreviewMeta {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #pipelineFeatureBlue {
+                background-color: rgba(79, 140, 255, 0.08);
+                border: 1px solid rgba(79, 140, 255, 0.35);
+                border-radius: 14px;
+                color: #6eb5ff;
+                font-size: 11px;
+                padding: 6px 12px;
+            }
+            #pipelineFeatureGreen {
+                background-color: rgba(52, 211, 153, 0.08);
+                border: 1px solid rgba(52, 211, 153, 0.35);
+                border-radius: 14px;
+                color: #34d399;
+                font-size: 11px;
+                padding: 6px 12px;
+            }
+            #pipelineFeatureOrange {
+                background-color: rgba(245, 158, 11, 0.08);
+                border: 1px solid rgba(245, 158, 11, 0.35);
+                border-radius: 14px;
+                color: #f5b335;
+                font-size: 11px;
+                padding: 6px 12px;
+            }
+            #pipelineDownloadBtn {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.8);
+                font-size: 12px;
+                padding: 10px 16px;
+            }
+            #pipelineDownloadBtn:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            #pipelineLogTime {
+                color: rgba(255, 255, 255, 0.35);
+                font-size: 12px;
+                font-family: Consolas, 'Courier New', monospace;
+            }
+            #pipelineLogInfo {
+                color: rgba(255, 255, 255, 0.75);
+                font-size: 12px;
+                font-family: Consolas, 'Courier New', monospace;
+            }
+            #pipelineLogSuccess {
+                color: #34d399;
+                font-size: 12px;
+                font-family: Consolas, 'Courier New', monospace;
+            }
+            #pipelineLogWarning {
+                color: #f5b335;
+                font-size: 12px;
+                font-family: Consolas, 'Courier New', monospace;
+            }
+            #pipelineLogRow {
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            }
+
+/*====================================================            
+            MODEL TRAINING STYLING
+======================================================*/
+
+#trainModelCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }
+            #trainModelStatus {
+                color: #2ecc71;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            #trainSemesterPill {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 8px 14px;
+            }
+            #trainSectionTitle {
+                font-size: 18px;
+                font-weight: bold;
+                color: white;
+            }
+            #trainSectionDesc {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #trainModelBtn {
+                background-color: #1a73e8;
+                border: none;
+                border-radius: 8px;
+                color: white;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 10px 18px;
+            }
+            #trainModelBtn:hover {
+                background-color: #2980d9;
+            }
+            #trainStartBtn {
+                background-color: #1a73e8;
+                border: none;
+                border-radius: 8px;
+                color: white;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 12px;
+            }
+            #trainStartBtn:hover {
+                background-color: #2980d9;
+            }
+            #trainPanelCard {
+                background-color: rgba(0, 0, 0, 0.22);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+            }
+            #trainPanelCardSelected {
+                background-color: rgba(0, 0, 0, 0.22);
+                border: 2px solid #4f8cff;
+                border-radius: 14px;
+            }
+            #trainPanelTitle {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 11px;
+                font-weight: bold;
+                letter-spacing: 1px;
+            }
+            #mlModelName {
+                font-size: 15px;
+                font-weight: bold;
+                color: white;
+            }
+            #mlModelTags {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 11px;
+            }
+            #mlModelCheck {
+                color: #4f8cff;
+                font-size: 16px;
+                font-weight: bold;
+            }
+            #mlMetricCard {
+                background-color: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                border-radius: 10px;
+            }
+            #mlMetricValue {
+                font-size: 18px;
+                font-weight: bold;
+                color: white;
+            }
+            #mlMetricLabel {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 11px;
+            }
+            #trainConfigLabel {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 11px;
+            }
+            #trainConfigCombo {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 10px 12px;
+            }
+            #trainConfigCombo::drop-down {
+                border: none;
+                width: 24px;
+            }
+            #trainConfigCombo QAbstractItemView {
+                background-color: #1a1d24;
+                color: white;
+                selection-background-color: #2a3f6e;
+            }
+            #trainProgressTitle {
+                color: white;
+                font-size: 13px;
+            }
+            #trainLogMuted {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+                font-family: Consolas, 'Courier New', monospace;
+            }
+            #trainLogSuccess {
+                color: #34d399;
+                font-size: 12px;
+                font-weight: bold;
+                font-family: Consolas, 'Courier New', monospace;
+            }
+            #trainShapLabel {
+                color: rgba(255, 255, 255, 0.65);
+                font-size: 12px;
+            }
+            #trainShapPercent {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+
+/*====================================================            
+            RISK ALERTS STYLING
+======================================================*/
+
+#riskAlertBanner {
+                background-color: rgba(245, 158, 11, 0.08);
+                border: 1px solid rgba(245, 158, 11, 0.35);
+                border-radius: 10px;
+            }
+            #riskAlertBannerText {
+                color: #e8c97a;
+                font-size: 13px;
+            }
+            #riskAlertTab {
+                background: transparent;
+                border: none;
+                border-bottom: 2px solid transparent;
+                border-radius: 0;
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 13px;
+                padding: 10px 0px;
+                margin: 0px;
+                min-width: 150px;
+                max-width: none;
+                text-align: center;
+            }
+            #riskAlertTab:hover {
+                color: rgba(255, 255, 255, 0.75);
+                background: transparent;
+            }
+            #riskAlertTab:checked {
+                color: #4f8cff;
+                font-weight: 600;
+                border-bottom: 2px solid #4f8cff;
+                background: transparent;
+            }
+            #studentAlertCard {
+                background-color: rgba(0, 0, 0, 0.22);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }
+            #riskStatusDot {
+                color: #ff5b5b;
+                font-size: 10px;
+            }
+            #studentAlertName {
+                font-size: 15px;
+                font-weight: bold;
+                color: white;
+            }
+            #highRiskBadge {
+                background-color: rgba(255, 91, 91, 0.18);
+                color: #ff7b7b;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 3px 10px;
+                border-radius: 10px;
+            }
+            #studentAlertMeta {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #studentAlertFactor {
+                color: rgba(255, 255, 255, 0.55);
+                font-size: 12px;
+            }
+            #factorHighlight {
+                color: #6eb5ff;
+            }
+            #alertActionButton {
+                background-color: transparent;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.75);
+                font-size: 12px;
+                padding: 8px 16px;
+                min-width: 130px;
+                text-align: center;
+            }
+            #alertActionButton:hover {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-color: rgba(255, 255, 255, 0.28);
+            }
+            #semesterPill {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 8px 14px;
+            }
+            #modelCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }
+            #modelStatus {
+                color: #2ecc71;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            #modelSemester {
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 12px;
+            }
+
+/*====================================================            
+            Student COHORTS STYLING
+======================================================*/
+
+          #cohortModelCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }
+            #cohortModelStatus {
+                color: #2ecc71;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            #cohortSemesterPill {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 8px 14px;
+            }
+            #cohortExplorerTitle {
+                font-size: 18px;
+                font-weight: bold;
+                color: white;
+            }
+            #cohortExplorerMeta {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #cohortSearchInput {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 20px;
+                color: white;
+                font-size: 12px;
+                padding: 10px 16px 10px 36px;
+            }
+            #cohortSearchInput:focus {
+                border-color: rgba(79, 140, 255, 0.5);
+            }
+            #cohortFilterCombo {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 20px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 8px 14px;
+                min-width: 120px;
+            }
+            #cohortFilterCombo::drop-down {
+                border: none;
+                width: 24px;
+            }
+            #cohortFilterCombo QAbstractItemView {
+                background-color: #1a1d24;
+                color: white;
+                selection-background-color: #2a3f6e;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+            }
+            #cohortTableContainer {
+                background-color: rgba(0, 0, 0, 0.22);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+            }
+            #cohortTableHeader {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 10px;
+                font-weight: bold;
+                letter-spacing: 0.5px;
+            }
+            #cohortTableRow {
+                border-top: 1px solid rgba(255, 255, 255, 0.06);
+            }
+            #cohortTableRow:hover {
+                background-color: rgba(255, 255, 255, 0.03);
+            }
+            #cohortCellId {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #cohortCellName {
+                color: white;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            #cohortCellMuted {
+                color: rgba(255, 255, 255, 0.45);
+                font-size: 12px;
+            }
+            #cohortGwaRisk {
+                color: #ff6b6b;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            #cohortGwaGood {
+                color: #3fb950;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            #cohortAbsencesRisk {
+                color: #ff6b6b;
+                font-size: 13px;
+            }
+            #cohortRiskBadge {
+                background-color: rgba(255, 91, 91, 0.12);
+                border: 1px solid rgba(255, 91, 91, 0.2);
+                border-radius: 12px;
+                color: #ff7b7b;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 10px;
+            }
+            #cohortRiskBadgeModerate {
+                background-color: rgba(245, 179, 53, 0.12);
+                border: 1px solid rgba(245, 179, 53, 0.2);
+                border-radius: 12px;
+                color: #f5b335;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 10px;
+            }
+            #cohortRiskBadgeLow {
+                background-color: rgba(63, 185, 80, 0.12);
+                border: 1px solid rgba(63, 185, 80, 0.2);
+                border-radius: 12px;
+                color: #3fb950;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 10px;
+            }
+            #cohortViewButton {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 14px;
+                color: rgba(255, 255, 255, 0.8);
+                font-size: 11px;
+                padding: 6px 16px;
+            }
+            #cohortViewButton:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            #readinessCard {
+                background-color: rgba(0, 0, 0, 0.22);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+            }
+            #readinessSectionTitle {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 11px;
+                font-weight: bold;
+                letter-spacing: 1px;
+            }
+            #readinessSummaryLabel {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 12px;
+            }
+            #readinessPctLabel {
+                color: #4f8cff;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            #readinessPortalName {
+                color: rgba(255, 255, 255, 0.75);
+                font-size: 13px;
+                font-weight: 600;
+            }
+            #readinessPortalDetail {
+                color: rgba(255, 255, 255, 0.3);
+                font-size: 11px;
+            }
+            #readinessHintLabel {
+                color: rgba(255, 255, 255, 0.35);
+                font-size: 12px;
+            }

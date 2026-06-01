@@ -1,0 +1,91 @@
+project_prototype/
+│
+├── main.py
+│
+├── assets/
+│   ├── icons/
+│   ├── images/
+│   └── styles/
+│       └── theme.qss
+│
+├── ui/
+│   ├── dashboard_window_new.py
+│   │
+│   ├── components/
+│   │   ├── metric_card.py
+│   │   ├── chart_widgets.py
+│   │   └── loading_overlay.py
+│   │
+│   ├── dialogs/
+│   │   ├── upload_dialog.py
+│   │   ├── prediction_result_dialog.py
+│   │   └── confirmation_dialog.py
+│   │
+|   |
+|   |
+|   |___mixins/
+|   |   |----prediction_mixin.py
+|   |
+│   └── pages/
+│       ├── dashboard_page.py
+│       ├── data_pipeline_page.py
+│       ├── model_training_page.py
+│       ├── portal_upload_page.py
+│       ├── risk_alerts_page.py
+│       ├── student_cohorts_page.py
+│       └── student_profile_drawer.py
+│
+├── database/
+│   ├── connection.py
+│   ├── migrations/
+│   └── repositories/
+│       ├── student_repository.py
+│       ├── prediction_repository.py
+│       ├── upload_repository.py
+│
+├── models/
+│   ├── student.py
+│   ├── prediction.py
+│   ├── risk_factor.py
+│   └── intervention.py
+│
+├── services/
+│   ├── upload_service.py
+│   ├── preprocessing_service.py
+│   ├── prediction_service.py
+│   ├── shap_service.py
+│   ├── alert_service.py
+│   ├── cohort_service.py
+│   └── export_service.py
+│
+├── ml/
+│   ├── training/
+│   │   ├── train_model.py
+│   │   ├── evaluate_model.py
+│   │   └── feature_engineering.py
+│   │
+│   ├── saved_models/
+│   │   ├── random_forest.pkl
+│   │   ├── xgboost.pkl
+│   │   └── scaler.pkl
+│   │
+│   └── utils/
+│       ├── metrics.py
+│       └── shap_explainer.py
+│
+├── data/
+│   ├── raw/
+│   ├── processed/
+│   └── exports/
+│
+├── utils/
+│   ├── validators.py
+│   ├── file_helpers.py
+│   ├── constants.py
+│   ├── logger.py
+│   └── animations.py
+│
+└── tests/
+    ├── test_prediction.py
+    ├── test_uploads.py
+    └── test_database.py
