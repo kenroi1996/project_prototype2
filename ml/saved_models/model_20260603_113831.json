@@ -1,0 +1,87 @@
+{
+  "timestamp": "2026-06-03T11:38:31.437334",
+  "model_id": "rf",
+  "feature_names": [
+    "Student_ID",
+    "Program",
+    "College",
+    "SecCode",
+    "Year",
+    "Sex_code",
+    "Home_Address",
+    "Civil_Status",
+    "Entrance_Exam_Score",
+    "Family_Income",
+    "Parent_Highest_Education",
+    "HS_GPA",
+    "Year_Graduated",
+    "SHS_Strand",
+    "HS_Type",
+    "Graduation_Honors",
+    "HS_School",
+    "Year_Enrolled",
+    "Scholarship_Type",
+    "Birthdate",
+    "Final_Avg_GRD",
+    "Religion"
+  ],
+  "feature_count": 22,
+  "saved_at": "model_20260603_113831.pkl",
+  "model_type": "random_forest",
+  "test_size": 0.2,
+  "train_samples": 2688,
+  "test_samples": 672,
+  "accuracy": 1.0,
+  "cv_mean": 0.831,
+  "cv_std": 0.2064,
+  "classification_report": {
+    "high": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 224.0
+    },
+    "low": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 224.0
+    },
+    "medium": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 224.0
+    },
+    "accuracy": 1.0,
+    "macro avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 672.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 672.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      224,
+      0,
+      0
+    ],
+    [
+      0,
+      224,
+      0
+    ],
+    [
+      0,
+      0,
+      224
+    ]
+  ]
+}

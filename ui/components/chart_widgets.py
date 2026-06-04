@@ -35,8 +35,8 @@ class RiskDistributionChart(QChartView):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        series = self._build_series()
-        chart = self._build_chart(series)
+        self.series = self._build_series()
+        chart = self._build_chart(self.series)
 
         self.setChart(chart)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -77,6 +77,44 @@ class RiskDistributionChart(QChartView):
 
         return chart
 
+    def update_chart(self, high_risk: int, moderate_risk: int, low_risk: int) -> None:
+        """
+        Update the pie chart with new risk distribution data.
+
+        Parameters
+        ----------
+        high_risk : int
+            Count of high-risk students
+        moderate_risk : int
+            Count of moderate-risk students
+        low_risk : int
+            Count of low-risk students
+        """
+        # Clear existing series
+        self.chart().removeAllSeries()
+
+        # Create new series with updated data
+        series = QPieSeries()
+
+        high = series.append("High Risk", high_risk)
+        moderate = series.append("Moderate Risk", moderate_risk)
+        low = series.append("Low Risk", low_risk)
+
+        series.setHoleSize(0.40)
+
+        high.setColor(QColor("#ff5b5b"))
+        moderate.setColor(QColor("#f5b335"))
+        low.setColor(QColor("#34d399"))
+
+        for slice in series.slices():
+            slice.setBorderColor(QColor("transparent"))
+            slice.setLabelVisible(False)
+
+        self.chart().addSeries(series)
+        self.chart().legend().setVisible(True)
+        self.chart().legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        self.chart().legend().setLabelColor(QColor("#b8bcc8"))
+
 
 # =====================================
 # RISK ANALYTICS STACKED BAR CHART
@@ -88,6 +126,9 @@ class RiskAnalyticsChart(QChartView):
         super().__init__(parent)
 
         series, axis_x, axis_y = self._build_series()
+        self.series = series
+        self.axis_x = axis_x
+        self.axis_y = axis_y
         chart = self._build_chart(series, axis_x, axis_y)
 
         self.setChart(chart)
@@ -148,6 +189,90 @@ class RiskAnalyticsChart(QChartView):
         chart.legend().setFont(QFont("Segoe UI", 9))
 
         return chart
+
+    def update_chart(self, by_college: dict) -> None:
+        """
+        Update the bar chart with college-wise risk distribution.
+
+        Parameters
+        ----------
+        by_college : dict
+            College breakdown: {"COLLEGE": {"total": int, "high": int}, ...}
+        """
+        # Extract college names and calculate percentages
+        colleges = []
+        high_values = []
+        moderate_values = []
+
+        # Map college codes for display
+        college_order = ["CITE", "CBAA", "CTE", "COED", "CON", "CAS"]
+        college_names = {
+            "CITE": "CITE",
+            "CBAA": "CBAA",
+            "CTE": "CTE",
+            "COED": "COED",
+            "CON": "CON",
+            "CAS": "CAS",
+        }
+
+        for college in college_order:
+            colleges.append(college)
+            data = by_college.get(college, {"total": 0, "high": 0})
+            total = data.get("total", 1)
+            high = data.get("high", 0)
+            moderate = total - high
+
+            # Calculate percentages (scale to 0-120 range for visibility)
+            high_pct = (high / total * 100) if total > 0 else 0
+            mod_pct = (moderate / total * 100) if total > 0 else 0
+
+            high_values.append(max(high_pct, 5))  # Min 5 for visibility
+            moderate_values.append(max(mod_pct, 5))
+
+        # Clear existing series
+        self.chart().removeAllSeries()
+
+        # Create new series
+        set_high = QBarSet("High Risk")
+        set_moderate = QBarSet("Moderate Risk")
+
+        set_high.setColor(QColor("#C0392B"))
+        set_moderate.setColor(QColor("#D4AC0D"))
+
+        set_high.append(high_values)
+        set_moderate.append(moderate_values)
+
+        series = QStackedBarSeries()
+        series.append(set_high)
+        series.append(set_moderate)
+        series.setLabelsVisible(False)
+
+        # Clear and update axes
+        self.chart().removeAxis(self.axis_x)
+        self.chart().removeAxis(self.axis_y)
+
+        axis_x = QBarCategoryAxis()
+        axis_x.append(colleges)
+        axis_x.setLabelsColor(QColor("#85929E"))
+        axis_x.setLabelsFont(QFont("Segoe UI", 10))
+        axis_x.setGridLineColor(QColor("#2C3E50"))
+
+        axis_y = QValueAxis()
+        axis_y.setRange(0, 120)
+        axis_y.setTickCount(7)
+        axis_y.setLabelsColor(QColor("#85929E"))
+        axis_y.setLabelsFont(QFont("Segoe UI", 10))
+        axis_y.setGridLineColor(QColor("#1C2833"))
+
+        self.series = series
+        self.axis_x = axis_x
+        self.axis_y = axis_y
+
+        self.chart().addSeries(series)
+        self.chart().addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        self.chart().addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+        series.attachAxis(axis_x)
+        series.attachAxis(axis_y)
 
 
 # =====================================

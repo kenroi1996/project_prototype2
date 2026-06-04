@@ -211,15 +211,37 @@ class TrainingEngine:
 
         self.progress_cb("Saving model…", 95)
 
-        # Save model to DataStore
+        # Save model to disk via ModelRegistry
+        from services.model_registry import ModelRegistry
+        save_result = ModelRegistry.save_model(
+            model,
+            self.model_id,
+            feature_names,
+            metadata={
+                "accuracy": accuracy,
+                "f1_score": f1,
+                "precision": precision,
+                "recall": recall,
+                "train_size": len(X_train),
+                "test_size": len(X_test),
+                "n_folds": self.n_folds,
+            },
+        )
+
+        if save_result["success"]:
+            print(f"[TrainingEngine] Model saved to {save_result['path']}")
+        else:
+            print(f"[TrainingEngine] Failed to save model: {save_result.get('error')}")
+
+        # Save model to DataStore (via set_trained_model to trigger notify)
         from services.data_store import DataStore
-        DataStore.get().trained_model = {
+        DataStore.get().set_trained_model({
             "model":         model,
             "model_id":      self.model_id,
             "feature_names": feature_names,
             "headers":       self.headers,
             "target_col":    self.target_col,
-        }
+        })
 
         self.progress_cb("Done ✅", 100)
 

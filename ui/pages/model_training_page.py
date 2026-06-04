@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pandas as pd
 from PyQt6.QtWidgets import (
     QWidget,
     QLabel,
@@ -42,21 +43,19 @@ class TrainingWorker(QThread):
     finished = pyqtSignal(object)        # MLService with results
     error = pyqtSignal(str)
 
-    def __init__(self, model_type: str, target_col: str, test_size: float, 
+    def __init__(self, model_type: str, test_size: float,
                  n_folds: int = 5, parent=None):
         super().__init__(parent)
         self.model_type = model_type
-        self.target_col = target_col
         self.test_size = test_size
         self.n_folds = n_folds
 
     def run(self):
         try:
             store = DataStore.get()
-            
-            # Get unified dataset
+
+            # Get unified dataset; accept either DataFrame or {headers, rows} dict
             if store.unified_dataset is None:
-                # Try to build it
                 unified = store.build_unified_dataset()
                 if unified is None:
                     self.error.emit(
@@ -67,52 +66,66 @@ class TrainingWorker(QThread):
             else:
                 unified = store.unified_dataset
 
-            self.progress.emit("Preparing features...", 10)
+            if isinstance(unified, dict):
+                headers = unified.get("headers", [])
+                rows = unified.get("rows", [])
+                unified_df = pd.DataFrame(rows, columns=headers)
+            else:
+                unified_df = unified.copy()
 
-            # Prepare features using DataPipeline
+            if unified_df.empty:
+                self.error.emit("Unified dataset is empty. Merge or upload data first.")
+                return
+
+            # ── Step 1: Feature engineering ──────────────────────────────────
+            self.progress.emit("Defining risk labels from grades & scores...", 10)
+            from services.feature_engineering import (
+                run_full_feature_pipeline,
+                TARGET_COLUMN,
+            )
+            unified_df = run_full_feature_pipeline(unified_df)
+            target_col = TARGET_COLUMN   # always "risk_label"
+
+            # ── Step 2: DataPipeline preprocessing ───────────────────────────
             from services.preprocessing_service import DataPipeline
-            
-            # Save unified to temp CSV and reload through pipeline
-            temp_path = Path("outputs/_unified_temp.csv")
-            temp_path.parent.mkdir(parents=True, exist_ok=True)
-            unified.to_csv(temp_path, index=False)
 
-            # Run preprocessing pipeline
-            pipeline = DataPipeline(unified)
-            
+            pipeline = DataPipeline(unified_df)
+            pipeline._target_column = target_col   # guard before encode/scale
+
             self.progress.emit("Removing duplicates...", 20)
             pipeline.remove_duplicates()
-            
+
             self.progress.emit("Handling missing values...", 35)
             pipeline.fill_missing(strategy="auto")
-            
-            self.progress.emit("Encoding categorical...", 50)
-            pipeline.encode_categorical(drop_first=False)
-            
-            self.progress.emit("Scaling numerical...", 65)
-            pipeline.scale_numerical(method="standard")
-            
-            self.progress.emit("Generating risk labels...", 75)
-            pipeline.generate_risk_labels(target_col=self.target_col)
 
-            self.progress.emit("Preparing feature matrix...", 85)
-            X, y, feature_names = pipeline.prepare_features(target_col=self.target_col)
+            self.progress.emit("Encoding categorical features...", 50)
+            pipeline.encode_categorical(drop_first=False)
+
+            self.progress.emit("Scaling numerical features...", 65)
+            pipeline.scale_numerical(method="standard")
+
+            # ── Step 3: Build feature matrix ─────────────────────────────────
+            self.progress.emit("Preparing feature matrix...", 80)
+            X, y, feature_names = pipeline.prepare_features(target_col=target_col)
 
             self.progress.emit(f"Training {self.model_type}...", 90)
 
-            # Train model
+            # ── Step 4: Train ─────────────────────────────────────────────────
             ml_service = MLService()
             ml_service.feature_names = feature_names
-            
-            metrics = ml_service.train(
+            ml_service.train(
                 X, y,
                 model_type=self.model_type,
                 test_size=self.test_size,
             )
 
-            # Store in DataStore
+            # ── Step 5: Persist to DataStore ──────────────────────────────────
             store.set_trained_model(ml_service)
-            store.unified_dataset = pipeline.df  # Update with processed data
+            processed_headers = list(pipeline.df.columns)
+            processed_rows = pipeline.df.astype(str).fillna("").values.tolist()
+            store.set_unified_dataset(
+                {"headers": processed_headers, "rows": processed_rows}
+            )
 
             self.progress.emit("Training complete!", 100)
             self.finished.emit(ml_service)
@@ -495,7 +508,10 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         if store.unified_dataset is not None or store.ready_count() > 0:
             rows = 0
             if store.unified_dataset is not None:
-                rows = len(store.unified_dataset)
+                if isinstance(store.unified_dataset, dict):
+                    rows = len(store.unified_dataset.get("rows", []))
+                else:
+                    rows = len(store.unified_dataset)
             else:
                 for portal in store.portals.values():
                     if portal:
@@ -524,8 +540,8 @@ class ModelTrainingPage(PredictionMixin, QWidget):
     def _on_start_training(self):
         """Called when Start Training button is clicked."""
         store = DataStore.get()
-        
-        if store.ready_count() == 0:
+
+        if store.unified_dataset is None and store.ready_count() == 0:
             QMessageBox.warning(self, "No Data", "Upload data from at least one portal first.")
             return
 
@@ -535,9 +551,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         
         test_size = float(split_text.split("/")[1].strip().replace("%", "")) / 100
         n_folds = int(folds_text.split("-")[0].strip())
-        
-        target_col = "risk_label"  # Always auto-generated
-        
+
         model_config = self.MODEL_CONFIGS.get(self._selected_model_id, {})
         model_type = model_config.get("class", "random_forest")
 
@@ -555,7 +569,6 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         # Start worker
         self._training_worker = TrainingWorker(
             model_type=model_type,
-            target_col=target_col,
             test_size=test_size,
             n_folds=n_folds,
             parent=self,

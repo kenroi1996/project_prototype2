@@ -62,15 +62,18 @@ class DashboardPage(PredictionMixin, QWidget):
             result = DataStore.get().predictions
             if result and result.success:
                 self._apply_predictions(result)
+        if key in ("predictions", "last_prediction_run", "all"):
+            self._refresh_prediction_status()
 
     # ------------------------------------------------------------------
     # Prediction results → update UI
     # ------------------------------------------------------------------
 
     def _apply_predictions(self, result):
-        """Update dashboard metrics and alerts from real prediction results."""
+        """Update dashboard metrics and charts from real prediction results."""
         s = result.summary
 
+        # Update metric cards
         self._metric_1.update_values(
             value   = f"{s.avg_score}%",
             status  = "High Risk" if s.avg_score >= 70 else "Moderate Risk",
@@ -90,8 +93,82 @@ class DashboardPage(PredictionMixin, QWidget):
             ),
         )
 
+        # Update Risk Distribution Chart (donut chart)
+        self._risk_distribution_chart.update_chart(
+            high_risk=s.high_risk,
+            moderate_risk=s.moderate_risk,
+            low_risk=s.low_risk,
+        )
+
+        # Update Risk Analytics Chart (college breakdown bar chart)
+        self._risk_analytics_chart.update_chart(by_college=s.by_college)
+
+        # Update SHAP factors with actual data from predictions
+        self._update_shap_factors(result.predictions)
+
         # Refresh recent alerts panel with top 3 high-risk students
         self._refresh_alerts_panel(result.predictions[:3])
+
+    def _update_shap_factors(self, predictions: list) -> None:
+        """
+        Update SHAP factors display with aggregated feature importance from predictions.
+
+        Parameters
+        ----------
+        predictions : list
+            List of prediction results with shap_factors
+        """
+        # Clear existing factors
+        while self._shap_factors_layout.count():
+            item = self._shap_factors_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Aggregate SHAP values across all predictions
+        factor_scores = {}
+        for pred in predictions:
+            shap_factors = pred.get("shap_factors", [])
+            for factor_name, importance in shap_factors:
+                if factor_name not in factor_scores:
+                    factor_scores[factor_name] = []
+                factor_scores[factor_name].append(importance)
+
+        # Calculate average importance per factor
+        avg_factors = [
+            (name, round(sum(scores) / len(scores), 1))
+            for name, scores in factor_scores.items()
+        ]
+
+        # Sort by importance and take top 8
+        avg_factors.sort(key=lambda x: x[1], reverse=True)
+        top_factors = avg_factors[:8]
+
+        # Color mapping for risk factors
+        color_map = {
+            "GWA": "#ff5b5b",
+            "Absences": "#ff5b5b",
+            "Failed": "#f5b335",
+            "Referral": "#f5b335",
+            "attendance": "#4f8cff",
+            "Financial": "#4f8cff",
+            "Psych": "#4f8cff",
+        }
+
+        # Get color based on factor name
+        def get_color(factor_name: str) -> str:
+            for keyword, color in color_map.items():
+                if keyword.lower() in factor_name.lower():
+                    return color
+            return "#4f8cff"  # Default blue
+
+        # Display top factors
+        for factor_name, importance in top_factors:
+            color = get_color(factor_name)
+            self._shap_factors_layout.addWidget(
+                ShapFactor(factor_name, int(importance), color)
+            )
+
+        self._shap_factors_layout.addStretch()
 
     def _refresh_alerts_panel(self, top_predictions: list):
         """Clear and repopulate the Recent High-Risk Alerts panel."""
@@ -145,9 +222,12 @@ class DashboardPage(PredictionMixin, QWidget):
 
         subHeader = QLabel("AI-powered student risk monitoring overview")
         subHeader.setObjectName("subHeader")
+        self._last_run_lbl = QLabel("Last prediction run: Not yet run")
+        self._last_run_lbl.setObjectName("subHeader")
 
         header_text_layout.addWidget(header)
         header_text_layout.addWidget(subHeader)
+        header_text_layout.addWidget(self._last_run_lbl)
 
         header_layout.addLayout(header_text_layout)
         header_layout.addStretch()
@@ -238,8 +318,8 @@ class DashboardPage(PredictionMixin, QWidget):
         distribution_layout.addSpacing(10)
         distribution_layout.addWidget(distribution_text)
 
-        donut_chart = RiskDistributionChart()
-        distribution_layout.addWidget(donut_chart)
+        self._risk_distribution_chart = RiskDistributionChart()
+        distribution_layout.addWidget(self._risk_distribution_chart)
         distribution_layout.addStretch()
 
         risk_distribution_panel.setLayout(distribution_layout)
@@ -250,9 +330,9 @@ class DashboardPage(PredictionMixin, QWidget):
         risk_score_panel.setMinimumHeight(350)
 
         score_layout = QVBoxLayout()
-        chart_view = RiskAnalyticsChart()
+        self._risk_analytics_chart = RiskAnalyticsChart()
         risk_score_panel.setLayout(score_layout)
-        score_layout.addWidget(chart_view)
+        score_layout.addWidget(self._risk_analytics_chart)
 
         analytics_layout.addWidget(risk_distribution_panel)
         analytics_layout.addWidget(risk_score_panel)
@@ -287,20 +367,24 @@ class DashboardPage(PredictionMixin, QWidget):
         shap_layout.addSpacing(10)
         shap_layout.addWidget(shap_text)
         shap_layout.addSpacing(10)
-        shap_layout.addStretch()
 
-        factors = [
+        # Dynamic SHAP factors container (updated after prediction)
+        self._shap_factors_layout = QVBoxLayout()
+        
+        # Seed with default factors
+        default_factors = [
             ("GWA drop (sem 1)", 38, "#ff5b5b"),
             ("Absences > 20%",   22, "#ff5b5b"),
             ("No org membership",14, "#f5b335"),
             ("Working student",  11, "#f5b335"),
             ("Failed ≥ 2 subjects", 9, "#4f8cff"),
             ("Low psych score",   8, "#4f8cff"),
-            ("Financial aid lapse",7, "#4f8cff"),
-            ("Referral to guidance",6,"#4f8cff"),
         ]
-        for label, value, color in factors:
-            shap_layout.addWidget(ShapFactor(label, value, color))
+        for label, value, color in default_factors:
+            self._shap_factors_layout.addWidget(ShapFactor(label, value, color))
+
+        self._shap_factors_layout.addStretch()
+        shap_layout.addLayout(self._shap_factors_layout)
 
         shap_panel.setLayout(shap_layout)
 
@@ -415,6 +499,15 @@ class DashboardPage(PredictionMixin, QWidget):
 
         self.setLayout(self.main_layout)
         self.init_prediction()
+        self._refresh_prediction_status()
+
+    def _refresh_prediction_status(self):
+        """Show the latest successful prediction run time."""
+        last_run = DataStore.get().last_prediction_run
+        if last_run:
+            self._last_run_lbl.setText(f"Last prediction run: {last_run}")
+        else:
+            self._last_run_lbl.setText("Last prediction run: Not yet run")
 
     # ------------------------------------------------------------------
     # Metric cards builder — stores refs for live updates

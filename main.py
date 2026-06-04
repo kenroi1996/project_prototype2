@@ -19,5 +19,5 @@ if __name__ == "__main__":
     load_stylesheet(app)
 
     window = DashboardWindow()
-    window.show()
+    window.show()   
     sys.exit(app.exec())

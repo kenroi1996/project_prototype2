@@ -122,6 +122,17 @@ class DatabaseService:
         self.disconnect()
         return False
 
+    @staticmethod
+    def _parse_semester(semester: str | int) -> int:
+        if isinstance(semester, int):
+            return 1 if semester <= 1 else 2
+        sem = str(semester).strip().lower()
+        if sem.startswith("1"):
+            return 1
+        if sem.startswith("2"):
+            return 2
+        return 1
+
     def pull_data(self, portal_key: str, limit: Optional[int] = None,
                   where_clause: Optional[str] = None) -> Dict[str, Any]:
         """Pull data from source table into headers/rows format."""
@@ -315,27 +326,83 @@ class DatabaseService:
 
     def run_star_schema_etl(self, academic_year: str = "2024-2025",
                             semester: str = "1st") -> Dict[str, Any]:
-        """Run the populate_star_schema() PostgreSQL function."""
+        """
+        Record a merge/pipeline run in merge_log for schema v2.
+
+        The attached schema replaces older star-schema population functions
+        with a merge_log audit table and a rebuilt fact_student_risk table.
+        """
         if not self._conn:
             raise RuntimeError("Not connected to database")
 
         try:
+            sem = self._parse_semester(semester)
             with self._conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM public.mis_students")
+                mis_rows = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM public.guidance_student_profile")
+                guidance_rows = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM public.registrar_student_profile")
+                registrar_rows = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM public.sao_student_profile")
+                sao_rows = cur.fetchone()[0]
+                total_students = mis_rows
+
+                coverage_pct = 0.0
+                if total_students > 0:
+                    coverage_pct = round(
+                        (
+                            (guidance_rows + registrar_rows + sao_rows)
+                            / (3 * total_students)
+                        ) * 100,
+                        2,
+                    )
+
                 cur.execute(
-                    "SELECT * FROM public.populate_star_schema(%s, %s)",
-                    (academic_year, semester)
+                    """
+                    INSERT INTO public.merge_log (
+                        academic_year, semester, total_students,
+                        mis_rows, guidance_rows, registrar_rows, sao_rows,
+                        unmatched_guidance, unmatched_registrar, unmatched_sao,
+                        coverage_pct, model_type, accuracy, cv_mean, cv_std, notes
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING run_id
+                    """,
+                    (
+                        academic_year,
+                        sem,
+                        total_students,
+                        mis_rows,
+                        guidance_rows,
+                        registrar_rows,
+                        sao_rows,
+                        max(total_students - guidance_rows, 0),
+                        max(total_students - registrar_rows, 0),
+                        max(total_students - sao_rows, 0),
+                        coverage_pct,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "Run logged from portal ETL action",
+                    ),
                 )
-                result = cur.fetchone()
+                run_id = cur.fetchone()[0]
                 self._conn.commit()
 
                 return {
                     "success": True,
-                    "dim_students_upserted": result[0],
-                    "dim_programs_upserted": result[1],
-                    "dim_academic_upserted": result[2],
-                    "dim_background_upserted": result[3],
-                    "dim_support_upserted": result[4],
-                    "facts_inserted": result[5],
+                    "run_id": run_id,
+                    "academic_year": academic_year,
+                    "semester": sem,
+                    "total_students": total_students,
+                    "mis_rows": mis_rows,
+                    "guidance_rows": guidance_rows,
+                    "registrar_rows": registrar_rows,
+                    "sao_rows": sao_rows,
+                    "coverage_pct": coverage_pct,
+                    "facts_inserted": 0,
                 }
         except psycopg2.Error as e:
             self._conn.rollback()
@@ -347,12 +414,10 @@ class DatabaseService:
             raise RuntimeError("Not connected")
 
         tables = {
-            "dim_student": "public.dim_student",
+            "dim_risk_level": "public.dim_risk_level",
             "dim_program": "public.dim_program",
-            "dim_academic": "public.dim_academic",
-            "dim_background": "public.dim_background",
-            "dim_support": "public.dim_support",
             "fact_student_risk": "public.fact_student_risk",
+            "merge_log": "public.merge_log",
         }
 
         stats = {}
@@ -367,66 +432,14 @@ class DatabaseService:
         return stats
 
     def get_unified_features(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Query the unified_student_features view for ML training."""
+        """Query latest student-risk summary view (schema v2)."""
         if not self._conn:
             raise RuntimeError("Not connected")
 
-        query = "SELECT * FROM public.unified_student_features"
+        query = "SELECT * FROM public.v_student_risk_summary"
         if limit:
             query += f" LIMIT {limit}"
 
         with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query)
             return [dict(row) for row in cur.fetchall()]
-
-    def update_risk_predictions(self, predictions: List[Dict[str, Any]],
-                                academic_year: str = "2024-2025",
-                                semester: str = "1st") -> Dict[str, Any]:
-        """
-        Update fact_student_risk with ML model predictions.
-        predictions: list of dicts with keys: student_id, risk_score, risk_category,
-                     risk_label, top_factor, model_version
-        """
-        if not self._conn:
-            raise RuntimeError("Not connected")
-
-        updated = 0
-        errors = []
-
-        query = """
-            UPDATE public.fact_student_risk
-            SET    risk_score    = %s,
-                   risk_category = %s,
-                   risk_label    = %s,
-                   top_factor    = %s,
-                   model_version = %s,
-                   prediction_run_at = CURRENT_TIMESTAMP
-            WHERE  student_id    = %s
-              AND  academic_year = %s
-              AND  semester      = %s
-        """
-
-        with self._conn.cursor() as cur:
-            for pred in predictions:
-                try:
-                    cur.execute(query, (
-                        pred.get("risk_score"),
-                        pred.get("risk_category"),
-                        pred.get("risk_label"),
-                        pred.get("top_factor"),
-                        pred.get("model_version"),
-                        pred.get("student_id"),
-                        academic_year,
-                        semester,
-                    ))
-                    updated += cur.rowcount
-                except psycopg2.Error as e:
-                    errors.append(f"{pred.get('student_id')}: {e}")
-
-        self._conn.commit()
-
-        return {
-            "success": True,
-            "updated": updated,
-            "errors": errors,
-        }

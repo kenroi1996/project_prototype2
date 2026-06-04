@@ -30,13 +30,18 @@ class DataStore:
             "registrar": None,
         }
 
-        self.unified_dataset = None   # set after merge
+        self._original_unified_dataset = None  # preserves Student_ID and original columns
+        self.unified_dataset = None   # set after merge or training
         self.trained_model   = None   # set after training
         self.model_ready     = False
         self.predictions     = None
+        self.last_prediction_run = None
 
         # Callbacks: list of callables notified on any portal change
         self._listeners: list = []
+
+        # Auto-load latest model from disk on startup
+        self._load_persisted_model()
 
     # ------------------------------------------------------------------
     # Portal data management
@@ -67,13 +72,18 @@ class DataStore:
             self._notify(key)
 
     def set_unified_dataset(self, data) -> None:
-        """Store merged dataset (dict with headers/rows or DataFrame) and notify listeners."""
+        """Store merged dataset (dict with headers/rows or DataFrame) and notify listeners.
+        Preserves original with Student_ID if this is the initial merge."""
         self.unified_dataset = data
+        # Preserve original unified dataset if not already set (first time from merge)
+        if self._original_unified_dataset is None and data is not None:
+            self._original_unified_dataset = data
         self._notify("unified_dataset")
 
     def clear_unified_dataset(self):
         """Clear merged dataset after portal data changes or reset."""
         self.unified_dataset = None
+        self._original_unified_dataset = None
         self._notify("unified_dataset")
 
     def clear_all(self):
@@ -81,8 +91,29 @@ class DataStore:
         for key in self.portals:
             self.portals[key] = None
         self.unified_dataset = None
+        self._original_unified_dataset = None
         self.model_ready     = False
+        self.last_prediction_run = None
         self._notify("all")
+    
+    def get_prediction_dataset(self) -> dict:
+        """Get unified dataset for prediction (with Student_ID column preserved).
+        
+        Returns the original merged dataset (with Student_ID) if available,
+        otherwise falls back to the current unified_dataset.
+        """
+        if self._original_unified_dataset is not None:
+            return self._original_unified_dataset
+        return self.unified_dataset
+
+    def set_last_prediction_run(self, timestamp: str | None = None):
+        """Store latest successful prediction timestamp and notify listeners."""
+        self.last_prediction_run = (
+            timestamp
+            if timestamp is not None
+            else datetime.now().strftime("%b %d, %Y · %H:%M")
+        )
+        self._notify("last_prediction_run")
 
     # ------------------------------------------------------------------
     # Readiness checks
@@ -123,9 +154,79 @@ class DataStore:
     # ------------------------------------------------------------------
 
     def set_trained_model(self, model_service):
-        """Store trained ML model from pipeline."""
-        self.trained_model = model_service
+        """Store trained ML model in PredictionEngine-compatible format."""
+        if isinstance(model_service, dict):
+            self.trained_model = model_service
+        else:
+            # Accept MLService objects and convert to serializable model package
+            self.trained_model = {
+                "model": getattr(model_service, "model", None),
+                "feature_names": list(getattr(model_service, "feature_names", []) or []),
+                "target_classes": list(getattr(model_service, "target_classes", []) or []),
+                "training_history": dict(
+                    getattr(model_service, "training_history", {}) or {}
+                ),
+                "target_col": "risk_label",
+                "is_mock": False,
+            }
         self.model_ready = True
+        self._notify("trained_model")
+
+    def save_model_to_disk(self, model_id: str, metadata: dict = None) -> dict:
+        """
+        Save the current trained model to disk using ModelRegistry.
+
+        Parameters
+        ----------
+        model_id : str
+            Model type ('rf', 'xgb', 'lr')
+        metadata : dict, optional
+            Additional metadata (accuracy, precision, recall, etc.)
+
+        Returns
+        -------
+        dict
+            Save result: {"success": bool, "path": str, ...}
+        """
+        if not self.trained_model or "model" not in self.trained_model:
+            return {"success": False, "error": "No trained model in memory"}
+
+        from services.model_registry import ModelRegistry
+
+        feature_names = self.trained_model.get("feature_names", [])
+        model_obj = self.trained_model["model"]
+
+        # Merge with training history metadata
+        full_metadata = {
+            **(self.trained_model.get("training_history", {})),
+            **(metadata or {}),
+        }
+
+        return ModelRegistry.save_model(model_obj, model_id, feature_names, full_metadata)
+
+    def _load_persisted_model(self) -> None:
+        """
+        Load the latest trained model from disk on app startup.
+        Called automatically from __init__.
+        """
+        from services.model_registry import ModelRegistry
+
+        model_pkg = ModelRegistry.load_latest_model()
+        if model_pkg:
+            try:
+                self.trained_model = {
+                    "model": model_pkg["model"],
+                    "model_id": model_pkg["model_id"],
+                    "feature_names": model_pkg["feature_names"],
+                    "metadata": model_pkg["metadata"],
+                    "target_col": "risk_label",
+                }
+                self.model_ready = True
+                timestamp = model_pkg["metadata"].get("timestamp", "unknown")
+                print(f"[DataStore] Auto-loaded model from {timestamp}")
+            except Exception as e:
+                print(f"[DataStore] Failed to load persisted model: {e}")
+
 
     def build_unified_dataset(self) -> pd.DataFrame | None:
         """

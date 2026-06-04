@@ -15,17 +15,15 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QTextEdit,
 )
-from PyQt6.QtCore import QTimer, Qt, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
-from ui.components.loading_overlay import LoadingOverlay
-from ui.mixins.prediction_mixin import PredictionMixin
 from ui.dialogs.preview_dataset import DatasetPreviewDialog
 from ui.dialogs.clean_data_window import CleanDataWindow
+from ui.dialogs.portal_dataset_dialog import PortalDatasetDialog
 from services.data_store import DataStore
 from services.excel_service import read_excel_file, dataframe_to_rows, rows_to_dataframe
-from services.pipeline_service import PipelineOrchestrator
 from services.database_service import DatabaseService, PORTAL_SOURCE_CONFIGS
+from services.preprocessing_service import CleaningEngine, compute_issues
 
 
 PORTAL_CONFIGS = {
@@ -96,40 +94,7 @@ PORTAL_CONFIGS = {
 }
 
 
-class PipelineWorker(QThread):
-    """Background worker for the full ML pipeline."""
-    
-    step_started = pyqtSignal(str, str)
-    step_progress = pyqtSignal(int)
-    finished_success = pyqtSignal(dict)
-    finished_error = pyqtSignal(str)
-
-    def __init__(self, excel_path: str, required_cols: Optional[list] = None, parent=None):
-        super().__init__(parent)
-        self.excel_path = excel_path
-        self.required_cols = required_cols
-        self.orchestrator = PipelineOrchestrator()
-
-    def run(self):
-        try:
-            def on_step(step, msg):
-                self.step_started.emit(step, msg)
-
-            results = self.orchestrator.run(
-                excel_path=self.excel_path,
-                required_columns=self.required_cols,
-                target_column="risk_label",
-                risk_based_on=None,
-                model_type="random_forest",
-                save_path="outputs",
-                on_step=on_step
-            )
-            self.finished_success.emit(results)
-        except Exception as e:
-            self.finished_error.emit(str(e))
-
-
-class PortalUploadPage(PredictionMixin, QWidget):
+class PortalUploadPage(QWidget):
     """Data upload portal for office record uploads (MIS, SAO, Guidance, Registrar)."""
 
     # Total expected records across all portals (used for completeness calc)
@@ -140,8 +105,7 @@ class PortalUploadPage(PredictionMixin, QWidget):
         self._selected_file = None
         self._cleaned_headers = None
         self._cleaned_rows = None
-        self._pipeline_worker: Optional[PipelineWorker] = None
-        
+
         # Dynamic state
         self._upload_history = []  # List of (filename, meta, level, timestamp)
         self._last_updated = None
@@ -161,10 +125,6 @@ class PortalUploadPage(PredictionMixin, QWidget):
         if self._cleaned_rows is not None:
             return len(self._cleaned_rows)
         return 0
-
-    def _get_total(self):
-        """Get total expected records (global constant)."""
-        return self.EXPECTED_TOTAL
 
     def _get_total(self):
         """Get total expected records for THIS portal only."""
@@ -253,10 +213,11 @@ class PortalUploadPage(PredictionMixin, QWidget):
                 row_count = len(self._cleaned_rows) if self._cleaned_rows else 0
                 self.file_label.setText(f"✓  {name}  ·  {row_count:,} rows cleaned & saved")
                 self.file_label.setStyleSheet("color: #34d399; font-size: 12px;")
-                self._run_pipeline_btn.setEnabled(True)
-        
+                self._save_db_btn.setEnabled(True)
+
         self._refresh_stats_ui()
         self._refresh_history_ui()
+        self._update_dataset_action_buttons()
 
     def _refresh_stats_ui(self):
         """Update all stat widgets with current dynamic values."""
@@ -350,152 +311,269 @@ class PortalUploadPage(PredictionMixin, QWidget):
             row_layout.addWidget(status_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
             self._history_layout.addWidget(row)
 
-    # ── PIPELINE METHODS ────────────────────────────────────────
+    def _get_loaded_dataset(self) -> tuple[list, list] | None:
+        """Return (headers, rows) from memory or DataStore, or None if empty."""
+        if self._cleaned_headers and self._cleaned_rows is not None:
+            return (
+                list(self._cleaned_headers),
+                [list(r) for r in self._cleaned_rows],
+            )
+        portal_data = DataStore.get().get_portal(self._portal_key)
+        if portal_data and portal_data.get("headers") and portal_data.get("rows") is not None:
+            return (
+                list(portal_data["headers"]),
+                [list(r) for r in portal_data["rows"]],
+            )
+        return None
 
-    def _run_full_pipeline(self):
-        """Run the complete ML pipeline on the uploaded file."""
-        if not self._selected_file:
-            QMessageBox.warning(self, "No File", "Please upload and clean a file first.")
-            return
+    def _update_dataset_action_buttons(self):
+        has_data = self._get_loaded_dataset() is not None
+        self._view_dataset_btn.setEnabled(has_data)
+        self._edit_dataset_btn.setEnabled(has_data)
 
-        self._run_pipeline_btn.setEnabled(False)
-        self._progress_bar.setValue(0)
-        self._pipeline_log.clear()
-        self._pipeline_log.append("🚀 Starting full ML pipeline...")
-
-        required = self.config.get("fields")
-
-        self._pipeline_worker = PipelineWorker(self._selected_file, required, self)
-        self._pipeline_worker.step_started.connect(self._on_pipeline_step)
-        self._pipeline_worker.finished_success.connect(self._on_pipeline_success)
-        self._pipeline_worker.finished_error.connect(self._on_pipeline_error)
-        self._pipeline_worker.start()
-
-    def _on_pipeline_step(self, step: str, message: str):
-        self._pipeline_log.append(f"[{step}] {message}")
-        step_progress = {
-            "read_excel": 10, "validate": 20, "remove_duplicates": 30,
-            "handle_missing": 45, "encode_categorical": 60,
-            "scale_numerical": 75, "generate_labels": 85,
-            "prepare_features": 90, "train_model": 95, "save_outputs": 100,
-        }
-        self._progress_bar.setValue(step_progress.get(step, 0))
-
-    def _on_pipeline_success(self, results: dict):
-        self._progress_bar.setValue(100)
-        self._pipeline_log.append("✅ Pipeline completed successfully!")
-        
-        from services.data_store import DataStore
-        store = DataStore.get()
-        
-        ml_service = results.get("model")
-        if ml_service:
-            store.set_trained_model(ml_service)
-            self._pipeline_log.append("🧠 Model stored in DataStore")
-        
-        if store.ready_count() >= 1:
-            try:
-                unified = store.build_unified_dataset()
-                if unified is not None:
-                    self._pipeline_log.append(f"🔗 Unified dataset: {len(unified)} rows")
-            except Exception as e:
-                self._pipeline_log.append(f"⚠️ Unified build failed: {e}")
-        
-        metrics = results.get("training_metrics", {})
-        summary = results.get("pipeline_summary", {})
-        
-        msg = (
-            f"Pipeline Complete!\n\n"
-            f"Rows: {summary.get('original_rows', 'N/A')} → {summary.get('current_rows', 'N/A')}\n"
-            f"Model accuracy: {metrics.get('accuracy', 'N/A')}\n"
-            f"CV score: {metrics.get('cv_mean', 'N/A')} ± {metrics.get('cv_std', 'N/A')}\n\n"
-            f"{'🚀 Model ready for prediction!' if store.trained_model else '⚠️ No model'}\n"
-            f"Portals ready: {store.ready_count()}/4"
+    def _sync_dataset_state(self, headers: list, rows: list):
+        """Update in-memory state, DataStore, and portal UI labels."""
+        self._cleaned_headers = list(headers)
+        self._cleaned_rows = [list(r) for r in rows]
+        DataStore.get().set_portal(
+            self._portal_key,
+            self._cleaned_headers,
+            self._cleaned_rows,
         )
-        QMessageBox.information(self, "Pipeline Complete", msg)
-        
-        self._run_pipeline_btn.setEnabled(True)
+        row_count = len(self._cleaned_rows)
+        if self._selected_file:
+            name = self._selected_file.replace("\\", "/").split("/")[-1]
+            if name.startswith("database://"):
+                self.file_label.setText(f"✓  DB  ·  {row_count:,} rows")
+            else:
+                self.file_label.setText(
+                    f"✓  {name}  ·  {row_count:,} rows"
+                )
+        else:
+            self.file_label.setText(f"✓  {row_count:,} rows loaded")
+        self.file_label.setStyleSheet("color: #34d399; font-size: 12px;")
+        self._save_db_btn.setEnabled(True)
+        self._refresh_stats_ui()
+        self._update_dataset_action_buttons()
 
-    def _on_pipeline_error(self, error: str):
-        self._progress_bar.setValue(0)
-        self._pipeline_log.append(f"❌ ERROR: {error}")
-        QMessageBox.critical(self, "Pipeline Error", error)
-        self._run_pipeline_btn.setEnabled(True)
-
-
-    def _get_db_service(self):
-        db = DatabaseService(
-            host="localhost",
-            port=5432,
-            database="testDB",  # Your correct database name
-            user="postgres",
-            password="admin123"
+    def _push_dataset_to_database(self, headers: list, rows: list) -> bool:
+        """Upsert headers/rows to the portal PostgreSQL table. Returns success."""
+        self._pipeline_log.append(
+            f"💾 Saving {self._portal_key.upper()} to PostgreSQL..."
         )
-        # Debug: verify connection
-        with db:
-            with db._conn.cursor() as cur:
-                cur.execute("SELECT current_database()")
-                print(f"[DB] Connected to: {cur.fetchone()[0]}")
-                cur.execute("""
-                    SELECT table_name FROM information_schema.tables 
-                    WHERE table_schema = 'public' AND table_name = 'mis_students'
-                """)
-                result = cur.fetchone()
-                print(f"[DB] mis_students exists: {result is not None}")
-        return db
-
-    def _save_to_database(self):
-        if not self._cleaned_headers or not self._cleaned_rows:
-            QMessageBox.warning(self, "No Data", "Please clean and save a dataset first.")
-            return
-
-        # ── DEBUG ──
-        print(f"[DEBUG] Portal: {self._portal_key}")
-        print(f"[DEBUG] CSV Headers: {self._cleaned_headers}")
-        print(f"[DEBUG] First row: {self._cleaned_rows[0] if self._cleaned_rows else 'None'}")
-        config = PORTAL_SOURCE_CONFIGS.get(self._portal_key, {})
-        print(f"[DEBUG] Expected field_map: {config.get('field_map', {})}")
-        # ── END DEBUG ──
-
-        self._save_db_btn.setEnabled(False)
-
-
-        self._save_db_btn.setEnabled(False)
-        self._pipeline_log.append(f"💾 Saving {self._portal_key.upper()} to PostgreSQL...")
-
         try:
             with self._get_db_service() as db:
-                result = db.push_data(
-                    self._portal_key,
-                    self._cleaned_headers,
-                    self._cleaned_rows
-                )
+                result = db.push_data(self._portal_key, headers, rows)
 
                 if result["success"]:
                     self._pipeline_log.append(
-                        f"✅ Saved to {result['table']}: {result['inserted']}/{result['total']} rows"
+                        f"✅ Saved to {result['table']}: "
+                        f"{result['inserted']}/{result['total']} rows"
                     )
-                    if result["errors"]:
-                        self._pipeline_log.append(f"⚠️ {len(result['errors'])} errors")
-
+                    if result.get("errors"):
+                        self._pipeline_log.append(
+                            f"⚠️ {len(result['errors'])} row errors"
+                        )
                     stats = db.get_stats(self._portal_key)
                     self._pipeline_log.append(
                         f"📊 Total in {stats['table']}: {stats['total_records']}"
                     )
+                    return True
 
-                    QMessageBox.information(
-                        self,
-                        "Database Saved",
-                        f"Inserted {result['inserted']} rows into {result['table']}.\n"
-                        f"Total records: {stats['total_records']}"
-                    )
-                else:
-                    self._pipeline_log.append(f"❌ {result['error']}")
-                    QMessageBox.critical(self, "Error", result["error"])
-
+                self._pipeline_log.append(f"❌ {result['error']}")
+                QMessageBox.critical(self, "Database Error", result["error"])
+                return False
         except Exception as e:
             self._pipeline_log.append(f"❌ {e}")
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "Database Error", str(e))
+            return False
+
+    def _on_view_dataset(self):
+        data = self._get_loaded_dataset()
+        if not data:
+            QMessageBox.information(
+                self,
+                "No Dataset",
+                "Upload, pull from DB, or clean a file before viewing.",
+            )
+            return
+
+        headers, rows = data
+        PortalDatasetDialog(
+            portal_title=self.config["title"],
+            headers=headers,
+            rows=rows,
+            accent=self.config["accent"],
+            readonly=True,
+            parent=self,
+        ).exec()
+
+    def _on_edit_dataset(self):
+        data = self._get_loaded_dataset()
+        if not data:
+            QMessageBox.information(
+                self,
+                "No Dataset",
+                "Upload, pull from DB, or clean a file before editing.",
+            )
+            return
+
+        headers, rows = data
+        clean = CleanDataWindow(headers, rows, self.config, parent=self)
+        if not clean.exec():
+            return
+
+        new_headers = clean.cleaned_headers
+        new_rows = clean.cleaned_rows
+
+        reply = QMessageBox.question(
+            self,
+            "Save Changes",
+            (
+                f"Apply {len(new_rows):,} cleaned rows to this portal and "
+                "update PostgreSQL?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        processed_headers, processed_rows = self._preprocess_edited_dataset(
+            new_headers, new_rows
+        )
+        self._sync_dataset_state(processed_headers, processed_rows)
+        self._push_dataset_to_database(processed_headers, processed_rows)
+        QMessageBox.information(
+            self,
+            "Dataset Updated",
+            f"Saved {len(processed_rows):,} rows to memory and the database.",
+        )
+
+    def _preprocess_edited_dataset(
+        self, headers: list, rows: list
+    ) -> tuple[list, list]:
+        """
+        Route edited table values through preprocessing_service before save.
+
+        This keeps edit updates aligned with the same cleaning logic used
+        elsewhere in the app.
+        """
+        step_profiles = {
+            "mis": {
+                "mode_cols": ["PROGRAM", "COLLEGE", "SECCODE", "SEX_CODE"],
+                "mean_cols": ["YEAR", "FINAL_AVG_GRD"],
+                "required_cols": ["ID_NO"],
+            },
+            "sao": {
+                "mode_cols": [
+                    "SCHOLARSHIP_APPLICANT",
+                    "SCHOLARSHIP_TYPE",
+                    "GENDER",
+                    "MUNICIPALITY",
+                    "PROGRAM",
+                ],
+                "required_cols": ["STUDENT_ID"],
+            },
+            "guidance": {
+                "mode_cols": [
+                    "systemcode",
+                    "family_income_bracket",
+                    "parent_highest_education",
+                    "home_municipality",
+                    "program_code",
+                ],
+                "mean_cols": ["entrance_exam_score", "applicant_age"],
+                "required_cols": ["student_id"],
+            },
+            "registrar": {
+                "mode_cols": [
+                    "gender",
+                    "shs_strand",
+                    "hs_type",
+                    "graduation_honors",
+                    "municipality",
+                ],
+                "mean_cols": ["hs_gpa", "year_graduated", "year_enrolled"],
+                "required_cols": ["student_id"],
+            },
+        }
+
+        def _present(cols: list) -> list:
+            return [col for col in cols if col in headers]
+
+        profile = step_profiles.get(self._portal_key, {})
+        normalized_rows = [
+            ["" if cell is None else str(cell).strip() for cell in row]
+            for row in rows
+        ]
+        steps = [
+            {"op": "remove_empty_rows", "params": {}},
+            {"op": "remove_duplicates", "params": {}},
+        ]
+
+        for col in _present(profile.get("required_cols", [])):
+            steps.append(
+                {"op": "fill_missing_value", "params": {"col": col, "value": "UNKNOWN"}}
+            )
+
+        for col in _present(profile.get("mean_cols", [])):
+            steps.append({"op": "fill_missing_mean", "params": {"col": col}})
+
+        for col in _present(profile.get("mode_cols", [])):
+            steps.append({"op": "fill_missing_mode", "params": {"col": col}})
+
+        clean_headers, clean_rows = CleaningEngine.apply(
+            list(headers), normalized_rows, steps
+        )
+        issues = compute_issues(clean_headers, clean_rows)
+        self._pipeline_log.append(
+            f"🧹 Preprocessed edits: "
+            f"{issues['missing']} missing cells, "
+            f"{issues['duplicates']} duplicates, "
+            f"{issues['empty_rows']} empty rows."
+        )
+        self._pipeline_log.append(
+            "⚙️ Applied steps: "
+            + ", ".join(
+                [
+                    "remove_empty_rows",
+                    "remove_duplicates",
+                    f"fill_required={len(_present(profile.get('required_cols', [])))}",
+                    f"fill_mean={len(_present(profile.get('mean_cols', [])))}",
+                    f"fill_mode={len(_present(profile.get('mode_cols', [])))}",
+                ]
+            )
+        )
+        return clean_headers, clean_rows
+
+    def _get_db_service(self):
+        return DatabaseService(
+            host="localhost",
+            port=5432,
+            database="testDB",
+            user="postgres",
+            password="admin123",
+        )
+
+    def _save_to_database(self):
+        data = self._get_loaded_dataset()
+        if not data:
+            QMessageBox.warning(self, "No Data", "Please clean and save a dataset first.")
+            return
+
+        headers, rows = data
+        self._save_db_btn.setEnabled(False)
+        try:
+            if self._push_dataset_to_database(headers, rows):
+                with self._get_db_service() as db:
+                    stats = db.get_stats(self._portal_key)
+                QMessageBox.information(
+                    self,
+                    "Database Saved",
+                    f"Saved {len(rows):,} rows.\n"
+                    f"Total in table: {stats.get('total_records', '—')}",
+                )
         finally:
             self._save_db_btn.setEnabled(True)
 
@@ -534,9 +612,9 @@ class PortalUploadPage(PredictionMixin, QWidget):
                     row_count = len(self._cleaned_rows)
                     self.file_label.setText(f"✓  DB  ·  {row_count:,} rows")
                     self.file_label.setStyleSheet("color: #34d399; font-size: 12px;")
-                    self._run_pipeline_btn.setEnabled(True)
                     self._save_db_btn.setEnabled(True)
                     self._refresh_stats_ui()
+                    self._update_dataset_action_buttons()
 
                     self._pipeline_log.append(f"✅ Loaded {row_count:,} rows")
                 else:
@@ -558,13 +636,13 @@ class PortalUploadPage(PredictionMixin, QWidget):
 
                 if result["success"]:
                     msg = (
-                        f"Star Schema ETL Complete!\n\n"
-                        f"dim_student: {result['dim_students_upserted']}\n"
-                        f"dim_program: {result['dim_programs_upserted']}\n"
-                        f"dim_academic: {result['dim_academic_upserted']}\n"
-                        f"dim_background: {result['dim_background_upserted']}\n"
-                        f"dim_support: {result['dim_support_upserted']}\n"
-                        f"fact_student_risk: {result['facts_inserted']}"
+                        f"Merge Log Recorded!\n\n"
+                        f"run_id: {result.get('run_id', '—')}\n"
+                        f"academic_year: {result.get('academic_year', '—')}\n"
+                        f"semester: {result.get('semester', '—')}\n"
+                        f"total_students: {result.get('total_students', 0)}\n"
+                        f"coverage_pct: {result.get('coverage_pct', 0)}%\n"
+                        f"fact_student_risk updates: {result.get('facts_inserted', 0)}"
                     )
                     self._pipeline_log.append(msg.replace("\n", " | "))
                     QMessageBox.information(self, "ETL Complete", msg)
@@ -610,8 +688,9 @@ class PortalUploadPage(PredictionMixin, QWidget):
         self.file_label.setStyleSheet("color: rgba(255,255,255,0.35); font-size: 12px;")
 
         self._refresh_stats_ui()
-        self._run_pipeline_btn.setEnabled(False)
-        self._pull_db_btn.setEnabled(True)  # Pull stays enabled (can always fetch 
+        self._save_db_btn.setEnabled(False)
+        self._pull_db_btn.setEnabled(True)
+        self._update_dataset_action_buttons()
 
         print(f"[{self._portal_key}] Dataset cleared")
 
@@ -673,17 +752,12 @@ class PortalUploadPage(PredictionMixin, QWidget):
         self.file_label.setText(f"✓  {name}  ·  {row_count:,} rows cleaned & saved")
         self.file_label.setStyleSheet("color: #34d399; font-size: 12px;")
     
-        # Add to history
         self._add_history_entry(name, row_count, "success")
-        
-        # Enable pipeline button
-        self._run_pipeline_btn.setEnabled(True)
+
         self._save_db_btn.setEnabled(True)
-        self._pull_db_btn.setEnabled(True)  # Also enable pull
+        self._pull_db_btn.setEnabled(True)
+        self._update_dataset_action_buttons()
 
-
-
-        # Refresh all dynamic stats
         self._refresh_stats_ui()
     
         store = DataStore.get()
@@ -783,6 +857,39 @@ class PortalUploadPage(PredictionMixin, QWidget):
             }}
             #portalClearBtn:hover {{
                 background-color: rgba(255,91,91,0.18);
+            }}
+            #portalViewBtn {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                font-weight: 600;
+                padding: 8px 16px;
+            }}
+            #portalViewBtn:hover:enabled {{
+                background-color: rgba(255, 255, 255, 0.1);
+            }}
+            #portalViewBtn:disabled {{
+                color: rgba(255, 255, 255, 0.25);
+                border-color: rgba(255, 255, 255, 0.06);
+            }}
+            #portalEditBtn {{
+                background-color: rgba(79, 140, 255, 0.12);
+                border: 1px solid rgba(79, 140, 255, 0.35);
+                border-radius: 8px;
+                color: #6eb5ff;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 8px 16px;
+            }}
+            #portalEditBtn:hover:enabled {{
+                background-color: rgba(79, 140, 255, 0.22);
+            }}
+            #portalEditBtn:disabled {{
+                color: rgba(255, 255, 255, 0.25);
+                border-color: rgba(255, 255, 255, 0.06);
+                background-color: rgba(255, 255, 255, 0.03);
             }}
             #portalStatValue {{
                 font-size: 22px;
@@ -917,59 +1024,18 @@ class PortalUploadPage(PredictionMixin, QWidget):
         semester_pill = QLabel("1st Semester 2024–25  ▾")
         semester_pill.setObjectName("portalSemesterPill")
 
-        # --- Run Prediction button (existing) ---
-        run_button = QPushButton("Run Prediction")
-        run_button.setObjectName("runButton")
-        run_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        run_button.setIcon(QIcon("assets/icons/play.svg"))
-        run_button.clicked.connect(self.on_run_prediction)
-        run_button.setFixedWidth(130)
-
-        # --- NEW: Full Pipeline button ---
-        self._run_pipeline_btn = QPushButton("🚀 Run Pipeline")
-        self._run_pipeline_btn.setObjectName("runButton")
-        self._run_pipeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._run_pipeline_btn.clicked.connect(self._run_full_pipeline)
-        self._run_pipeline_btn.setFixedWidth(130)
-        self._run_pipeline_btn.setEnabled(False)
-
-        model_layout.addWidget(model_status)
-        model_layout.addWidget(semester_pill)
-        model_layout.addWidget(run_button)
-        model_layout.addWidget(self._run_pipeline_btn)
-
-        model_card.setLayout(model_layout)
-        header_layout.addWidget(model_card)
-
-
-        # --- NEW: Save to Database button ---
         self._save_db_btn = QPushButton("💾 Save to DB")
         self._save_db_btn.setObjectName("runButton")
         self._save_db_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_db_btn.clicked.connect(self._save_to_database)
         self._save_db_btn.setFixedWidth(130)
-        self._save_db_btn.setEnabled(False)  # Enable after cleaning
+        self._save_db_btn.setEnabled(False)
 
-        model_layout.addWidget(model_status)
-        model_layout.addWidget(semester_pill)
-        model_layout.addWidget(run_button)
-        model_layout.addWidget(self._run_pipeline_btn)
-        model_layout.addWidget(self._save_db_btn)  # Add here
-
-
-        # --- NEW: Pull from DB button ---
         self._pull_db_btn = QPushButton("📥 Pull from DB")
         self._pull_db_btn.setObjectName("runButton")
         self._pull_db_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._pull_db_btn.clicked.connect(self._pull_from_database)
         self._pull_db_btn.setFixedWidth(130)
-
-        model_layout.addWidget(model_status)
-        model_layout.addWidget(semester_pill)
-        model_layout.addWidget(run_button)
-        model_layout.addWidget(self._run_pipeline_btn)
-        model_layout.addWidget(self._save_db_btn)
-        model_layout.addWidget(self._pull_db_btn)  # Add here
 
         self._etl_btn = QPushButton("🔄 Run ETL")
         self._etl_btn.setObjectName("runButton")
@@ -979,14 +1045,12 @@ class PortalUploadPage(PredictionMixin, QWidget):
 
         model_layout.addWidget(model_status)
         model_layout.addWidget(semester_pill)
-        model_layout.addWidget(run_button)
-        model_layout.addWidget(self._run_pipeline_btn)
         model_layout.addWidget(self._save_db_btn)
         model_layout.addWidget(self._pull_db_btn)
         model_layout.addWidget(self._etl_btn)
 
-
-
+        model_card.setLayout(model_layout)
+        header_layout.addWidget(model_card)
 
         fixed_header_layout.addLayout(header_layout)
         self.fixed_header_container.setLayout(fixed_header_layout)
@@ -1131,12 +1195,26 @@ class PortalUploadPage(PredictionMixin, QWidget):
         browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         browse_btn.clicked.connect(self._browse_file)
 
+        self._view_dataset_btn = QPushButton("👁  View Dataset")
+        self._view_dataset_btn.setObjectName("portalViewBtn")
+        self._view_dataset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._view_dataset_btn.clicked.connect(self._on_view_dataset)
+        self._view_dataset_btn.setEnabled(False)
+
+        self._edit_dataset_btn = QPushButton("✎  Edit Dataset")
+        self._edit_dataset_btn.setObjectName("portalEditBtn")
+        self._edit_dataset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._edit_dataset_btn.clicked.connect(self._on_edit_dataset)
+        self._edit_dataset_btn.setEnabled(False)
+
         clear_btn = QPushButton("🗑  Clear Dataset")
         clear_btn.setObjectName("portalClearBtn")
         clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         clear_btn.clicked.connect(self._on_clear_dataset)
 
         btn_row.addWidget(browse_btn)
+        btn_row.addWidget(self._view_dataset_btn)
+        btn_row.addWidget(self._edit_dataset_btn)
         btn_row.addWidget(clear_btn)
         upload_layout.addLayout(btn_row)
 
@@ -1183,7 +1261,7 @@ class PortalUploadPage(PredictionMixin, QWidget):
         self.main_layout.addLayout(content_row)
 
         # =====================================
-        # PIPELINE PROGRESS & LOG
+        # ACTIVITY LOG (DB / upload actions)
         # =====================================
 
         pipeline_card = QFrame()
@@ -1192,33 +1270,13 @@ class PortalUploadPage(PredictionMixin, QWidget):
         pipeline_layout.setContentsMargins(24, 20, 24, 20)
         pipeline_layout.setSpacing(12)
 
-        pipeline_title = QLabel("ML PIPELINE")
+        pipeline_title = QLabel("ACTIVITY LOG")
         pipeline_title.setObjectName("portalCardTitle")
         pipeline_layout.addWidget(pipeline_title)
 
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        self._progress_bar.setTextVisible(True)
-        self._progress_bar.setFixedHeight(10)
-        self._progress_bar.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: rgba(255,255,255,0.08);
-                border-radius: 5px;
-                border: none;
-                color: white;
-                font-size: 11px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {cfg['accent']};
-                border-radius: 5px;
-            }}
-        """)
-        pipeline_layout.addWidget(self._progress_bar)
-
         self._pipeline_log = QTextEdit()
         self._pipeline_log.setReadOnly(True)
-        self._pipeline_log.setPlaceholderText("Pipeline logs will appear here...")
+        self._pipeline_log.setPlaceholderText("Upload and database actions will appear here...")
         self._pipeline_log.setMaximumHeight(150)
         self._pipeline_log.setStyleSheet("""
             QTextEdit {
@@ -1258,7 +1316,6 @@ class PortalUploadPage(PredictionMixin, QWidget):
         self.main_layout.addWidget(history_card)
         self.main_layout.addStretch()
         self.setLayout(self.main_layout)
-        self.init_prediction()
 
 
 class MisPortalPage(PortalUploadPage):

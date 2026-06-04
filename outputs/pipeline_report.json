@@ -1,170 +1,145 @@
 {
   "summary": {
     "original_rows": 3360,
-    "current_rows": 3360,
+    "current_rows": 2109,
     "columns": [
-      "Student_ID",
       "Program",
-      "College",
-      "SecCode",
-      "Year",
       "Sex_code",
-      "Home_Address",
-      "Civil_Status",
-      "Entrance_Exam_Score",
-      "Family_Income",
-      "Parent_Highest_Education",
-      "HS_GPA",
-      "Year_Graduated",
-      "SHS_Strand",
-      "HS_Type",
-      "Graduation_Honors",
-      "HS_School",
-      "Year_Enrolled",
-      "Scholarship_Applicant",
       "Scholarship_Type",
-      "Birthdate",
-      "Final_Avg_GRD",
-      "Religion",
-      "risk_label"
+      "risk_label",
+      "GPA_Tier",
+      "Has_College_Grade",
+      "Year_Level",
+      "Entrance_Exam_Tier",
+      "HS_Performance_Tier",
+      "Strand_Program_Match",
+      "Financial_Stress",
+      "First_Gen_Student",
+      "Has_Scholarship",
+      "Gap_Years",
+      "Private_HS",
+      "Has_HS_Honors",
+      "Age_At_Enrollment"
     ],
     "numeric_columns": [
-      "Student_ID",
       "Program",
-      "College",
-      "SecCode",
-      "Year",
       "Sex_code",
-      "Home_Address",
-      "Civil_Status",
-      "Entrance_Exam_Score",
-      "Family_Income",
-      "Parent_Highest_Education",
-      "HS_GPA",
-      "Year_Graduated",
-      "SHS_Strand",
-      "HS_Type",
-      "Graduation_Honors",
-      "HS_School",
-      "Year_Enrolled",
       "Scholarship_Type",
-      "Birthdate",
-      "Final_Avg_GRD",
-      "Religion"
+      "GPA_Tier",
+      "Has_College_Grade",
+      "Year_Level",
+      "Entrance_Exam_Tier",
+      "HS_Performance_Tier",
+      "Strand_Program_Match",
+      "Financial_Stress",
+      "First_Gen_Student",
+      "Has_Scholarship",
+      "Gap_Years",
+      "Private_HS",
+      "Has_HS_Honors",
+      "Age_At_Enrollment"
     ],
     "categorical_columns": [
       "risk_label"
     ],
     "missing_values": 0,
-    "memory_mb": 0.57
+    "memory_mb": 0.37
   },
   "training": {
     "model_type": "random_forest",
     "test_size": 0.2,
-    "train_samples": 2688,
-    "test_samples": 672,
+    "train_samples": 1687,
+    "test_samples": 422,
     "accuracy": 1.0,
-    "cv_mean": 0.8467,
-    "cv_std": 0.1845,
+    "cv_mean": 1.0,
+    "cv_std": 0.0,
     "classification_report": {
-      "high": {
+      "high_risk": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 224.0
+        "support": 30.0
       },
-      "low": {
+      "low_risk": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 224.0
+        "support": 357.0
       },
-      "medium": {
+      "moderate_risk": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 224.0
+        "support": 35.0
       },
       "accuracy": 1.0,
       "macro avg": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 672.0
+        "support": 422.0
       },
       "weighted avg": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 672.0
+        "support": 422.0
       }
     },
     "confusion_matrix": [
       [
-        224,
+        30,
         0,
         0
       ],
       [
         0,
-        224,
+        357,
         0
       ],
       [
         0,
         0,
-        224
+        35
       ]
     ]
   },
   "feature_importance": {
     "feature": {
-      "0": "Student_ID",
-      "17": "Year_Enrolled",
-      "12": "Year_Graduated",
-      "19": "Birthdate",
-      "4": "Year",
-      "1": "Program",
-      "3": "SecCode",
-      "2": "College",
-      "20": "Final_Avg_GRD",
-      "11": "HS_GPA",
-      "8": "Entrance_Exam_Score",
-      "13": "SHS_Strand",
-      "16": "HS_School",
-      "6": "Home_Address",
-      "9": "Family_Income",
-      "21": "Religion",
-      "10": "Parent_Highest_Education",
-      "5": "Sex_code",
-      "18": "Scholarship_Type",
-      "15": "Graduation_Honors",
-      "14": "HS_Type",
-      "7": "Civil_Status"
+      "3": "GPA_Tier",
+      "7": "HS_Performance_Tier",
+      "6": "Entrance_Exam_Tier",
+      "0": "Program",
+      "15": "Age_At_Enrollment",
+      "14": "Has_HS_Honors",
+      "10": "First_Gen_Student",
+      "11": "Has_Scholarship",
+      "8": "Strand_Program_Match",
+      "1": "Sex_code",
+      "13": "Private_HS",
+      "2": "Scholarship_Type",
+      "4": "Has_College_Grade",
+      "5": "Year_Level",
+      "9": "Financial_Stress",
+      "12": "Gap_Years"
     },
     "importance": {
-      "0": 0.41187099413879863,
-      "17": 0.19895313978929247,
-      "12": 0.19803501217822667,
-      "19": 0.054741399863483746,
-      "4": 0.04058008120380559,
-      "1": 0.031090983170011695,
-      "3": 0.027769787321188566,
-      "2": 0.00799323095995976,
-      "20": 0.004918776632213424,
-      "11": 0.004648165687238108,
-      "8": 0.0035724841441653284,
-      "13": 0.0030310035805304163,
-      "16": 0.0029278657942130573,
-      "6": 0.0020250616376773765,
-      "9": 0.001552153763137095,
-      "21": 0.0014396229104322042,
-      "10": 0.0013563458666191006,
-      "5": 0.0013002728818602798,
-      "18": 0.0006803498276876528,
-      "15": 0.0005831142301888681,
-      "14": 0.0005572358541632983,
-      "7": 0.00037291856510685614
+      "3": 0.8174313827878678,
+      "7": 0.04826547352292815,
+      "6": 0.03413959557148809,
+      "0": 0.022414004931289103,
+      "15": 0.019000063068513266,
+      "14": 0.017585557908964933,
+      "10": 0.008789063943899326,
+      "11": 0.008338622968857918,
+      "8": 0.008130095029007977,
+      "1": 0.006135160342224432,
+      "13": 0.005363590155843506,
+      "2": 0.0044073897691155935,
+      "4": 0.0,
+      "5": 0.0,
+      "9": 0.0,
+      "12": 0.0
     }
   }
 }

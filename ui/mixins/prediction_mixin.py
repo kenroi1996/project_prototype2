@@ -16,7 +16,7 @@ class _PredictionWorker(QThread):
             store  = DataStore.get()
             result = PredictionEngine.run(
                 model_data      = store.trained_model,
-                unified_dataset = store.unified_dataset,
+                unified_dataset = store.get_prediction_dataset(),
                 progress_cb     = lambda s, p: self.progress.emit(s, p),
             )
             self.finished.emit(result)
@@ -65,20 +65,25 @@ class PredictionMixin:
     def _prediction_confirmed(self):
         """Runs the real prediction engine."""
         from services.data_store import DataStore
-        from services.ml_service import MLService
-        from pathlib import Path
+        from services.model_registry import ModelRegistry
 
         store = DataStore.get()
 
         # ── Try to load model from disk if not in memory ──
         if not store.trained_model:
-            model_path = Path("outputs/trained_model.pkl")
-            if model_path.exists():
+            model_pkg = ModelRegistry.load_latest_model()
+            if model_pkg:
                 try:
-                    ml_service = MLService()
-                    ml_service.load_model(str(model_path))
-                    store.set_trained_model(ml_service)
-                    print("[PredictionMixin] Loaded model from outputs/trained_model.pkl")
+                    store.trained_model = {
+                        "model": model_pkg["model"],
+                        "model_id": model_pkg["model_id"],
+                        "feature_names": model_pkg["feature_names"],
+                        "metadata": model_pkg["metadata"],
+                        "target_col": "risk_label",
+                    }
+                    store.model_ready = True
+                    timestamp = model_pkg["metadata"].get("timestamp", "unknown")
+                    print(f"[PredictionMixin] Loaded model from disk: {timestamp}")
                 except Exception as e:
                     print(f"[PredictionMixin] Failed to load model: {e}")
 
@@ -115,11 +120,61 @@ class PredictionMixin:
 
     def _on_prediction_complete(self, result):
         from services.data_store import DataStore
+        from services.risk_persistence_service import RiskPersistenceService
+        from services.prediction_config import PredictionConfig
+        from database.connection import get_connection
         self.overlay.hide()
 
         if result.success:
-            DataStore.get().predictions = result
-            DataStore.get()._notify("predictions")
+            store = DataStore.get()
+            store.predictions = result
+            store.set_last_prediction_run()
+
+            # Resolve model_id from the stored model package (default "rf")
+            model_id = "rf"
+            if store.trained_model:
+                model_id = store.trained_model.get("model_id", "rf")
+
+            # Fetch the latest merge_log run_id to populate model_run_id
+            model_run_id = None
+            try:
+                conn = get_connection()
+                if conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT run_id FROM public.merge_log "
+                            "ORDER BY run_at DESC LIMIT 1"
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            model_run_id = row[0]
+                    conn.close()
+            except Exception as e:
+                print(f"[PredictionMixin] Could not fetch model_run_id: {e}")
+
+            # Save prediction results to fact_student_risk
+            persist_result = RiskPersistenceService.save_predictions(
+                result.predictions,
+                model_id=model_id,
+                academic_year=PredictionConfig.get_current_academic_year(),
+                semester=PredictionConfig.get_current_semester(),
+                model_run_id=model_run_id,
+            )
+
+            if persist_result.get("success"):
+                inserted = persist_result.get("inserted", 0)
+                updated  = persist_result.get("updated", 0)
+                print(
+                    f"[PredictionMixin] Persisted predictions: "
+                    f"{inserted} inserted, {updated} updated"
+                )
+            else:
+                print(
+                    f"[PredictionMixin] Failed to save predictions: "
+                    f"{persist_result.get('error')}"
+                )
+
+            store._notify("predictions")
             self._apply_predictions(result)
 
     def _on_prediction_complete_mock(self):

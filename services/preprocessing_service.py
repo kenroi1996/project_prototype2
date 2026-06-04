@@ -319,9 +319,14 @@ class DataPipeline:
         return self
 
     def encode_categorical(self, columns: Optional[list[str]] = None, drop_first: bool = False) -> "DataPipeline":
-        target_cols = columns if columns else self.df.select_dtypes(
-            include=["object", "category"]
-        ).columns.tolist()
+        # Build candidate list — always exclude the target column
+        if columns:
+            target_cols = [c for c in columns if c != self._target_column]
+        else:
+            target_cols = [
+                c for c in self.df.select_dtypes(include=["object", "category"]).columns
+                if c != self._target_column
+            ]
 
         for col in target_cols:
             if col not in self.df.columns:
@@ -344,9 +349,14 @@ class DataPipeline:
         return self
 
     def scale_numerical(self, method: str = "standard", columns: Optional[list[str]] = None) -> "DataPipeline":
-        target_cols = columns if columns else self.df.select_dtypes(
-            include=[np.number]
-        ).columns.tolist()
+        # Build candidate list — always exclude the target column
+        if columns:
+            target_cols = [c for c in columns if c != self._target_column]
+        else:
+            target_cols = [
+                c for c in self.df.select_dtypes(include=[np.number]).columns
+                if c != self._target_column
+            ]
 
         target_cols = [c for c in target_cols if c in self.df.columns]
 

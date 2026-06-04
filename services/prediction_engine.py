@@ -161,28 +161,97 @@ class PredictionEngine:
         col_idx    = {h: i for i, h in enumerate(headers)}
         feat_idxs  = [col_idx.get(f) for f in feature_names]
 
-        # Student ID column
+        # Student ID column - try multiple possible names
+        student_id_keywords = [
+            "student_id", "id_no", "id", "keyid", "systemcode", 
+            "student code", "studentid"
+        ]
         id_col = next(
-            (c for c in headers if c.lower() in
-             ("student_id", "id_no", "keyid", "systemcode")),
-            headers[0]
+            (c for c in headers if c.lower() in student_id_keywords),
+            None
         )
+        
+        if not id_col:
+            # If still not found, look for any column with "id" or "code" in name
+            id_col = next(
+                (c for c in headers if "id" in c.lower() or "code" in c.lower()),
+                headers[0]  # Last resort
+            )
+        
         id_idx = col_idx.get(id_col, 0)
 
-        # Name / meta columns (best-effort)
-        name_idx    = col_idx.get("firstname") or col_idx.get("name")
-        lname_idx   = col_idx.get("lastname")
-        program_idx = col_idx.get("Program") or col_idx.get("PROGRAM") or col_idx.get("program_code")
-        college_idx = col_idx.get("College") or col_idx.get("COLLEGE")
-        gwa_idx     = col_idx.get("Final_Avg_GRD") or col_idx.get("FINAL_AVG_GRD")
-        abs_idx     = col_idx.get("Attendance_Rate") or col_idx.get("absences")
+        # Name / meta columns (best-effort) — use explicit None check to avoid
+        # treating column index 0 as falsy
+        def _idx(*keys):
+            """Return the first column index found for any of the given keys."""
+            for k in keys:
+                v = col_idx.get(k)
+                if v is not None:
+                    return v
+            return None
+
+        # MergeEngine produces UNIFIED_COLUMNS names (e.g. "Student_ID", "Sex_code",
+        # "SecCode"). The lookups below cover both unified names and raw portal names
+        # so the engine works whether the dataset came from MergeEngine or a raw upload.
+        name_idx    = _idx("firstname", "first_name", "First_Name")
+        lname_idx   = _idx("lastname", "last_name", "Last_Name")
+        program_idx = _idx("Program", "program", "PROGRAM", "program_code")
+        college_idx = _idx("College", "college", "COLLEGE")
+        gwa_idx     = _idx("Final_Avg_GRD", "final_avg_grd", "FINAL_AVG_GRD")
+        abs_idx     = _idx("Attendance_Rate", "absences")
+
+        # Extra fields for fact_student_risk — unified names first, raw names as fallback
+        seccode_idx      = _idx("SecCode",                  "seccode",                  "SECCODE",                  "sec_code")
+        year_idx         = _idx("Year",                     "year",                     "YEAR",                     "year_level")
+        sex_idx          = _idx("Sex_code",                 "sex_code",                 "SEX_CODE",                 "gender",   "GENDER")
+        address_idx      = _idx("Home_Address",             "home_address",             "HOME_ADDRESS",             "municipality", "MUNICIPALITY")
+        civil_idx        = _idx("Civil_Status",             "civil_status",             "CIVIL_STATUS")
+        birthdate_idx    = _idx("Birthdate",                "birthdate",                "BIRTHDATE")
+        yr_enrolled_idx  = _idx("Year_Enrolled",            "year_enrolled",            "YEAR_ENROLLED")
+        exam_score_idx   = _idx("Entrance_Exam_Score",      "entrance_exam_score",      "ENTRANCE_EXAM_SCORE")
+        income_idx       = _idx("Family_Income",            "family_income_bracket",    "family_income",            "FAMILY_INCOME")
+        parent_edu_idx   = _idx("Parent_Highest_Education", "parent_highest_education", "PARENT_HIGHEST_EDUCATION")
+        hs_gpa_idx       = _idx("HS_GPA",                   "hs_gpa",                   "HS_GPA")
+        yr_grad_idx      = _idx("Year_Graduated",           "year_graduated",           "YEAR_GRADUATED")
+        strand_idx       = _idx("SHS_Strand",               "shs_strand",               "SHS_STRAND")
+        hs_type_idx      = _idx("HS_Type",                  "hs_type",                  "HS_TYPE")
+        honors_idx       = _idx("Graduation_Honors",        "graduation_honors",        "GRADUATION_HONORS")
+        hs_school_idx    = _idx("HS_School",                "hs_school",                "HS_SCHOOL",                "hs_school_name")
+        scholar_idx      = _idx("Scholarship_Applicant",    "scholarship_applicant",    "SCHOLARSHIP_APPLICANT")
+        scholar_type_idx = _idx("Scholarship_Type",         "scholarship_type",         "SCHOLARSHIP_TYPE")
 
         X            = []
         student_ids  = []
         student_meta = []
 
+        def _cell(row, idx):
+            """Safely retrieve and strip a cell value; returns '' if missing."""
+            if idx is not None and idx < len(row):
+                return str(row[idx]).strip()
+            return ""
+
+        # Debug: log which unified columns were resolved (printed once)
+        _resolved = {
+            "program": program_idx, "college": college_idx,
+            "gwa": gwa_idx, "sec_code": seccode_idx, "year_level": year_idx,
+            "sex_code": sex_idx, "home_address": address_idx,
+            "civil_status": civil_idx, "birthdate": birthdate_idx,
+            "year_enrolled": yr_enrolled_idx, "entrance_exam_score": exam_score_idx,
+            "family_income": income_idx, "parent_edu": parent_edu_idx,
+            "hs_gpa": hs_gpa_idx, "year_graduated": yr_grad_idx,
+            "shs_strand": strand_idx, "hs_type": hs_type_idx,
+            "honors": honors_idx, "hs_school": hs_school_idx,
+            "scholarship": scholar_idx, "scholarship_type": scholar_type_idx,
+        }
+        _missing = [k for k, v in _resolved.items() if v is None]
+        _found   = [k for k, v in _resolved.items() if v is not None]
+        print(f"[PredictionEngine] Resolved {len(_found)}/{len(_resolved)} meta columns")
+        if _missing:
+            print(f"[PredictionEngine] NULL columns (not found in headers): {_missing}")
+            print(f"[PredictionEngine] Available headers: {headers[:30]}")
+
         for row in rows:
-            sid = row[id_idx].strip() if id_idx < len(row) else ""
+            sid = _cell(row, id_idx)
             if not sid:
                 continue
 
@@ -200,23 +269,37 @@ class PredictionEngine:
             X.append(feature_row)
             student_ids.append(sid)
 
-            # Build name
-            fname = (row[name_idx].strip()
-                     if name_idx is not None and name_idx < len(row) else "")
-            lname = (row[lname_idx].strip()
-                     if lname_idx is not None and lname_idx < len(row) else "")
+            fname = _cell(row, name_idx)
+            lname = _cell(row, lname_idx)
             name  = f"{fname} {lname}".strip() or sid
 
             student_meta.append({
+                # Display fields
                 "name":    name,
-                "program": (row[program_idx].strip()
-                            if program_idx is not None and program_idx < len(row) else "—"),
-                "college": (row[college_idx].strip()
-                            if college_idx is not None and college_idx < len(row) else "—"),
-                "gwa":     (row[gwa_idx].strip()
-                            if gwa_idx is not None and gwa_idx < len(row) else "—"),
-                "absences":(row[abs_idx].strip()
-                            if abs_idx is not None and abs_idx < len(row) else "—"),
+                "program": _cell(row, program_idx) or "—",
+                "college": _cell(row, college_idx) or "—",
+                "gwa":     _cell(row, gwa_idx)     or "—",
+                "absences":_cell(row, abs_idx)     or "—",
+                # fact_student_risk feature fields — keys must match
+                # what risk_persistence_service._upsert_one() reads
+                "sec_code":                  _cell(row, seccode_idx),
+                "year_level":                _cell(row, year_idx),
+                "sex_code":                  _cell(row, sex_idx),
+                "home_address":              _cell(row, address_idx),
+                "civil_status":              _cell(row, civil_idx),
+                "birthdate":                 _cell(row, birthdate_idx),
+                "year_enrolled":             _cell(row, yr_enrolled_idx),
+                "entrance_exam_score":       _cell(row, exam_score_idx),
+                "family_income":             _cell(row, income_idx),
+                "parent_highest_education":  _cell(row, parent_edu_idx),
+                "hs_gpa":                    _cell(row, hs_gpa_idx),
+                "year_graduated":            _cell(row, yr_grad_idx),
+                "shs_strand":                _cell(row, strand_idx),
+                "hs_type":                   _cell(row, hs_type_idx),
+                "graduation_honors":         _cell(row, honors_idx),
+                "hs_school_name":            _cell(row, hs_school_idx),
+                "scholarship_applicant":     _cell(row, scholar_idx),
+                "scholarship_type":          _cell(row, scholar_type_idx),
             })
 
         return X, student_ids, student_meta

@@ -1,6 +1,6 @@
 """
 End-to-end pipeline orchestrator.
-Coordinates: Excel → Clean → Features → Model
+Coordinates: Unified CSV → Feature Engineering → Clean → Train
 """
 
 import json
@@ -12,13 +12,18 @@ import pandas as pd
 from .excel_service import read_excel_file, rows_to_dataframe
 from .preprocessing_service import DataPipeline
 from .ml_service import MLService
+from .feature_engineering import (
+    run_full_feature_pipeline,
+    TARGET_COLUMN,
+    FINAL_FEATURES,
+)
 
 
 class PipelineOrchestrator:
     STEP_NAMES = [
-        "read_excel", "validate", "remove_duplicates", "handle_missing",
-        "encode_categorical", "scale_numerical", "generate_labels",
-        "prepare_features", "train_model", "save_outputs",
+        "read_excel", "validate", "define_target", "engineer_features",
+        "remove_duplicates", "handle_missing", "encode_categorical",
+        "scale_numerical", "prepare_features", "train_model", "save_outputs",
     ]
 
     def __init__(self):
@@ -37,7 +42,7 @@ class PipelineOrchestrator:
     def run(self,
             excel_path: str | Path,
             required_columns: Optional[list[str]] = None,
-            target_column: str = "risk_label",
+            target_column: str = TARGET_COLUMN,
             risk_based_on: Optional[str] = None,
             risk_rules: Optional[dict] = None,
             model_type: str = "random_forest",
@@ -48,103 +53,111 @@ class PipelineOrchestrator:
             if on_step:
                 on_step(step, msg)
 
-        # Step 1: Read Excel
+        # ── Step 1: Read unified CSV ──────────────────────────────────────────
         notify("read_excel", f"Reading {Path(excel_path).name}...")
         df = read_excel_file(excel_path)
-        self.pipeline = DataPipeline(df)
-        notify("read_excel", f"Loaded {len(df)} rows, {len(df.columns)} columns")
+        notify("read_excel", f"Loaded {len(df):,} rows · {len(df.columns)} columns")
 
-        # Step 2: Validate
+        # ── Step 2: Validate (non-blocking — just report) ─────────────────────
         notify("validate", "Validating columns...")
         self._check_cancelled()
-        validation = self.pipeline.validate_columns(required_columns)
-        if not validation["valid"]:
-            raise ValueError(f"Validation failed: {validation['info']}")
-        notify("validate", validation["info"])
+        if df.empty:
+            raise ValueError("Dataset is empty after loading.")
+        notify("validate", f"{len(df):,} rows · {len(df.columns)} columns present")
 
-        # Step 3: Remove Duplicates
+        # ── Step 3: Define target & engineer features ─────────────────────────
+        notify("define_target", "Defining risk labels from grades & exam scores...")
+        self._check_cancelled()
+        notify("engineer_features", "Engineering features (GPA tier, strand match, ...)...")
+        self._check_cancelled()
+        df = run_full_feature_pipeline(df)
+        notify(
+            "engineer_features",
+            f"Features ready: {len(df.columns) - 1} inputs + '{TARGET_COLUMN}' target "
+            f"· {len(df):,} rows",
+        )
+
+        # Snapshot the engineered DataFrame BEFORE scaling so the viewer
+        # shows human-readable values (0/1 flags, integer tiers, etc.)
+        engineered_headers = list(df.columns)
+        engineered_rows    = df.astype(str).fillna("").values.tolist()
+
+        # ── Step 4–7: DataPipeline (dedup / fill / encode / scale) ───────────
+        self.pipeline = DataPipeline(df)
+        self.pipeline._target_column = target_column   # guard before encode/scale
+
         notify("remove_duplicates", "Removing duplicate rows...")
         self._check_cancelled()
         before = len(self.pipeline.df)
         self.pipeline.remove_duplicates()
-        removed = before - len(self.pipeline.df)
-        notify("remove_duplicates", f"Removed {removed} duplicate rows")
+        notify("remove_duplicates", f"Removed {before - len(self.pipeline.df)} duplicates")
 
-        # Step 4: Handle Missing
-        notify("handle_missing", "Filling missing values...")
+        notify("handle_missing", "Filling remaining missing values...")
         self._check_cancelled()
         self.pipeline.fill_missing(strategy="auto")
         notify("handle_missing", "Missing values handled")
 
-        # Step 5: Encode Categorical
         notify("encode_categorical", "Encoding categorical features...")
         self._check_cancelled()
         self.pipeline.encode_categorical(drop_first=False)
         notify("encode_categorical", "Categorical encoding complete")
 
-        # Step 6: Scale Numerical
         notify("scale_numerical", "Scaling numerical features...")
         self._check_cancelled()
         self.pipeline.scale_numerical(method="standard")
         notify("scale_numerical", "Feature scaling complete")
 
-        # Step 7: Generate Risk Labels
-        notify("generate_labels", "Generating risk labels...")
-        self._check_cancelled()
-        self.pipeline.generate_risk_labels(
-            rules=risk_rules,
-            target_col=target_column,
-            based_on=risk_based_on
-        )
-        notify("generate_labels", f"Risk labels generated in column '{target_column}'")
-
-        # Step 8: Prepare Features
+        # ── Step 8: Prepare feature matrix ───────────────────────────────────
         notify("prepare_features", "Preparing feature matrix...")
         self._check_cancelled()
         X, y, feature_names = self.pipeline.prepare_features(target_col=target_column)
-        notify("prepare_features", f"{len(feature_names)} features prepared")
+        notify("prepare_features", f"{len(feature_names)} features · {len(X):,} samples")
 
-        # Step 9: Train Model
+        # ── Step 9: Train ─────────────────────────────────────────────────────
         notify("train_model", f"Training {model_type}...")
         self._check_cancelled()
         self.ml_service = MLService()
         self.ml_service.feature_names = feature_names
         metrics = self.ml_service.train(X, y, model_type=model_type)
-        notify("train_model", f"Accuracy: {metrics['accuracy']:.2%}, CV: {metrics['cv_mean']:.2%}")
+        notify(
+            "train_model",
+            f"Accuracy: {metrics['accuracy']:.2%}  CV: {metrics['cv_mean']:.2%} "
+            f"± {metrics['cv_std']:.2%}",
+        )
 
-        # Step 10: Save Outputs
+        # ── Step 10: Save outputs ─────────────────────────────────────────────
         if save_path:
             notify("save_outputs", "Saving artifacts...")
             self._check_cancelled()
             save_dir = Path(save_path)
             save_dir.mkdir(parents=True, exist_ok=True)
 
-            csv_path = save_dir / "cleaned_dataset.csv"
-            self.pipeline.to_csv(str(csv_path))
+            self.pipeline.to_csv(str(save_dir / "cleaned_dataset.csv"))
 
-            model_path = save_dir / "trained_model.pkl"
             self.ml_service.save_model(
-                str(model_path),
-                metadata={"feature_names": feature_names, "target": target_column}
+                str(save_dir / "trained_model.pkl"),
+                metadata={"feature_names": feature_names, "target": target_column},
             )
 
-            report_path = save_dir / "pipeline_report.json"
+            fi = self.ml_service.get_feature_importance()
             report = {
                 "summary": self.pipeline.get_summary(),
                 "training": self.ml_service.training_history,
-                "feature_importance": self.ml_service.get_feature_importance().to_dict()
-                    if self.ml_service.get_feature_importance() is not None else None,
+                "feature_importance": fi.to_dict() if fi is not None else None,
             }
-            with open(report_path, "w") as f:
+            with open(save_dir / "pipeline_report.json", "w") as f:
                 json.dump(report, f, indent=2, default=str)
 
             notify("save_outputs", f"Saved to {save_dir}")
 
         self.results = {
-            "pipeline_summary": self.pipeline.get_summary(),
-            "training_metrics": self.ml_service.training_history,
+            "pipeline_summary":   self.pipeline.get_summary(),
+            "training_metrics":   self.ml_service.training_history,
             "feature_importance": self.ml_service.get_feature_importance(),
-            "model": self.ml_service,
+            "model":              self.ml_service,
+            # Engineered dataset snapshot (pre-scale, human-readable)
+            "engineered_headers": engineered_headers,
+            "engineered_rows":    engineered_rows,
         }
 
         return self.results
