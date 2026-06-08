@@ -26,7 +26,7 @@ from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 
 from services.data_store import DataStore
 from services.merge_engine import MergeEngine, UNIFIED_COLUMNS
-from services.pipeline_service import PipelineOrchestrator
+from services.pipeline_orchestrator import PipelineOrchestrator
 from ui.mixins.prediction_mixin import PredictionMixin
 from ui.components.loading_overlay import LoadingOverlay
 

@@ -1,6 +1,10 @@
 """
 End-to-end pipeline orchestrator.
 Coordinates: Unified CSV → Feature Engineering → Clean → Train
+
+Two-phase architecture:
+  Phase 1 (train):  run_full_feature_pipeline() — defines target + engineers features
+  Phase 2 (predict): run_prediction_pipeline() — engineers features only (no target)
 """
 
 import json
@@ -14,6 +18,7 @@ from .preprocessing_service import DataPipeline
 from .ml_service import MLService
 from .feature_engineering import (
     run_full_feature_pipeline,
+    run_prediction_pipeline,
     TARGET_COLUMN,
     FINAL_FEATURES,
 )
@@ -21,7 +26,7 @@ from .feature_engineering import (
 
 class PipelineOrchestrator:
     STEP_NAMES = [
-        "read_excel", "validate", "define_target", "engineer_features",
+        "read_excel", "validate", "geo_cache", "define_target", "engineer_features",
         "remove_duplicates", "handle_missing", "encode_categorical",
         "scale_numerical", "prepare_features", "train_model", "save_outputs",
     ]
@@ -58,19 +63,49 @@ class PipelineOrchestrator:
         df = read_excel_file(excel_path)
         notify("read_excel", f"Loaded {len(df):,} rows · {len(df.columns)} columns")
 
-        # ── Step 2: Validate (non-blocking — just report) ─────────────────────
-        notify("validate", "Validating columns...")
+        # ── Step 2: Load GeoCache ─────────────────────────────────────────────
+        notify("geo_cache", "Loading municipality coordinates...")
         self._check_cancelled()
-        if df.empty:
-            raise ValueError("Dataset is empty after loading.")
-        notify("validate", f"{len(df):,} rows · {len(df.columns)} columns present")
 
-        # ── Step 3: Define target & engineer features ─────────────────────────
+        from .feature_engineering import load_geo_cache
+        load_geo_cache([
+            # Cebu Province municipalities
+            {"municipality": "bogo", "latitude": 11.0442, "longitude": 124.0130},
+            {"municipality": "bogo city", "latitude": 11.0442, "longitude": 124.0130},
+            {"municipality": "medellin", "latitude": 11.1283, "longitude": 123.9606},
+            {"municipality": "daanbantayan", "latitude": 11.2467, "longitude": 124.0017},
+            {"municipality": "san remigio", "latitude": 11.0809, "longitude": 123.9412},
+            {"municipality": "tabogon", "latitude": 10.9292, "longitude": 123.9964},
+            {"municipality": "tabuelan", "latitude": 10.8208, "longitude": 123.8723},
+            {"municipality": "sogod", "latitude": 10.3847, "longitude": 123.9833},
+            {"municipality": "borbon", "latitude": 10.8380, "longitude": 124.0265},
+            {"municipality": "carmen", "latitude": 10.5857, "longitude": 124.0166},
+            # Cebu City area
+            {"municipality": "cebu city", "latitude": 10.3157, "longitude": 123.8854},
+            {"municipality": "mandaue", "latitude": 10.3236, "longitude": 123.9222},
+            {"municipality": "mandaue city", "latitude": 10.3236, "longitude": 123.9222},
+            {"municipality": "lapu-lapu", "latitude": 10.2667, "longitude": 123.9667},
+            {"municipality": "lapu-lapu city", "latitude": 10.2667, "longitude": 123.9667},
+            {"municipality": "talisay", "latitude": 10.2447, "longitude": 123.8494},
+            {"municipality": "talisay city", "latitude": 10.2447, "longitude": 123.8494},
+            {"municipality": "consolacion", "latitude": 10.3679, "longitude": 123.9485},
+            {"municipality": "liloan", "latitude": 10.3992, "longitude": 123.9982},
+            {"municipality": "compostela", "latitude": 10.4553, "longitude": 123.9668},
+        ])
+        notify("geo_cache", "Loaded Cebu municipality coordinates")
+
+        # ── Step 3: Phase 1 — Full feature pipeline (training) ──────────────
         notify("define_target", "Defining risk labels from grades & exam scores...")
         self._check_cancelled()
-        notify("engineer_features", "Engineering features (GPA tier, strand match, ...)...")
+        notify("engineer_features", "Engineering pre-enrollment features...")
         self._check_cancelled()
         df = run_full_feature_pipeline(df)
+        # Convert string labels to integers BEFORE splitting
+        df["risk_label"] = df["risk_label"].map({"not_at_risk": 0, "at_risk": 1})
+
+        # Verify
+        print("Target dtype:", df["risk_label"].dtype)
+        print("Target distribution:\n", df["risk_label"].value_counts())
         notify(
             "engineer_features",
             f"Features ready: {len(df.columns) - 1} inputs + '{TARGET_COLUMN}' target "
@@ -84,7 +119,7 @@ class PipelineOrchestrator:
 
         # ── Step 4–7: DataPipeline (dedup / fill / encode / scale) ───────────
         self.pipeline = DataPipeline(df)
-        self.pipeline._target_column = target_column   # guard before encode/scale
+        self.pipeline._target_column = target_column
 
         notify("remove_duplicates", "Removing duplicate rows...")
         self._check_cancelled()
@@ -155,7 +190,6 @@ class PipelineOrchestrator:
             "training_metrics":   self.ml_service.training_history,
             "feature_importance": self.ml_service.get_feature_importance(),
             "model":              self.ml_service,
-            # Engineered dataset snapshot (pre-scale, human-readable)
             "engineered_headers": engineered_headers,
             "engineered_rows":    engineered_rows,
         }

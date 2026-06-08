@@ -1,15 +1,11 @@
 {
   "summary": {
-    "original_rows": 3360,
-    "current_rows": 2109,
+    "original_rows": 2535,
+    "current_rows": 2149,
     "columns": [
       "Program",
       "Sex_code",
-      "Scholarship_Type",
       "risk_label",
-      "GPA_Tier",
-      "Has_College_Grade",
-      "Year_Level",
       "Entrance_Exam_Tier",
       "HS_Performance_Tier",
       "Strand_Program_Match",
@@ -19,15 +15,13 @@
       "Gap_Years",
       "Private_HS",
       "Has_HS_Honors",
-      "Age_At_Enrollment"
+      "Age_At_Enrollment",
+      "Distance_Bucket"
     ],
     "numeric_columns": [
       "Program",
       "Sex_code",
-      "Scholarship_Type",
-      "GPA_Tier",
-      "Has_College_Grade",
-      "Year_Level",
+      "risk_label",
       "Entrance_Exam_Tier",
       "HS_Performance_Tier",
       "Strand_Program_Match",
@@ -37,109 +31,89 @@
       "Gap_Years",
       "Private_HS",
       "Has_HS_Honors",
-      "Age_At_Enrollment"
+      "Age_At_Enrollment",
+      "Distance_Bucket"
     ],
-    "categorical_columns": [
-      "risk_label"
-    ],
+    "categorical_columns": [],
     "missing_values": 0,
-    "memory_mb": 0.37
+    "memory_mb": 0.23
   },
   "training": {
     "model_type": "random_forest",
     "test_size": 0.2,
-    "train_samples": 1687,
-    "test_samples": 422,
-    "accuracy": 1.0,
-    "cv_mean": 1.0,
-    "cv_std": 0.0,
+    "train_samples": 1719,
+    "test_samples": 430,
+    "accuracy": 0.8977,
+    "cv_mean": 0.9009,
+    "cv_std": 0.0107,
     "classification_report": {
-      "high_risk": {
-        "precision": 1.0,
-        "recall": 1.0,
-        "f1-score": 1.0,
-        "support": 30.0
+      "0": {
+        "precision": 0.9254807692307693,
+        "recall": 0.9673366834170855,
+        "f1-score": 0.9459459459459459,
+        "support": 398.0
       },
-      "low_risk": {
-        "precision": 1.0,
-        "recall": 1.0,
-        "f1-score": 1.0,
-        "support": 357.0
+      "1": {
+        "precision": 0.07142857142857142,
+        "recall": 0.03125,
+        "f1-score": 0.043478260869565216,
+        "support": 32.0
       },
-      "moderate_risk": {
-        "precision": 1.0,
-        "recall": 1.0,
-        "f1-score": 1.0,
-        "support": 35.0
-      },
-      "accuracy": 1.0,
+      "accuracy": 0.8976744186046511,
       "macro avg": {
-        "precision": 1.0,
-        "recall": 1.0,
-        "f1-score": 1.0,
-        "support": 422.0
+        "precision": 0.49845467032967034,
+        "recall": 0.4992933417085427,
+        "f1-score": 0.49471210340775557,
+        "support": 430.0
       },
       "weighted avg": {
-        "precision": 1.0,
-        "recall": 1.0,
-        "f1-score": 1.0,
-        "support": 422.0
+        "precision": 0.8619233963710708,
+        "recall": 0.8976744186046511,
+        "f1-score": 0.8787855600797967,
+        "support": 430.0
       }
     },
     "confusion_matrix": [
       [
-        30,
-        0,
-        0
+        385,
+        13
       ],
       [
-        0,
-        357,
-        0
-      ],
-      [
-        0,
-        0,
-        35
+        31,
+        1
       ]
     ]
   },
   "feature_importance": {
     "feature": {
-      "3": "GPA_Tier",
-      "7": "HS_Performance_Tier",
-      "6": "Entrance_Exam_Tier",
       "0": "Program",
-      "15": "Age_At_Enrollment",
-      "14": "Has_HS_Honors",
-      "10": "First_Gen_Student",
-      "11": "Has_Scholarship",
-      "8": "Strand_Program_Match",
+      "2": "Entrance_Exam_Tier",
+      "11": "Age_At_Enrollment",
+      "12": "Distance_Bucket",
+      "3": "HS_Performance_Tier",
+      "6": "First_Gen_Student",
+      "4": "Strand_Program_Match",
       "1": "Sex_code",
-      "13": "Private_HS",
-      "2": "Scholarship_Type",
-      "4": "Has_College_Grade",
-      "5": "Year_Level",
-      "9": "Financial_Stress",
-      "12": "Gap_Years"
+      "7": "Has_Scholarship",
+      "9": "Private_HS",
+      "10": "Has_HS_Honors",
+      "8": "Gap_Years",
+      "5": "Financial_Stress"
     },
     "importance": {
-      "3": 0.8174313827878678,
-      "7": 0.04826547352292815,
-      "6": 0.03413959557148809,
-      "0": 0.022414004931289103,
-      "15": 0.019000063068513266,
-      "14": 0.017585557908964933,
-      "10": 0.008789063943899326,
-      "11": 0.008338622968857918,
-      "8": 0.008130095029007977,
-      "1": 0.006135160342224432,
-      "13": 0.005363590155843506,
-      "2": 0.0044073897691155935,
-      "4": 0.0,
-      "5": 0.0,
-      "9": 0.0,
-      "12": 0.0
+      "0": 0.1961291638061523,
+      "2": 0.18049759861959908,
+      "11": 0.1527058261819914,
+      "12": 0.11219018172567366,
+      "3": 0.10630470710977995,
+      "6": 0.05703637576439906,
+      "4": 0.05015448883805954,
+      "1": 0.045644172553583044,
+      "7": 0.04194810085937202,
+      "9": 0.03499190617266409,
+      "10": 0.02239747836872566,
+      "8": 0.0,
+      "5": 0.0
     }
   }
 }
