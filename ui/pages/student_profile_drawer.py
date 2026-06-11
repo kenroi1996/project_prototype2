@@ -419,7 +419,7 @@ class StudentProfilePanel(QFrame):
             f"{student['id']} · {student['college']} · {student['program']}"
         )
         self.risk_pill.setText(
-            f"●  High Risk — {student['score']}%"
+            f"●  {student.get('risk_level', 'High')} Risk — {student['score']}%"
         )
 
         self._clear_layout(self.metrics_grid)

@@ -37,9 +37,8 @@ class FeaturePipelineWorker(QThread):
     finished = pyqtSignal(dict)       # result payload
     error    = pyqtSignal(str)
 
-    def __init__(self, run_id: int = 0, parent=None) -> None:
-        super().__init__(parent)
-        self._run_id = run_id
+    def __init__(self, run_id: int = 0, parent=None):
+        super().__init__(parent=None)  # Force no parent
 
     def run(self) -> None:
         try:

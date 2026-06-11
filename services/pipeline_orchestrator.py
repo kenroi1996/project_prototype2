@@ -3,8 +3,18 @@ End-to-end pipeline orchestrator.
 Coordinates: Unified CSV → Feature Engineering → Clean → Train
 
 Two-phase architecture:
-  Phase 1 (train):  run_full_feature_pipeline() — defines target + engineers features
-  Phase 2 (predict): run_prediction_pipeline() — engineers features only (no target)
+  Phase 1 (train):   run_full_feature_pipeline() — defines target + engineers features
+  Phase 2 (predict): run_prediction_pipeline()   — engineers features only (no target)
+
+GeoCache loading
+----------------
+Municipality coordinates are loaded ONCE from public.geo_cache in PostgreSQL.
+_ensure_geo_cache() (inside feature_engineering.py) is called automatically
+at the start of both pipeline entry points, so neither the orchestrator nor
+TrainingWorker need to call load_geo_cache() manually anymore.
+
+The orchestrator still calls _ensure_geo_cache() explicitly via the import
+so the step notification fires correctly in the UI progress log.
 """
 
 import json
@@ -20,7 +30,9 @@ from .feature_engineering import (
     run_full_feature_pipeline,
     run_prediction_pipeline,
     TARGET_COLUMN,
-    FINAL_FEATURES,
+    TRAINING_FEATURES,
+    FINAL_FEATURES,          # legacy alias — kept for any callers that use it
+    _ensure_geo_cache,       # called explicitly so the UI step fires
 )
 
 
@@ -32,10 +44,10 @@ class PipelineOrchestrator:
     ]
 
     def __init__(self):
-        self.pipeline: Optional[DataPipeline] = None
-        self.ml_service: Optional[MLService] = None
-        self.results: dict = {}
-        self._cancelled: bool = False
+        self.pipeline:    Optional[DataPipeline] = None
+        self.ml_service:  Optional[MLService]    = None
+        self.results:     dict                   = {}
+        self._cancelled:  bool                   = False
 
     def cancel(self):
         self._cancelled = True
@@ -44,15 +56,17 @@ class PipelineOrchestrator:
         if self._cancelled:
             raise InterruptedError("Pipeline was cancelled by user.")
 
-    def run(self,
-            excel_path: str | Path,
-            required_columns: Optional[list[str]] = None,
-            target_column: str = TARGET_COLUMN,
-            risk_based_on: Optional[str] = None,
-            risk_rules: Optional[dict] = None,
-            model_type: str = "random_forest",
-            save_path: Optional[str] = None,
-            on_step: Optional[Callable[[str, str], None]] = None) -> dict:
+    def run(
+        self,
+        excel_path:        str | Path,
+        required_columns:  Optional[list[str]]              = None,
+        target_column:     str                              = TARGET_COLUMN,
+        risk_based_on:     Optional[str]                    = None,
+        risk_rules:        Optional[dict]                   = None,
+        model_type:        str                              = "random_forest",
+        save_path:         Optional[str]                    = None,
+        on_step:           Optional[Callable[[str, str], None]] = None,
+    ) -> dict:
 
         def notify(step: str, msg: str):
             if on_step:
@@ -60,52 +74,43 @@ class PipelineOrchestrator:
 
         # ── Step 1: Read unified CSV ──────────────────────────────────────────
         notify("read_excel", f"Reading {Path(excel_path).name}...")
+        self._check_cancelled()
         df = read_excel_file(excel_path)
         notify("read_excel", f"Loaded {len(df):,} rows · {len(df.columns)} columns")
 
-        # ── Step 2: Load GeoCache ─────────────────────────────────────────────
-        notify("geo_cache", "Loading municipality coordinates...")
+        # ── Step 2: Load GeoCache from PostgreSQL ─────────────────────────────
+        # _ensure_geo_cache() queries public.geo_cache and populates _GEO_CACHE.
+        # It is also called automatically inside run_full_feature_pipeline(), so
+        # calling it here just ensures the UI step notification fires and the
+        # cache is warm before engineer_features() runs.
+        notify("geo_cache", "Loading municipality coordinates from database...")
         self._check_cancelled()
+        _ensure_geo_cache()
+        from .feature_engineering import _GEO_CACHE
+        notify(
+            "geo_cache",
+            f"GeoCache ready: {len(_GEO_CACHE)} municipalities loaded"
+            if _GEO_CACHE
+            else "⚠ GeoCache empty — run geo_cache_setup.sql to seed coordinates"
+        )
 
-        from .feature_engineering import load_geo_cache
-        load_geo_cache([
-            # Cebu Province municipalities
-            {"municipality": "bogo", "latitude": 11.0442, "longitude": 124.0130},
-            {"municipality": "bogo city", "latitude": 11.0442, "longitude": 124.0130},
-            {"municipality": "medellin", "latitude": 11.1283, "longitude": 123.9606},
-            {"municipality": "daanbantayan", "latitude": 11.2467, "longitude": 124.0017},
-            {"municipality": "san remigio", "latitude": 11.0809, "longitude": 123.9412},
-            {"municipality": "tabogon", "latitude": 10.9292, "longitude": 123.9964},
-            {"municipality": "tabuelan", "latitude": 10.8208, "longitude": 123.8723},
-            {"municipality": "sogod", "latitude": 10.3847, "longitude": 123.9833},
-            {"municipality": "borbon", "latitude": 10.8380, "longitude": 124.0265},
-            {"municipality": "carmen", "latitude": 10.5857, "longitude": 124.0166},
-            # Cebu City area
-            {"municipality": "cebu city", "latitude": 10.3157, "longitude": 123.8854},
-            {"municipality": "mandaue", "latitude": 10.3236, "longitude": 123.9222},
-            {"municipality": "mandaue city", "latitude": 10.3236, "longitude": 123.9222},
-            {"municipality": "lapu-lapu", "latitude": 10.2667, "longitude": 123.9667},
-            {"municipality": "lapu-lapu city", "latitude": 10.2667, "longitude": 123.9667},
-            {"municipality": "talisay", "latitude": 10.2447, "longitude": 123.8494},
-            {"municipality": "talisay city", "latitude": 10.2447, "longitude": 123.8494},
-            {"municipality": "consolacion", "latitude": 10.3679, "longitude": 123.9485},
-            {"municipality": "liloan", "latitude": 10.3992, "longitude": 123.9982},
-            {"municipality": "compostela", "latitude": 10.4553, "longitude": 123.9668},
-        ])
-        notify("geo_cache", "Loaded Cebu municipality coordinates")
-
-        # ── Step 3: Phase 1 — Full feature pipeline (training) ──────────────
-        notify("define_target", "Defining risk labels from grades & exam scores...")
-        self._check_cancelled()
+        # ── Step 3: Phase 1 — Full feature pipeline (training) ───────────────
+        # run_full_feature_pipeline() does:
+        #   normalize → define_target → engineer_features → drop_raw
+        #   → deduplicate → drop_leakage → class-imbalance report
+        notify("define_target",    "Defining risk labels from grades & exam scores...")
         notify("engineer_features", "Engineering pre-enrollment features...")
         self._check_cancelled()
-        df = run_full_feature_pipeline(df)
-        # Convert string labels to integers BEFORE splitting
-        df["risk_label"] = df["risk_label"].map({"not_at_risk": 0, "at_risk": 1})
 
-        # Verify
-        print("Target dtype:", df["risk_label"].dtype)
-        print("Target distribution:\n", df["risk_label"].value_counts())
+        df = run_full_feature_pipeline(df)
+
+        # Convert string labels → integers before model training
+        # "at_risk" → 1,  "not_at_risk" → 0
+        df[TARGET_COLUMN] = df[TARGET_COLUMN].map({"not_at_risk": 0, "at_risk": 1})
+
+        print("Target dtype:", df[TARGET_COLUMN].dtype)
+        print("Target distribution:\n", df[TARGET_COLUMN].value_counts())
+
         notify(
             "engineer_features",
             f"Features ready: {len(df.columns) - 1} inputs + '{TARGET_COLUMN}' target "
@@ -117,15 +122,14 @@ class PipelineOrchestrator:
         engineered_headers = list(df.columns)
         engineered_rows    = df.astype(str).fillna("").values.tolist()
 
-        # ── Step 4–7: DataPipeline (dedup / fill / encode / scale) ───────────
+        # ── Step 4–7: DataPipeline (fill / encode / scale) ───────────────────
+        # NOTE: do NOT call pipeline.remove_duplicates() here —
+        # run_full_feature_pipeline() already deduplicated the data.
+        # Running it again on engineered data collapses rows to ~28.
         self.pipeline = DataPipeline(df)
         self.pipeline._target_column = target_column
 
-        notify("remove_duplicates", "Removing duplicate rows...")
-        self._check_cancelled()
-        before = len(self.pipeline.df)
-        self.pipeline.remove_duplicates()
-        notify("remove_duplicates", f"Removed {before - len(self.pipeline.df)} duplicates")
+        notify("remove_duplicates", "Skipped — deduplication done in feature pipeline")
 
         notify("handle_missing", "Filling remaining missing values...")
         self._check_cancelled()
@@ -153,11 +157,15 @@ class PipelineOrchestrator:
         self._check_cancelled()
         self.ml_service = MLService()
         self.ml_service.feature_names = feature_names
-        metrics = self.ml_service.train(X, y, model_type=model_type)
+        metrics = self.ml_service.train(
+            X, y,
+            model_type   = model_type,
+            class_weight = "balanced",   # corrects 93 % / 7 % class imbalance
+        )
         notify(
             "train_model",
-            f"Accuracy: {metrics['accuracy']:.2%}  CV: {metrics['cv_mean']:.2%} "
-            f"± {metrics['cv_std']:.2%}",
+            f"Accuracy: {metrics['accuracy']:.2%}  "
+            f"CV: {metrics['cv_mean']:.2%} ± {metrics['cv_std']:.2%}",
         )
 
         # ── Step 10: Save outputs ─────────────────────────────────────────────
@@ -174,10 +182,10 @@ class PipelineOrchestrator:
                 metadata={"feature_names": feature_names, "target": target_column},
             )
 
-            fi = self.ml_service.get_feature_importance()
+            fi     = self.ml_service.get_feature_importance()
             report = {
-                "summary": self.pipeline.get_summary(),
-                "training": self.ml_service.training_history,
+                "summary":            self.pipeline.get_summary(),
+                "training":           self.ml_service.training_history,
                 "feature_importance": fi.to_dict() if fi is not None else None,
             }
             with open(save_dir / "pipeline_report.json", "w") as f:

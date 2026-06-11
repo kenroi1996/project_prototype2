@@ -130,6 +130,17 @@ class PredictionMixin:
             store.predictions = result
             store.set_last_prediction_run()
 
+            try:
+                summary = result.summary
+                store.add_activity(
+                    f"Prediction completed — {summary.total:,} students scored, "
+                    f"{summary.high_risk:,} high-risk",
+                    icon="🎯",
+                    color="#34d399",
+                )
+            except Exception:
+                store.add_activity("Prediction completed", icon="🎯", color="#34d399")
+
             # Resolve model_id from the stored model package (default "rf")
             model_id = "rf"
             if store.trained_model:

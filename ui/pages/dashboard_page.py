@@ -40,6 +40,7 @@ from ui.components.chart_widgets import (
     ShapFactor,
 )
 from ui.components.loading_overlay import LoadingOverlay
+from ui.components.activity_log import ActivityLogPanel
 from ui.mixins.prediction_mixin import PredictionMixin
 from services.data_store import DataStore
 
@@ -58,10 +59,13 @@ class DashboardPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _on_store_updated(self, key: str):
-        if key == "predictions":
+        if key in ("predictions", "all"):
             result = DataStore.get().predictions
             if result and result.success:
                 self._apply_predictions(result)
+            else:
+                # No (successful) prediction available → keep dashboard blank
+                self._show_empty_state()
         if key in ("predictions", "last_prediction_run", "all"):
             self._refresh_prediction_status()
 
@@ -188,6 +192,52 @@ class DashboardPage(PredictionMixin, QWidget):
         self._alerts_content_layout.addStretch()
 
     # ------------------------------------------------------------------
+    # Empty / blank states (no prediction yet)
+    # ------------------------------------------------------------------
+
+    def _clear_layout(self, layout) -> None:
+        """Remove every item (widgets and stretches) from a layout."""
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _show_empty_shap(self) -> None:
+        """Render the SHAP panel with a placeholder message."""
+        self._clear_layout(self._shap_factors_layout)
+        placeholder = QLabel("No prediction data yet. Run a prediction to view risk factors.")
+        placeholder.setObjectName("analyticsText")
+        placeholder.setWordWrap(True)
+        self._shap_factors_layout.addWidget(placeholder)
+        self._shap_factors_layout.addStretch()
+
+    def _show_empty_alerts(self) -> None:
+        """Render the alerts panel with a placeholder message."""
+        self._clear_layout(self._alerts_content_layout)
+        placeholder = QLabel("No high-risk alerts yet. Run a prediction to populate.")
+        placeholder.setObjectName("analyticsText")
+        placeholder.setWordWrap(True)
+        self._alerts_content_layout.addWidget(placeholder)
+        self._alerts_content_layout.addStretch()
+
+    def _reset_metric_cards(self) -> None:
+        """Reset prediction-driven metric cards to their pending state."""
+        for card in (self._metric_1, self._metric_2, self._metric_3):
+            card.update_values(
+                value="—",
+                status="Pending",
+                remarks="Run prediction to update",
+            )
+
+    def _show_empty_state(self) -> None:
+        """Blank every prediction-driven visualization on the dashboard."""
+        self._reset_metric_cards()
+        self._risk_distribution_chart.show_empty()
+        self._risk_analytics_chart.show_empty()
+        self._show_empty_shap()
+        self._show_empty_alerts()
+
+    # ------------------------------------------------------------------
     # Setup UI
     # ------------------------------------------------------------------
 
@@ -286,6 +336,13 @@ class DashboardPage(PredictionMixin, QWidget):
         self.main_layout.addWidget(self.fixed_header_container)
 
         # =====================================
+        # ACTIVITY LOG PANEL
+        # =====================================
+
+        self._activity_log = ActivityLogPanel()
+        self.main_layout.addWidget(self._activity_log)
+
+        # =====================================
         # METRIC CARDS
         # =====================================
 
@@ -368,22 +425,9 @@ class DashboardPage(PredictionMixin, QWidget):
         shap_layout.addWidget(shap_text)
         shap_layout.addSpacing(10)
 
-        # Dynamic SHAP factors container (updated after prediction)
+        # Dynamic SHAP factors container (populated only after prediction)
         self._shap_factors_layout = QVBoxLayout()
-        
-        # Seed with default factors
-        default_factors = [
-            ("GWA drop (sem 1)", 38, "#ff5b5b"),
-            ("Absences > 20%",   22, "#ff5b5b"),
-            ("No org membership",14, "#f5b335"),
-            ("Working student",  11, "#f5b335"),
-            ("Failed ≥ 2 subjects", 9, "#4f8cff"),
-            ("Low psych score",   8, "#4f8cff"),
-        ]
-        for label, value, color in default_factors:
-            self._shap_factors_layout.addWidget(ShapFactor(label, value, color))
-
-        self._shap_factors_layout.addStretch()
+        self._show_empty_shap()
         shap_layout.addLayout(self._shap_factors_layout)
 
         shap_panel.setLayout(shap_layout)
@@ -409,20 +453,9 @@ class DashboardPage(PredictionMixin, QWidget):
         alerts_layout.addWidget(alerts_text)
         alerts_layout.addSpacing(10)
 
-        # ── Dynamic alerts content (updated after prediction) ──────────
+        # ── Dynamic alerts content (populated only after prediction) ───
         self._alerts_content_layout = QVBoxLayout()
-
-        # Seed with placeholder alerts
-        for text in [
-            "⚠ BSIT-101 | John Doe | High Risk",
-            "⚠ BSED-202 | Jane Smith | Critical",
-            "⚠ BSBA-303 | Mark Reyes | High Risk",
-        ]:
-            lbl = QLabel(text)
-            lbl.setObjectName("alertItem")
-            self._alerts_content_layout.addWidget(lbl)
-
-        self._alerts_content_layout.addStretch()
+        self._show_empty_alerts()
         alerts_layout.addLayout(self._alerts_content_layout)
 
         alerts_panel.setLayout(alerts_layout)
@@ -500,6 +533,12 @@ class DashboardPage(PredictionMixin, QWidget):
         self.setLayout(self.main_layout)
         self.init_prediction()
         self._refresh_prediction_status()
+
+        # If a successful prediction already exists, populate immediately;
+        # otherwise the dashboard stays blank until one is run.
+        existing = DataStore.get().predictions
+        if existing and existing.success:
+            self._apply_predictions(existing)
 
     def _refresh_prediction_status(self):
         """Show the latest successful prediction run time."""

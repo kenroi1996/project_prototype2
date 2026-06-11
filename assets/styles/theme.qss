@@ -223,6 +223,57 @@
                 color: #9fb3ff;
             }
 
+/* ======================================================
+   Activity Log Panel
+====================================================== */
+
+            #activityCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                border-top: 4px solid #4f8cff;
+            }
+            #activityTitle {
+                font-size: 14px;
+                font-weight: bold;
+                color: rgba(255,255,255,0.7);
+                letter-spacing: 1px;
+            }
+            #activityLiveDot {
+                color: #34d399;
+                font-size: 11px;
+            }
+            #activityLiveText {
+                color: rgba(255,255,255,0.45);
+                font-size: 12px;
+            }
+            #activityScroll, #activityListHost {
+                background: transparent;
+                border: none;
+            }
+            #activityRow {
+                background-color: rgba(255,255,255,0.04);
+                border-radius: 10px;
+            }
+            #activityRow:hover {
+                background-color: rgba(255,255,255,0.08);
+            }
+            #activityIcon {
+                font-size: 13px;
+            }
+            #activityMessage {
+                font-size: 13px;
+                color: #d6deff;
+            }
+            #activityTime {
+                font-size: 12px;
+                color: rgba(255,255,255,0.4);
+            }
+            #activityEmpty {
+                font-size: 13px;
+                color: rgba(255,255,255,0.4);
+                padding: 12px;
+            }
+
 
 /* ======================================================
    Data Pipeline Styles

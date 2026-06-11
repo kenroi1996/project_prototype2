@@ -26,19 +26,19 @@ Two-phase usage
 Pipeline position
 -----------------
   [MergeEngine] → [normalize_columns] → [define_target*] → [engineer_features]
-               → [drop_raw_columns]   → [drop_duplicates] → [drop_training_leakage]
+               → [drop_raw_columns]   → [deduplicate_on_id] → [drop_training_leakage]
                → [DataPipeline: encode / scale]
                → [TrainingEngine / PredictionEngine]
 
   * define_target only in Phase 1 (training).
 
-Unified column names this module reads
----------------------------------------
-Student_ID, Program, College, SecCode, Year, Sex_code, Home_Address,
-Civil_Status, Entrance_Exam_Score, Family_Income, Parent_Highest_Education,
-HS_GPA, Year_Graduated, SHS_Strand, HS_Type, Graduation_Honors, HS_School,
-Year_Enrolled, Scholarship_Applicant, Scholarship_Type, Birthdate,
-Final_Avg_GRD, Religion, Municipality (optional)
+DUPLICATE DETECTION LOGIC
+--------------------------
+Deduplication is performed on Student_ID BEFORE it is dropped, so only true
+duplicate student records (same student appearing more than once) are removed.
+Doing this AFTER Student_ID is gone would incorrectly collapse distinct students
+who happen to share identical engineered feature values — causing ~43% data loss
+with low-cardinality bucketed features.
 """
 
 from __future__ import annotations
@@ -50,22 +50,17 @@ import pandas as pd
 
 
 # ── GPA scale ────────────────────────────────────────────────────────────────
-# Philippine university grading: 1.0 = Excellent, 5.0 = Failed.
-# Passing threshold = 3.0 (equivalent to 75 %).
-# GPA >= 3.0 means the student is at academic risk.
-
-# ── Target variable thresholds (binary) ──────────────────────────────────────
-GPA_AT_RISK_THRESHOLD  = 3.0   # Final_Avg_GRD >= 3.0  → at_risk
-EXAM_AT_RISK_THRESHOLD = 60    # Entrance_Exam_Score < 60 → at_risk (fallback)
+GPA_AT_RISK_THRESHOLD  = 3.0
+EXAM_AT_RISK_THRESHOLD = 60
 
 # ── Strand–Program alignment tables ──────────────────────────────────────────
 _STEM_PROGRAMS = {
     "BSCS", "BS CS", "BSIT", "BS IT", "BSCE", "BS CE",
-    "BSEcE", "BSME", "BS ME", "BSEE", "BS EE", "BSIE",
+    "BSECE", "BSME", "BS ME", "BSEE", "BS EE", "BSIE",
     "BSPH", "BSMATH", "BS MATH", "BSTAT", "BSAGRIBUS",
 }
 _ABM_PROGRAMS = {
-    "BSA", "BSBA", "BS BA", "BSMA", "BSEntrep", "BSENTREP",
+    "BSA", "BSBA", "BS BA", "BSMA", "BSENTREP",
     "BSHRM", "BS HRM", "BSTM", "BS TM",
 }
 _HUMSS_PROGRAMS = {
@@ -74,17 +69,19 @@ _HUMSS_PROGRAMS = {
     "ABCOMM", "AB COMM", "BSSW", "BS SW",
 }
 _STRAND_MAP: dict[str, set[str]] = {
-    "STEM":           _STEM_PROGRAMS,
-    "ABM":            _ABM_PROGRAMS,
-    "HUMSS":          _HUMSS_PROGRAMS,
-    "TVL":            set(),   # vocational — always mismatched for 4-yr programs
-    "GAS":            set(),   # general academic — neutral
-    "SPORTS":         set(),
+    "STEM":            _STEM_PROGRAMS,
+    "ABM":             _ABM_PROGRAMS,
+    "HUMSS":           _HUMSS_PROGRAMS,
+    "TVL":             set(),
+    "GAS":             set(),
+    # ICT is a STEM-adjacent SHS track in the Philippines — maps to STEM programs
+    "ICT":             _STEM_PROGRAMS,
+    "SPORTS":          set(),
     "ARTS AND DESIGN": set(),
 }
 
-# ── Family income → financial stress (1 = lowest income / highest stress) ────
 _INCOME_ORDER: dict[str, int] = {
+    # Standard long-form keys
     "below 10,000": 1,   "below 10000": 1,
     "10,000-20,000": 2,  "10000-20000": 2,
     "20,001-30,000": 3,  "20001-30000": 3,
@@ -92,20 +89,32 @@ _INCOME_ORDER: dict[str, int] = {
     "40,001-50,000": 5,  "40001-50000": 5,
     "above 50,000": 6,   "above 50000": 6,
     "50,001 and above": 6,
+    # Guidance Office short-form keys ("Below 10k", "10k-20k", "20k-50k", "50k+")
+    "below 10k": 1,
+    "10k-20k":   2,
+    "20k-30k":   3,
+    "30k-40k":   4,
+    "40k-50k":   5,
+    "20k-50k":   4,   # mid-point of the broader bracket
+    "50k+":      6,
+    "above 50k": 6,
 }
 
-# ── Non-college parent education labels ───────────────────────────────────────
 _NON_COLLEGE_LABELS = {
+    # No formal / basic education
     "no formal education", "elementary", "grade school",
+    # Secondary
     "high school", "junior high school", "senior high school",
+    # Vocational / alternative
     "vocational", "als", "alternative learning system",
     "did not finish high school", "none",
+    # Note: "college", "graduate", "bachelor" are NOT here —
+    # parents with college degrees do NOT make the student first-gen.
 }
 
-# ── GeoCache: municipality → (lat, lon) ──────────────────────────────────────
 _GEO_CACHE: dict[str, tuple[float, float]] = {}
 
-CAMPUS_LAT = 11.0442   # Bogo City — adjust to your actual campus
+CAMPUS_LAT = 11.0442
 CAMPUS_LON = 124.0130
 
 _DISTANCE_BUCKETS = {
@@ -117,19 +126,20 @@ _DISTANCE_BUCKETS = {
     "very_far":  (50, float("inf")),
 }
 
+_PROGRAM_RISK_MAP:      dict[str, float] = {}
+_MUNICIPALITY_RISK_MAP: dict[str, float] = {}
+_GLOBAL_PROGRAM_RISK      = 0.50
+_GLOBAL_MUNICIPALITY_RISK = 0.50
+
 
 def load_geo_cache(rows: list[dict]) -> None:
-    """
-    Populate _GEO_CACHE from GeoCache table rows.
-    Call this before engineer_features() if you have geocoded data.
-
-    Parameters
-    ----------
-    rows : list of dicts with keys 'municipality', 'latitude', 'longitude'
-    """
     global _GEO_CACHE
+    def _norm_muni(name: str) -> str:
+        """Normalise a municipality name: lowercase, strip, remove ' city' suffix."""
+        return name.strip().lower().replace(" city", "").strip()
+
     _GEO_CACHE = {
-        str(r["municipality"]).strip().lower(): (
+        _norm_muni(str(r["municipality"])): (
             float(r["latitude"]),
             float(r["longitude"]),
         )
@@ -139,65 +149,113 @@ def load_geo_cache(rows: list[dict]) -> None:
     print(f"[FeatureEngineering] GeoCache loaded: {len(_GEO_CACHE)} municipalities")
 
 
-# ── Columns to drop after engineering (raw sources replaced by features) ──────
+def _ensure_geo_cache() -> None:
+    if _GEO_CACHE:
+        return
+    try:
+        from db import get_session
+        from models.geo_cache import GeoCache
+
+        with get_session() as session:
+            rows = [
+                {
+                    "municipality": row.municipality,
+                    "latitude":     float(row.latitude),
+                    "longitude":    float(row.longitude),
+                }
+                for row in session.query(GeoCache).all()
+            ]
+        load_geo_cache(rows)
+    except Exception as exc:
+        print(
+            f"[FeatureEngineering] GeoCache DB load failed ({exc}); "
+            "_GEO_CACHE left empty."
+        )
+        if not _GEO_CACHE:
+            print(
+                "[FeatureEngineering] WARNING: "
+                "Geo cache is empty. Distance features will be unknown."
+            )
+
+
+# ── Columns to drop after engineering ────────────────────────────────────────
 COLS_TO_DROP: list[str] = [
-    # Identifiers
     "Student_ID",
-    # Redundant / zero-signal
-    "College",          # fully determined by Program
-    "SecCode",          # admin artifact, changes each semester
-    "Civil_Status",     # near-uniform for college-age students
-    "Religion",         # no academic relevance
-    "HS_School",        # high cardinality, encodes geography not quality
-    # Raw sources replaced by engineered features
-    "Final_Avg_GRD",          # → target label + GPA_Tier (display only)
-    "Year",                   # → Year_Level (display only)
-    "Entrance_Exam_Score",    # → Entrance_Exam_Tier
-    "HS_GPA",                 # → HS_Performance_Tier
-    "SHS_Strand",             # → Strand_Program_Match
-    "Family_Income",          # → Financial_Stress
-    "Parent_Highest_Education", # → First_Gen_Student
-    "Scholarship_Applicant",  # → Has_Scholarship
-    "Scholarship_Type",       # 55 %+ missing — unreliable
-    "HS_Type",                # → Private_HS
-    "Graduation_Honors",      # → Has_HS_Honors
-    "Year_Enrolled",          # → Gap_Years, Age_At_Enrollment
-    "Year_Graduated",         # → Gap_Years
-    "Birthdate",              # → Age_At_Enrollment
-    "Home_Address",           # → Distance_KM / Distance_Bucket
-    "Municipality",           # → Distance_KM / Distance_Bucket
+    "College",
+    "SecCode",
+    "Civil_Status",
+    "Religion",
+    "HS_School",
+    "Final_Avg_GRD",
+    "Year",
+    "SHS_Strand",
+    "Family_Income",
+    "Parent_Highest_Education",
+    "Scholarship_Applicant",
+    "Scholarship_Type",
+    "HS_Type",
+    "Graduation_Honors",
+    "Year_Enrolled",
+    "Year_Graduated",
+    "Birthdate",
+    "Home_Address",
+    "Municipality",
 ]
 
-# ── Safe pre-enrollment features — the ONLY columns fed to the model ──────────
-TRAINING_FEATURES: list[str] = [
-    "Entrance_Exam_Tier",    # 0=strong · 1=average · 2=weak
-    "HS_Performance_Tier",   # 0=high   · 1=average · 2=low
-    "Strand_Program_Match",  # 0=mismatch · 0.5=unknown · 1=aligned
-    "Financial_Stress",      # 1–6 (higher = more financial pressure)
-    "First_Gen_Student",     # 1 if neither parent reached college
-    "Has_Scholarship",       # 1 if scholarship applicant / recipient
-    "Gap_Years",             # years between HS graduation and enrollment
-    "Private_HS",            # 1 if attended private high school
-    "Has_HS_Honors",         # 1 if graduated with any honours
-    "Age_At_Enrollment",     # age in years at time of enrollment
-    "Distance_Bucket",       # on_campus/very_near/near/moderate/far/very_far/unknown
-    "Program",               # label-encoded by DataPipeline
-    "Sex_code",              # label-encoded by DataPipeline
+TRAINING_FEATURES = [
+    "Entrance_Exam_Score",
+    "HS_GPA",
+    "Entrance_Exam_Tier",
+    "HS_Performance_Tier",
+    "Strand_Program_Match",
+    "Financial_Stress",
+    "First_Gen_Student",
+    "Has_Scholarship",
+    "Gap_Years",
+    "Private_HS",
+    "Has_HS_Honors",
+    "Age_At_Enrollment",
+    "Age_Group",
+    "Distance_KM",
+    "Distance_Bucket",
+    "Program",
+    "Program_Risk_Index",
+    "Municipality_Risk_Index",
+    "Sex_code",
 ]
 
-# ── Display-only features — shown in UI but NOT fed to the model ──────────────
-# Reason: derived from Final_Avg_GRD which does not exist for incoming students.
 DISPLAY_ONLY_FEATURES: list[str] = [
-    "GPA_Tier",          # −1=no grade · 0=excellent · 1=passing · 2=borderline · 3=at-risk
-    "Has_College_Grade", # 1 if Final_Avg_GRD was present
-    "Year_Level",        # integer year of study
-    "Distance_KM",       # raw km value (Distance_Bucket used for training)
+    "GPA_Tier",
+    "Has_College_Grade",
+    "Year_Level",
 ]
 
-# Legacy alias — kept so any existing code referencing FINAL_FEATURES still works
 FINAL_FEATURES = TRAINING_FEATURES
 
 TARGET_COLUMN = "risk_label"
+
+PREDICTION_ID_COLUMN = "Student_ID"
+
+PREDICTION_FEATURES: list[str] = [PREDICTION_ID_COLUMN] + TRAINING_FEATURES
+
+_PREDICTION_FEATURE_DEFAULTS: dict[str, Any] = {
+    "Entrance_Exam_Tier":      1,
+    "HS_Performance_Tier":     1,
+    "Strand_Program_Match":    0.5,
+    "Financial_Stress":        3,
+    "First_Gen_Student":       0,
+    "Has_Scholarship":         0,
+    "Gap_Years":               0,
+    "Private_HS":              0,
+    "Has_HS_Honors":           0,
+    "Age_At_Enrollment":       18,
+    "Age_Group":               "traditional",
+    "Distance_Bucket":         "unknown",
+    "Program":                 "UNKNOWN",
+    "Program_Risk_Index":      0.50,
+    "Municipality_Risk_Index": 0.50,
+    "Sex_code":                "UNKNOWN",
+}
 
 
 # =============================================================================
@@ -205,10 +263,6 @@ TARGET_COLUMN = "risk_label"
 # =============================================================================
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rename DB-style lowercase column names to PascalCase expected by the pipeline.
-    Safe to call even when columns are already correctly named.
-    """
     column_map = {
         "student_id":               "Student_ID",
         "id_no":                    "Student_ID",
@@ -245,20 +299,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def define_target(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add binary ``risk_label`` column to *df*.  Call only during TRAINING (Phase 1).
-
-    Logic (Philippine GPA scale — 1.0 = best, 5.0 = fail):
-        at_risk     — GPA >= 3.0   (at or past the failing threshold)
-        not_at_risk — GPA <  3.0   (passing)
-
-    Fallback when no GPA (student has no Final_Avg_GRD):
-        at_risk     — entrance exam score < 60
-        not_at_risk — entrance exam score >= 60
-
-    Default when neither is available: 'at_risk' (conservative — flag for
-    review rather than assume safety).
-    """
     df = df.copy()
 
     if TARGET_COLUMN in df.columns:
@@ -277,62 +317,91 @@ def define_target(df: pd.DataFrame) -> pd.DataFrame:
             return "at_risk" if g >= GPA_AT_RISK_THRESHOLD else "not_at_risk"
         if pd.notna(e):
             return "at_risk" if e < EXAM_AT_RISK_THRESHOLD else "not_at_risk"
-        return "at_risk"   # conservative default
+        return "at_risk"
 
     df[TARGET_COLUMN] = [_label(g, e) for g, e in zip(grd, exam)]
 
-    counts = df[TARGET_COLUMN].value_counts().to_dict()
+    counts      = df[TARGET_COLUMN].value_counts().to_dict()
+    n_at_risk   = counts.get("at_risk", 0)
+    n_not_risk  = counts.get("not_at_risk", 0)
+    n_total     = n_at_risk + n_not_risk
+
     print(
         f"[FeatureEngineering] Target distribution: "
-        f"at_risk={counts.get('at_risk', 0)}, "
-        f"not_at_risk={counts.get('not_at_risk', 0)}"
+        f"at_risk={n_at_risk}, not_at_risk={n_not_risk}"
     )
+
+    # ── Early detection: degenerate label distribution ────────────────────────
+    # If Final_Avg_GRD is absent and all exam scores are above the threshold,
+    # every student gets labeled 'not_at_risk' — training will fail with a
+    # single-class error. Raise a clear error here rather than crashing later.
+    has_grades   = "Final_Avg_GRD" in df.columns and grd.notna().sum() > 0
+    grade_source = "Final_Avg_GRD" if has_grades else "Entrance_Exam_Score"
+
+    if n_at_risk == 0:
+        raise ValueError(
+            f"Zero at-risk students detected after labeling "
+            f"(source: {grade_source}).\n\n"
+            + (
+                f"Final_Avg_GRD is absent from this dataset — the fallback "
+                f"rule (Entrance_Exam_Score < {EXAM_AT_RISK_THRESHOLD}) labeled "
+                f"everyone 'not_at_risk' because all exam scores are above {EXAM_AT_RISK_THRESHOLD}.\n\n"
+                f"This is the INCOMING STUDENTS dataset (no grades yet). "
+                f"It is correct for PREDICTION but not for TRAINING.\n\n"
+                f"To train the model, use the HISTORICAL MIS export that includes "
+                f"Final_Avg_GRD for past students:\n"
+                f"  SELECT id_no, program, college, seccode, year, sex_code, "
+                f"home_address, civil_status, religion, final_avg_grd "
+                f"FROM public.mis_students WHERE final_avg_grd IS NOT NULL;"
+                if not has_grades
+                else
+                f"All {n_total} students have Final_Avg_GRD < {GPA_AT_RISK_THRESHOLD} "
+                f"(all passing). Check that the correct historical dataset is uploaded."
+            )
+        )
+
+    if n_at_risk / max(n_total, 1) < 0.005:
+        print(
+            f"[FeatureEngineering] WARNING: Only {n_at_risk} at-risk students "
+            f"({n_at_risk/max(n_total,1)*100:.1f}%) — model may not learn the "
+            f"at-risk pattern reliably. More historical data with failing grades "
+            f"will improve prediction quality."
+        )
+
     return df
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Derive all engineered features from raw UNIFIED_COLUMNS.
-
-    Produces both TRAINING_FEATURES and DISPLAY_ONLY_FEATURES.
-    Does NOT drop raw source columns — call drop_raw_columns() separately
-    so the caller can still inspect the full DataFrame if needed.
-    Safe to call for both Phase 1 (training) and Phase 2 (prediction) data.
-    """
     df = df.copy()
 
-    # Guard: skip if already engineered (prevents double-run corruption)
     if _is_already_engineered(df):
         print("[FeatureEngineering] WARNING: engineer_features() called on already-"
               "engineered data — skipping to prevent corruption.")
         return df
 
-    # ── 1. Entrance Exam Tier (pre-enrollment) ────────────────────────────────
+    # ── 1. Entrance Exam Tier ─────────────────────────────────────────────────
     exam = pd.to_numeric(
         df.get("Entrance_Exam_Score", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
     )
     df["Entrance_Exam_Tier"] = exam.apply(_exam_tier)
 
-    # ── 2. HS Performance Tier (pre-enrollment) ───────────────────────────────
+    # ── 2. HS Performance Tier ────────────────────────────────────────────────
     hs_gpa = pd.to_numeric(
         df.get("HS_GPA", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
     )
     df["HS_Performance_Tier"] = hs_gpa.apply(_hs_tier)
 
-    # ── 3. Strand–Program Alignment (pre-enrollment) ──────────────────────────
+    # ── 3. Strand–Program Alignment ───────────────────────────────────────────
     df["Strand_Program_Match"] = df.apply(
         lambda r: _strand_match(r.get("SHS_Strand", ""), r.get("Program", "")),
         axis=1,
     )
 
-    # ── 4. Financial Stress (pre-enrollment) ──────────────────────────────────
-    income_raw   = df.get("Family_Income", pd.Series(dtype=str, index=df.index)).fillna("")
-    income_level = income_raw.str.lower().str.strip().map(_INCOME_ORDER).fillna(3)
-    df["Financial_Stress"] = (7 - income_level).clip(lower=1, upper=6).astype(int)
-
-    # ── 5. First-Generation Student (pre-enrollment) ──────────────────────────
+    # ── 5 & 6. First-Gen + Has Scholarship ───────────────────────────────────
+    # Computed before Financial_Stress (step 4) because its formula references
+    # both of these columns.
     parent_edu = df.get(
         "Parent_Highest_Education", pd.Series(dtype=str, index=df.index)
     ).fillna("")
@@ -340,13 +409,29 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         parent_edu.str.lower().str.strip().isin(_NON_COLLEGE_LABELS)
     ).astype(int)
 
-    # ── 6. Has Scholarship (pre-enrollment) ───────────────────────────────────
     scholar = df.get(
         "Scholarship_Applicant", pd.Series(dtype=str, index=df.index)
     ).fillna("")
     df["Has_Scholarship"] = scholar.apply(_is_truthy).astype(int)
 
-    # ── 7. Gap Years (pre-enrollment) ─────────────────────────────────────────
+    # ── 4. Financial Stress ───────────────────────────────────────────────────
+    # fillna(0) on both dependency columns guards against NaN propagation into
+    # the arithmetic, which would produce NaN stress values and crash .astype(int).
+    income_raw   = df.get("Family_Income", pd.Series(dtype=str, index=df.index)).fillna("")
+    income_level = income_raw.str.lower().str.strip().map(_INCOME_ORDER).fillna(3)
+
+    stress = (
+        7 - income_level
+        + (1 - df["Has_Scholarship"].fillna(0))
+        + df["First_Gen_Student"].fillna(0)
+    )
+    df["Financial_Stress"] = stress.fillna(3).clip(lower=1, upper=10).astype(int)
+
+    # ── 7. Gap Years ──────────────────────────────────────────────────────────
+    # FIX: Year_Enrolled stores plain 4-digit integers (e.g. 2023), not date
+    # strings. pd.to_datetime("2023") silently coerces many values to NaT,
+    # producing NaN years that crash the subsequent .astype(int).
+    # pd.to_numeric correctly parses year integers from all portal formats.
     yr_grad = pd.to_numeric(
         df.get("Year_Graduated", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
@@ -359,57 +444,65 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         (yr_enrl - yr_grad - 1).clip(lower=0).fillna(0).astype(int)
     )
 
-    # ── 8. Private HS (pre-enrollment) ────────────────────────────────────────
+    # ── 8. Private HS ─────────────────────────────────────────────────────────
     hs_type = df.get("HS_Type", pd.Series(dtype=str, index=df.index)).fillna("")
     df["Private_HS"] = (
         hs_type.str.lower().str.contains("private", na=False)
     ).astype(int)
 
-    # ── 9. Has HS Honors (pre-enrollment) ─────────────────────────────────────
+    # ── 9. Has HS Honors ──────────────────────────────────────────────────────
     honors = df.get("Graduation_Honors", pd.Series(dtype=str, index=df.index)).fillna("")
     df["Has_HS_Honors"] = honors.apply(
         lambda v: 0 if str(v).strip().lower() in ("", "none", "nan", "—", "n/a") else 1
     )
 
-    # ── 10. Age at Enrollment (pre-enrollment) ────────────────────────────────
+    # ── 10. Age at Enrollment ─────────────────────────────────────────────────
     birthdate = pd.to_datetime(
         df.get("Birthdate", pd.Series(dtype=str, index=df.index)),
         errors="coerce",
     )
-    df["Age_At_Enrollment"] = (yr_enrl - birthdate.dt.year).clip(lower=10, upper=60)
-    age_median = df["Age_At_Enrollment"].median()
-    df["Age_At_Enrollment"] = (
-        df["Age_At_Enrollment"]
-        .fillna(age_median if pd.notna(age_median) else 18)
-        .astype(float)
-    )
+    age_raw    = (yr_enrl - birthdate.dt.year).clip(lower=10, upper=60)
+    age_median = age_raw.median()
+    age_filled = age_raw.fillna(age_median if pd.notna(age_median) else 18)
 
-    # ── 11. Distance from campus (pre-enrollment) ─────────────────────────────
-    # Resolve municipality from dedicated column or extract from Home_Address.
+    # FIX: pd.cut is called on the already-filled series so there are no NaN
+    # inputs that would produce NaN categories. Without this, students with
+    # missing Birthdate got NaN Age_Group, breaking encode_categorical() later.
+    df["Age_Group"] = pd.cut(
+        age_filled,
+        bins=[0, 20, 24, 100],
+        labels=["traditional", "adult", "older"],
+    ).astype(object)   # cast Categorical → object to prevent imputer issues
+
+    df["Age_At_Enrollment"] = age_filled.astype(float)
+
+    # ── 11. Distance from campus ──────────────────────────────────────────────
     municipality = pd.Series("", index=df.index)
 
     if "Municipality" in df.columns:
-        municipality = df["Municipality"].fillna("").str.strip().str.lower()
+        # Normalise: lowercase + strip " city" so "BOGO CITY" and "BOGO"
+        # resolve to the same geo cache key ("bogo")
+        municipality = (df["Municipality"].fillna("")
+                        .str.strip().str.lower()
+                        .str.replace(r"\s+city$", "", regex=True)
+                        .str.strip())
     elif "Home_Address" in df.columns:
         def _extract_muni(addr: str) -> str:
             if not addr or addr.strip().lower() in ("", "nan", "none", "n/a"):
                 return ""
-            parts = [p.strip().lower() for p in addr.split(",")]
-            for part in reversed(parts):
-                clean = part.replace(" city", "").strip()
-                if clean in _GEO_CACHE:
-                    return clean
+            addr_clean = addr.lower().replace(" city", "")
+            for muni_name in _GEO_CACHE.keys():
+                if muni_name in addr_clean:
+                    return muni_name
             return ""
         municipality = df["Home_Address"].fillna("").astype(str).apply(_extract_muni)
 
-    df["Distance_KM"] = municipality.apply(_calc_distance)
+    df["Distance_KM"]     = municipality.apply(_calc_distance)
     df["Distance_Bucket"] = df["Distance_KM"].apply(
         lambda d: "unknown" if d < 0 else _distance_bucket(d)
     )
 
-    # ── DISPLAY-ONLY: grade-derived features (NOT used in training) ───────────
-    # These are computed so the UI can show them on student profile cards,
-    # but drop_training_leakage() removes them before the model sees the data.
+    # ── DISPLAY-ONLY: grade-derived features ─────────────────────────────────
     grd = pd.to_numeric(
         df.get("Final_Avg_GRD", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
@@ -421,24 +514,40 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df.get("Year", pd.Series(dtype=float, index=df.index)),
             errors="coerce",
         )
-        .fillna(1)
-        .clip(lower=1)
-        .astype(int)
+        .fillna(1).clip(lower=1).astype(int)
     )
+
+    # ── Risk index features ───────────────────────────────────────────────────
+    df["Program_Risk_Index"] = (
+        df["Program"].astype(str).str.strip().str.upper()
+        .map(_PROGRAM_RISK_MAP)
+        .fillna(_GLOBAL_PROGRAM_RISK)
+    )
+
+    if "Municipality" in df.columns:
+        df["Municipality_Risk_Index"] = (
+            df["Municipality"].astype(str).str.strip().str.lower()
+            .map(_MUNICIPALITY_RISK_MAP)
+            .fillna(_GLOBAL_MUNICIPALITY_RISK)
+        )
+    else:
+        df["Municipality_Risk_Index"] = _GLOBAL_MUNICIPALITY_RISK
+
+    # ── Final safety: cast any residual Categorical columns to object ─────────
+    for col in df.select_dtypes(include="category").columns:
+        df[col] = df[col].astype(object)
 
     print(
         f"[FeatureEngineering] Features engineered. "
         f"DataFrame shape: {df.shape}"
     )
+    print("DEBUG: GeoCache Size =", len(_GEO_CACHE))
+    print("DEBUG: Unique Extracted Municipalities =", municipality.nunique())
+    print("DEBUG: Null Birthdates Count =", birthdate.isna().sum())
     return df
 
 
 def drop_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Remove source columns that have been replaced by engineered features.
-    Only drops columns that actually exist to avoid KeyError.
-    Safe to call multiple times — no-ops if raw columns are already gone.
-    """
     existing = [c for c in COLS_TO_DROP if c in df.columns]
     df = df.drop(columns=existing)
     print(
@@ -449,14 +558,6 @@ def drop_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_training_leakage(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Remove grade-derived and display-only columns before the model sees the data.
-    Call this as the LAST step before TrainingEngine or PredictionEngine.
-
-    Removes: GPA_Tier, Has_College_Grade, Year_Level (grade-derived),
-             Distance_KM (redundant — Distance_Bucket used instead),
-             Scholarship_Type (55 %+ missing in historical data).
-    """
     leakage_cols = DISPLAY_ONLY_FEATURES + ["Scholarship_Type"]
     existing = [c for c in leakage_cols if c in df.columns]
     if existing:
@@ -465,52 +566,62 @@ def drop_training_leakage(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def deduplicate_on_student_id(df: pd.DataFrame) -> pd.DataFrame:
+    before = len(df)
+
+    if "Student_ID" in df.columns:
+        df = (
+            df.sort_index()
+              .drop_duplicates(subset=["Student_ID"], keep="last")
+              .reset_index(drop=True)
+        )
+        id_col_used = "Student_ID"
+    else:
+        print(
+            "[FeatureEngineering] WARNING: Student_ID not found — "
+            "falling back to full-row deduplication. "
+            "This may incorrectly collapse distinct students with "
+            "identical engineered feature values."
+        )
+        df = df.drop_duplicates().reset_index(drop=True)
+        id_col_used = "all columns"
+
+    removed = before - len(df)
+    if removed:
+        print(
+            f"[FeatureEngineering] Removed {removed} duplicate rows "
+            f"({before} → {len(df)}) — keyed on {id_col_used}"
+        )
+    return df
+
+
 def run_full_feature_pipeline(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    PHASE 1 — Complete training pipeline for historical data (has Final_Avg_GRD).
+    print("CRITICAL CHECK - Actual Data Columns:", df.columns.tolist())
+    _ensure_geo_cache()
 
-    Steps:
-        normalize_columns → define_target → engineer_features → drop_raw_columns
-        → drop_duplicates → drop_training_leakage → class-imbalance warning
-
-    Returns a DataFrame whose columns are TRAINING_FEATURES + risk_label,
-    ready for DataPipeline (encode / scale) then TrainingEngine.
-    """
-    # ── Guard: detect if pipeline has already run on this data ───────────────
-    # This happens when the training page passes already-processed data.
-    # Symptom: engineered columns present + raw source columns absent.
-    # Effect without this guard: deduplication collapses rows to ~28,
-    # metrics become undefined, model produces 0 % accuracy.
     if _is_already_engineered(df):
         print(
             "[FeatureEngineering] WARNING: run_full_feature_pipeline() received "
             "already-engineered data. Skipping engineering steps. "
             "Pass the RAW unified dataset, not the pre-processed one."
         )
-        # Still drop leakage cols and deduplicate if not yet done
-        df = df.drop_duplicates()
+        df = deduplicate_on_student_id(df)
         df = drop_training_leakage(df)
         return df
 
     df = normalize_columns(df)
     df = define_target(df)
+    _build_program_risk_map(df)
+    _build_municipality_risk_map(df)
     df = engineer_features(df)
+
+    df = deduplicate_on_student_id(df)
     df = drop_raw_columns(df)
-
-    before = len(df)
-    df = df.drop_duplicates()
-    removed = before - len(df)
-    if removed:
-        print(
-            f"[FeatureEngineering] Removed {removed} duplicate rows "
-            f"({before} → {len(df)})"
-        )
-
     df = drop_training_leakage(df)
 
     if TARGET_COLUMN in df.columns:
-        counts       = df[TARGET_COLUMN].value_counts()
-        total        = len(df)
+        counts      = df[TARGET_COLUMN].value_counts()
+        total       = len(df)
         print("[FeatureEngineering] Final class distribution:")
         for label, count in counts.items():
             print(f"  {label}: {count} ({count / total * 100:.1f} %)")
@@ -524,29 +635,40 @@ def run_full_feature_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def select_prediction_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if PREDICTION_ID_COLUMN not in df.columns:
+        df[PREDICTION_ID_COLUMN] = [f"STU-{i + 1:05d}" for i in range(len(df))]
+
+    for col in TRAINING_FEATURES:
+        if col not in df.columns:
+            df[col] = _PREDICTION_FEATURE_DEFAULTS.get(col, 0)
+
+    df = df[PREDICTION_FEATURES]
+
+    print(
+        f"[FeatureEngineering] Prediction feature set enforced: "
+        f"{len(df.columns)} columns -> {list(df.columns)}"
+    )
+    return df
+
+
 def run_prediction_pipeline(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    PHASE 2 — Prediction pipeline for incoming students (no Final_Avg_GRD).
-
-    Same steps as run_full_feature_pipeline() but WITHOUT define_target(),
-    because there are no grades to derive a label from.
-
-    Returns a DataFrame whose columns are TRAINING_FEATURES,
-    ready to be scored by the saved model.
-    """
-    if _is_already_engineered(df):
-        print(
-            "[FeatureEngineering] WARNING: run_prediction_pipeline() received "
-            "already-engineered data. Skipping engineering steps."
-        )
-        df = drop_training_leakage(df)
-        return df
+    print("CRITICAL CHECK - Actual Data Columns:", df.columns.tolist())
+    _ensure_geo_cache()
 
     df = normalize_columns(df)
-    df = engineer_features(df)
-    df = drop_raw_columns(df)
-    df = drop_training_leakage(df)
-    return df
+
+    if _is_already_engineered(df):
+        print(
+            "[FeatureEngineering] run_prediction_pipeline() received "
+            "already-engineered data — skipping engineering steps."
+        )
+    else:
+        df = engineer_features(df)
+
+    return select_prediction_features(df)
 
 
 # =============================================================================
@@ -554,21 +676,16 @@ def run_prediction_pipeline(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def _is_already_engineered(df: pd.DataFrame) -> bool:
-    """
-    Return True if the DataFrame has already been through engineer_features().
-    Detected by the presence of any engineered output column.
-    Used to guard against running the pipeline twice on the same data.
-    """
     engineered_markers = {
         "Entrance_Exam_Tier", "HS_Performance_Tier", "Strand_Program_Match",
-        "Financial_Stress", "First_Gen_Student", "Has_Scholarship",
+        "First_Gen_Student", "Has_Scholarship", "Financial_Stress",
         "Gap_Years", "Private_HS", "Has_HS_Honors", "Age_At_Enrollment",
         "Distance_Bucket",
     }
     return bool(engineered_markers & set(df.columns))
 
+
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Return great-circle distance in kilometres between two coordinates."""
     from math import radians, sin, cos, sqrt, atan2
     R    = 6371
     dlat = radians(lat2 - lat1)
@@ -581,7 +698,6 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _calc_distance(muni: str) -> float:
-    """Return distance in km from municipality to campus, or -1.0 if unknown."""
     if not muni or muni not in _GEO_CACHE:
         return -1.0
     lat, lon = _GEO_CACHE[muni]
@@ -589,22 +705,47 @@ def _calc_distance(muni: str) -> float:
 
 
 def _distance_bucket(km: float) -> str:
-    """Classify a distance value into a human-readable bucket label."""
     for label, (lo, hi) in _DISTANCE_BUCKETS.items():
         if lo <= km < hi:
             return label
     return "unknown"
 
 
+def _build_program_risk_map(df: pd.DataFrame) -> None:
+    global _PROGRAM_RISK_MAP, _GLOBAL_PROGRAM_RISK
+
+    if TARGET_COLUMN not in df.columns:
+        return
+
+    risk_rate = (
+        df.assign(Program=df["Program"].astype(str).str.strip().str.upper())
+          .groupby("Program")[TARGET_COLUMN]
+          .apply(lambda x: (x == "at_risk").mean())
+    )
+    _PROGRAM_RISK_MAP = risk_rate.to_dict()
+    if len(risk_rate):
+        _GLOBAL_PROGRAM_RISK = float(risk_rate.mean())
+
+
+def _build_municipality_risk_map(df: pd.DataFrame) -> None:
+    global _MUNICIPALITY_RISK_MAP, _GLOBAL_MUNICIPALITY_RISK
+
+    if TARGET_COLUMN not in df.columns or "Municipality" not in df.columns:
+        return
+
+    risk_rate = (
+        df.assign(
+            Municipality=df["Municipality"].astype(str).str.strip().str.lower()
+        )
+        .groupby("Municipality")[TARGET_COLUMN]
+        .apply(lambda x: (x == "at_risk").mean())
+    )
+    _MUNICIPALITY_RISK_MAP = risk_rate.to_dict()
+    if len(risk_rate):
+        _GLOBAL_MUNICIPALITY_RISK = float(risk_rate.mean())
+
+
 def _gpa_tier(v: Any) -> int:
-    """
-    Philippine GPA: 1.0 (best) → 5.0 (fail).
-        -1  missing (no college grade yet)
-         0  excellent  (< 1.75)
-         1  passing    (1.75 – 2.49)
-         2  borderline (2.50 – 2.99)
-         3  at-risk    (>= 3.0)
-    """
     v = pd.to_numeric(v, errors="coerce")
     if pd.isna(v): return -1
     if v >= 3.0:   return 3
@@ -614,7 +755,6 @@ def _gpa_tier(v: Any) -> int:
 
 
 def _exam_tier(v: Any) -> int:
-    """0=strong(>=80)  1=average(65–79)  2=weak(<65).  Returns 1 for missing."""
     v = pd.to_numeric(v, errors="coerce")
     if pd.isna(v): return 1
     if v >= 80:    return 0
@@ -623,7 +763,6 @@ def _exam_tier(v: Any) -> int:
 
 
 def _hs_tier(v: Any) -> int:
-    """0=high(>=90)  1=average(80–89)  2=low(<80).  Returns 1 for missing."""
     v = pd.to_numeric(v, errors="coerce")
     if pd.isna(v): return 1
     if v >= 90:    return 0
@@ -631,14 +770,18 @@ def _hs_tier(v: Any) -> int:
     return 2
 
 
-def _strand_match(strand: Any, program: Any) -> float:
-    """Return 1.0=aligned, 0.5=unknown strand, 0.0=mismatched or vocational."""
-    s = str(strand).strip().upper()
-    p = str(program).strip().upper()
+def _strand_match(strand, program) -> int:
+    s = str(strand).upper().strip()
+    p = str(program).upper().strip()
+
     aligned = _STRAND_MAP.get(s)
-    if aligned is None: return 0.5   # strand not in map → unknown
-    if not aligned:     return 0.0   # TVL / GAS / Sports / Arts → mismatch
-    return 1.0 if p in aligned else 0.0
+    if aligned is None:
+        return -1
+    if p in aligned:
+        return 2
+    if s in {"TVL", "GAS"}:
+        return 1
+    return 0
 
 
 def _is_truthy(v: Any) -> bool:

@@ -47,6 +47,7 @@ from .pages.portal_upload_page import (
     RegistrarPortalPage,
 )
 from .pages.data_merge_pipeline import DataMergePipelinePage
+from .pages.prediction_page import PredictionPage
 
 
 
@@ -311,6 +312,29 @@ class DashboardWindow(AnimatedBackground):
             button.clicked.connect(lambda checked, idx=page_index, text=item["text"]: self.on_nav_button_clicked(text, idx))
             sidebar_layout.addWidget(button)
 
+        sidebar_layout.addSpacing(10)
+        #=======================================
+        # PREDICTION Section
+        #=======================================
+
+        prediction_label = QLabel("PREDICTION")
+        prediction_label.setObjectName("sectionLabel")
+        sidebar_layout.addWidget(prediction_label)
+
+        prediction_buttons = [
+            {
+                "text": "Prediction",
+                "icon": "assets/icons/play.svg",
+                "page_index": 9,
+            },
+        ]
+        for item in prediction_buttons:
+            button = self.create_nav_button(item["text"], item["icon"])
+            page_index = item["page_index"]
+            self.nav_buttons[item["text"]] = button
+            button.clicked.connect(lambda checked, idx=page_index, text=item["text"]: self.on_nav_button_clicked(text, idx))
+            sidebar_layout.addWidget(button)
+
         sidebar_scroll.setWidget(nav_content)
         sidebar_outer.addWidget(sidebar_scroll, 1)
 
@@ -371,6 +395,7 @@ class DashboardWindow(AnimatedBackground):
         self.sao_portal_page = SaoPortalPage()
         self.guidance_portal_page = GuidancePortalPage()
         self.registrar_portal_page = RegistrarPortalPage()
+        self.prediction_page = PredictionPage()
 
         self.merge_pipeline_page._on_proceed_training = (
             lambda: self.on_nav_button_clicked("Model Training", 3)
@@ -416,6 +441,10 @@ class DashboardWindow(AnimatedBackground):
             self.registrar_portal_page
         )
 
+        prediction_scroll = self.create_scrollable_page(
+            self.prediction_page
+        )
+
         # =====================================
         # ADD SCROLLABLE PAGES TO STACK
         # =====================================
@@ -454,6 +483,10 @@ class DashboardWindow(AnimatedBackground):
 
         self.stacked_widget.addWidget(
             registrar_portal_scroll
+        )
+
+        self.stacked_widget.addWidget(
+            prediction_scroll
         )
 
         # Set dashboard as the starting page

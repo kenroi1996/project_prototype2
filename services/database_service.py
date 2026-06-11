@@ -1,9 +1,10 @@
 """PostgreSQL database service — Star Schema + Portal Source Tables."""
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from typing import Optional, List, Dict, Any
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -86,16 +87,14 @@ PORTAL_SOURCE_CONFIGS = {
 
 
 class DatabaseService:
-    """Handles PostgreSQL connections for all portal and star schema operations."""
-
-    def __init__(self, host="localhost", port=5432, database="testDB",
-                 user="postgres", password="admin123"):
+    def __init__(self, host=None, port=None, database=None,
+                 user=None, password=None):
         self.conn_params = {
-            "host": host,
-            "port": port,
-            "database": database,
-            "user": user,
-            "password": password,
+            "host": host or os.getenv("DB_HOST", "localhost"),
+            "port": port or int(os.getenv("DB_PORT", "5432")),
+            "database": database or os.getenv("DB_NAME", "testDB"),
+            "user": user or os.getenv("DB_USER", "postgres"),
+            "password": password or os.getenv("DB_PASSWORD", "admin123"),
         }
         self._conn: Optional[psycopg2.extensions.connection] = None
 
@@ -443,3 +442,76 @@ class DatabaseService:
         with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query)
             return [dict(row) for row in cur.fetchall()]
+
+
+
+    def get_active_model(self):
+        """
+        Fetches the current active model from the model_registry table.
+        Returns a dictionary with model details or None if no active model exists.
+        """
+        query = """
+            SELECT model_name, model_type, metadata 
+            FROM public.model_registry 
+            WHERE is_active = TRUE 
+            ORDER BY created_at DESC 
+            LIMIT 1;
+        """
+        try:
+            # Assuming self.conn is the active connection managed by the context manager
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query)
+                row = cur.fetchone()
+                # Return as a standard dict for the UI to consume
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"[DatabaseService] Error fetching active model: {e}")
+            return None
+
+    def register_model(self, name, model_type, metadata, is_active=True):
+        """
+        Registers a new model record into the registry.
+        If is_active is True, it deactivates all other models first to ensure
+        only one model is marked active at a time.
+        """
+        try:
+            with self.conn.cursor() as cur:
+                # Ensure only one model is active at a time if this one is set to active
+                if is_active:
+                    cur.execute("UPDATE public.model_registry SET is_active = FALSE;")
+                
+                query = """
+                    INSERT INTO public.model_registry (model_name, model_type, metadata, is_active)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING model_id;
+                """
+                # The Json() wrapper handles Python dict -> PostgreSQL JSONB conversion
+                cur.execute(query, (name, model_type, Json(metadata), is_active))
+                model_id = cur.fetchone()[0]
+                
+                return {
+                    "success": True, 
+                    "id": model_id, 
+                    "table": "model_registry"
+                }
+        except Exception as e:
+            # Return error details to be logged in the UI's Activity Log
+            return {"success": False, "error": str(e)}
+
+    def ensure_schema(self):
+        """Utility to ensure the registry table exists (matching your CREATE TABLE)."""
+        schema_query = """
+        CREATE TABLE IF NOT EXISTS public.model_registry (
+            model_id SERIAL PRIMARY KEY,
+            model_name VARCHAR(100) NOT NULL,
+            model_type VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT FALSE,
+            metadata JSONB
+        );
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(schema_query)
+        except Exception as e:
+            print(f"[DatabaseService] Schema init error: {e}")

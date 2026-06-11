@@ -47,7 +47,7 @@ class XGBTrainingWorker(QThread):
         learning_rate: float = 0.05,
         parent = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent=None)  # Force no parent
         self.test_size     = test_size
         self.n_estimators  = n_estimators
         self.max_depth     = max_depth

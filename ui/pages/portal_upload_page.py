@@ -356,6 +356,12 @@ class PortalUploadPage(QWidget):
         self._refresh_stats_ui()
         self._update_dataset_action_buttons()
 
+        DataStore.get().add_activity(
+            f"{self._portal_key.upper()} dataset loaded — {row_count:,} records",
+            icon="📤",
+            color="#4f8cff",
+        )
+
     def _push_dataset_to_database(self, headers: list, rows: list) -> bool:
         """Upsert headers/rows to the portal PostgreSQL table. Returns success."""
         self._pipeline_log.append(
@@ -1219,44 +1225,6 @@ class PortalUploadPage(QWidget):
         upload_layout.addLayout(btn_row)
 
         content_row.addWidget(upload_card, 1)
-
-        # Expected fields
-        fields_card = QFrame()
-        fields_card.setObjectName("portalCard")
-        fields_layout = QVBoxLayout(fields_card)
-        fields_layout.setContentsMargins(24, 20, 24, 20)
-        fields_layout.setSpacing(14)
-
-        fields_title = QLabel("EXPECTED CSV FIELDS")
-        fields_title.setObjectName("portalCardTitle")
-        fields_layout.addWidget(fields_title)
-
-        fields_hint = QLabel("Ensure your upload includes the following column headers:")
-        fields_hint.setObjectName("portalOfficeDesc")
-        fields_hint.setWordWrap(True)
-        fields_layout.addWidget(fields_hint)
-
-        fields = cfg["fields"]
-        if len(fields) > 6:
-            fields_grid_host = QWidget()
-            fields_grid = QGridLayout(fields_grid_host)
-            fields_grid.setContentsMargins(0, 0, 0, 0)
-            fields_grid.setHorizontalSpacing(8)
-            fields_grid.setVerticalSpacing(8)
-            cols = 2
-            for i, field in enumerate(fields):
-                pill = QLabel(field)
-                pill.setObjectName("portalFieldPill")
-                fields_grid.addWidget(pill, i // cols, i % cols)
-            fields_layout.addWidget(fields_grid_host)
-        else:
-            for field in fields:
-                pill = QLabel(field)
-                pill.setObjectName("portalFieldPill")
-                fields_layout.addWidget(pill)
-
-        fields_layout.addStretch()
-        content_row.addWidget(fields_card, 1)
 
         self.main_layout.addLayout(content_row)
 

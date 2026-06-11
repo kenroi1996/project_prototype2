@@ -1,76 +1,72 @@
 """
 Risk Persistence Service
 ========================
-Saves PredictionEngine results to fact_student_risk and reads them back.
+Saves PredictionEngine results into the EarlyAlert star schema.
 
-Schema (testDB — EarlyAlert v2)
---------------------------------
-fact_student_risk
-  PK  fact_id             serial
-  NK  student_id          varchar(20)         ← natural key from portals
-      academic_year       varchar(20)
-      semester            smallint            ← 1 or 2
-      model_run_id        integer             ← FK merge_log.run_id (optional)
-      predicted_at        timestamp
+Target tables (in dependency order)
+-------------------------------------
+  dim_student              — one row per student, upserted on student_id
+  dim_program              — one row per program code, upserted on program_code
+  dim_academic_term        — one row per (academic_year, semester) pair
+  fact_student_academic_risk — one row per prediction run per student
 
-  -- Feature groups written from unified dataset --
-      program, college, sec_code, year_level, final_avg_grd
-      sex_code, home_address, civil_status, birthdate, year_enrolled
-      entrance_exam_score, family_income, parent_highest_education
-      hs_gpa, year_graduated, shs_strand, hs_type, graduation_honors, hs_school_name
-      scholarship_applicant, scholarship_type
+Write strategy
+--------------
+  - dim_* tables: INSERT … ON CONFLICT … DO UPDATE (upsert)
+    Dimension rows are created on first encounter and refreshed with the
+    latest values on every subsequent prediction run.
+  - fact table: plain INSERT (no unique constraint on the table — each
+    prediction run produces a new snapshot row).
+  - Every student row is wrapped in its own SAVEPOINT so a single bad
+    record never aborts the entire batch.
+  - dim lookups (student_key, program_key, term_key) are resolved once per
+    batch where possible, then cached in a local dict to avoid N+1 queries.
 
-  -- ML outputs --
-      risk_score          numeric(5,4)        ← probability 0.0–1.0
-      risk_level_id       smallint            ← FK dim_risk_level (1=Low,2=Medium,3=High)
-      risk_label          varchar(20)         ← 'Low' | 'Medium' | 'High'
-      confidence          numeric(5,4)
-      top_risk_factor     varchar(255)
-
-  UNIQUE (student_id, academic_year, semester)
-
-dim_risk_level  (1=Low, 2=Medium, 3=High)  — seeded by schema, read-only here.
+Risk level mapping  (matches dim_risk_level seed rows)
+-------------------------------------------------------
+  1 = Low       (low_risk)
+  2 = Medium    (moderate_risk)
+  3 = High      (high_risk)
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
-
-import psycopg2
+from typing import Any, Dict, List, Optional, Tuple
 
 from database.connection import get_connection
 
 
 # ---------------------------------------------------------------------------
-# Risk level mapping  (matches dim_risk_level seed data in schema)
+# Constants
 # ---------------------------------------------------------------------------
+
 _RISK_LEVEL_MAP: Dict[str, int] = {
-    # PredictionEngine category strings
     "low_risk":      1,
     "moderate_risk": 2,
     "high_risk":     3,
-    # Normalised label strings (fallback)
     "low":           1,
     "medium":        2,
     "moderate":      2,
     "high":          3,
 }
 
-_RISK_LABEL_MAP: Dict[str, str] = {
-    "low_risk":      "Low",
-    "moderate_risk": "Medium",
-    "high_risk":     "High",
-}
-
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Type helpers
 # ---------------------------------------------------------------------------
 
-def _to_numeric(value: str, cast) -> Optional[Any]:
-    """Cast a string to a numeric type; return None on blank or error."""
-    v = str(value).strip()
+def _str(value, maxlen: int = None) -> Optional[str]:
+    """Strip and truncate a value; return None if blank/sentinel."""
+    v = str(value).strip() if value is not None else ""
+    if not v or v in ("—", "None", "nan", "none"):
+        return None
+    return v[:maxlen] if maxlen else v
+
+
+def _num(value, cast):
+    """Cast to numeric type; return None on blank or error."""
+    v = str(value).strip() if value is not None else ""
     if not v or v in ("—", "None", "nan"):
         return None
     try:
@@ -79,17 +75,15 @@ def _to_numeric(value: str, cast) -> Optional[Any]:
         return None
 
 
-def _to_bool(value: str) -> Optional[bool]:
-    """Convert a string scholarship_applicant value to bool."""
-    v = str(value).strip().lower()
+def _bool(value) -> Optional[bool]:
+    v = str(value).strip().lower() if value is not None else ""
     if not v or v in ("—", "none", "nan", ""):
         return None
     return v in ("true", "1", "yes", "t", "y", "with", "approved", "scholar")
 
 
-def _to_date(value: str) -> Optional[date]:
-    """Parse a date string to a date object; return None on failure."""
-    v = str(value).strip()
+def _date(value) -> Optional[date]:
+    v = str(value).strip() if value is not None else ""
     if not v or v in ("—", "None", "nan"):
         return None
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
@@ -100,12 +94,182 @@ def _to_date(value: str) -> Optional[date]:
     return None
 
 
-def _semester_int(semester) -> int:
-    """Normalise semester to 1 or 2."""
-    s = str(semester).strip().lower()
-    if s.startswith("2"):
-        return 2
-    return 1
+def _semester(value) -> int:
+    return 2 if str(value).strip().startswith("2") else 1
+
+
+# ---------------------------------------------------------------------------
+# Dimension upserts  (return the surrogate key)
+# ---------------------------------------------------------------------------
+
+def _upsert_student(cur, pred: Dict[str, Any]) -> int:
+    """
+    Upsert dim_student on student_id.
+    Returns student_key.
+    """
+    cur.execute("""
+        INSERT INTO public.dim_student (
+            student_id, first_name, last_name, sex_code, birthdate,
+            civil_status, home_address, home_municipality,
+            family_income_bracket, parent_highest_education,
+            hs_school_name, hs_type, shs_strand, graduation_honors,
+            scholarship_type, religion
+        )
+        VALUES (
+            %(student_id)s, %(first_name)s, %(last_name)s, %(sex_code)s,
+            %(birthdate)s, %(civil_status)s, %(home_address)s,
+            %(home_municipality)s, %(family_income_bracket)s,
+            %(parent_highest_education)s, %(hs_school_name)s,
+            %(hs_type)s, %(shs_strand)s, %(graduation_honors)s,
+            %(scholarship_type)s, %(religion)s
+        )
+        ON CONFLICT (student_id) DO UPDATE SET
+            first_name               = EXCLUDED.first_name,
+            last_name                = EXCLUDED.last_name,
+            sex_code                 = EXCLUDED.sex_code,
+            birthdate                = COALESCE(EXCLUDED.birthdate,
+                                                dim_student.birthdate),
+            civil_status             = EXCLUDED.civil_status,
+            home_address             = EXCLUDED.home_address,
+            home_municipality        = EXCLUDED.home_municipality,
+            family_income_bracket    = EXCLUDED.family_income_bracket,
+            parent_highest_education = EXCLUDED.parent_highest_education,
+            hs_school_name           = EXCLUDED.hs_school_name,
+            hs_type                  = EXCLUDED.hs_type,
+            shs_strand               = EXCLUDED.shs_strand,
+            graduation_honors        = EXCLUDED.graduation_honors,
+            scholarship_type         = EXCLUDED.scholarship_type,
+            religion                 = EXCLUDED.religion
+        RETURNING student_key
+    """, {
+        "student_id":               _str(pred.get("student_id"), 50),
+        "first_name":               _str(pred.get("first_name"), 100),
+        "last_name":                _str(pred.get("last_name"),  100),
+        "sex_code":                 _str(pred.get("sex_code"),   10),
+        "birthdate":                _date(pred.get("birthdate")),
+        "civil_status":             _str(pred.get("civil_status"), 50),
+        "home_address":             _str(pred.get("home_address")),
+        "home_municipality":        _str(pred.get("home_municipality"), 100),
+        "family_income_bracket":    _str(pred.get("family_income_bracket"), 100),
+        "parent_highest_education": _str(pred.get("parent_highest_education"), 150),
+        "hs_school_name":           _str(pred.get("hs_school_name"), 255),
+        "hs_type":                  _str(pred.get("hs_type"), 50),
+        "shs_strand":               _str(pred.get("shs_strand"), 100),
+        "graduation_honors":        _str(pred.get("graduation_honors"), 100),
+        "scholarship_type":         _str(pred.get("scholarship_type"), 100),
+        "religion":                 _str(pred.get("religion"), 100),
+    })
+    row = cur.fetchone()
+    return row[0]
+
+
+def _upsert_program(cur, program_code: str, college: str) -> Optional[int]:
+    """
+    Upsert dim_program on program_code.
+    Returns program_key, or None if program_code is blank.
+    """
+    code = _str(program_code, 50)
+    if not code:
+        return None
+
+    cur.execute("""
+        INSERT INTO public.dim_program (program_code, program_name, college)
+        VALUES (%(code)s, %(code)s, %(college)s)
+        ON CONFLICT (program_code) DO UPDATE SET
+            college = COALESCE(EXCLUDED.college, dim_program.college)
+        RETURNING program_key
+    """, {
+        "code":    code,
+        "college": _str(college, 150),
+    })
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _upsert_term(cur, academic_year: str, semester: int) -> int:
+    """
+    Upsert dim_academic_term on (academic_year, semester).
+    Returns term_key.
+    """
+    cur.execute("""
+        INSERT INTO public.dim_academic_term (academic_year, semester)
+        VALUES (%(academic_year)s, %(semester)s)
+        ON CONFLICT (academic_year, semester) DO UPDATE SET
+            academic_year = EXCLUDED.academic_year
+        RETURNING term_key
+    """, {
+        "academic_year": _str(academic_year, 20),
+        "semester":      semester,
+    })
+    row = cur.fetchone()
+    return row[0]
+
+
+# ---------------------------------------------------------------------------
+# Fact insert
+# ---------------------------------------------------------------------------
+
+def _insert_fact(
+    cur,
+    student_key:  int,
+    program_key:  Optional[int],
+    term_key:     int,
+    pred:         Dict[str, Any],
+    model_run_id: Optional[int],
+) -> int:
+    """
+    Insert one row into fact_student_academic_risk.
+    Returns the new fact_id.
+    """
+    raw_score          = float(pred.get("score", 0))
+    predicted_risk_score = round(raw_score / 100.0, 4)   # store as 0.0–1.0
+    risk_level_id      = _RISK_LEVEL_MAP.get(
+        str(pred.get("category", "")).lower(), 1
+    )
+
+    cur.execute("""
+        INSERT INTO public.fact_student_academic_risk (
+            student_key,
+            program_key,
+            term_key,
+            risk_level_id,
+            model_run_id,
+            predicted_at,
+            year_level,
+            entrance_exam_score,
+            high_school_gpa,
+            predicted_risk_score,
+            prediction_confidence
+        )
+        VALUES (
+            %(student_key)s,
+            %(program_key)s,
+            %(term_key)s,
+            %(risk_level_id)s,
+            %(model_run_id)s,
+            %(predicted_at)s,
+            %(year_level)s,
+            %(entrance_exam_score)s,
+            %(high_school_gpa)s,
+            %(predicted_risk_score)s,
+            %(prediction_confidence)s
+        )
+        RETURNING fact_id
+    """, {
+        "student_key":          student_key,
+        "program_key":          program_key,
+        "term_key":             term_key,
+        "risk_level_id":        risk_level_id,
+        "model_run_id":         model_run_id,
+        "predicted_at":         datetime.now(),
+        "year_level":           _num(pred.get("year_level"), int),
+        "entrance_exam_score":  _num(pred.get("entrance_exam_score"), float),
+        "high_school_gpa":      _num(pred.get("hs_gpa"), float),
+        "predicted_risk_score": predicted_risk_score,
+        "prediction_confidence": predicted_risk_score,   # use same value
+    })
+    row = cur.fetchone()
+    return row[0]
 
 
 # ---------------------------------------------------------------------------
@@ -113,30 +277,34 @@ def _semester_int(semester) -> int:
 # ---------------------------------------------------------------------------
 
 class RiskPersistenceService:
-    """Persist / retrieve prediction results against the EarlyAlert v2 schema."""
+    """
+    Persist prediction results into the EarlyAlert star schema.
 
-    # ------------------------------------------------------------------
-    # WRITE — called from PredictionMixin after every successful run
-    # ------------------------------------------------------------------
+    Public API (called from PredictionMixin._on_prediction_complete):
+        RiskPersistenceService.save_predictions(
+            predictions, model_id, academic_year, semester, model_run_id
+        )
+    """
 
     @staticmethod
     def save_predictions(
-        predictions: List[Dict[str, Any]],
-        model_id: str = "rf",
-        academic_year: str = "2024-2025",
-        semester: str = "1",
-        model_run_id: Optional[int] = None,
+        predictions:   List[Dict[str, Any]],
+        model_id:      str           = "rf",
+        academic_year: str           = "2024-2025",
+        semester:      str           = "1",
+        model_run_id:  Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Upsert prediction results into fact_student_risk.
+        Populate dim_student, dim_program, dim_academic_term, and
+        fact_student_academic_risk for every prediction in the batch.
 
-        Each student row is saved inside its own SAVEPOINT so a single bad
-        record never aborts the whole batch.
+        Each student row is wrapped in a SAVEPOINT so a single bad record
+        never aborts the batch.
 
         Returns
         -------
-        dict  {"success": bool, "inserted": int, "updated": int,
-               "errors": list[str], "total_processed": int}
+        dict  {"success": bool, "inserted": int, "errors": list[str],
+               "total_processed": int}
         """
         conn = None
         try:
@@ -145,43 +313,69 @@ class RiskPersistenceService:
                 return {"success": False, "error": "Could not connect to database."}
 
             cur = conn.cursor()
-            sem = _semester_int(semester)
+            sem = _semester(semester)
+
+            # ── Resolve / create dim_academic_term once for the whole batch ──
+            term_key = _upsert_term(cur, academic_year, sem)
+            print(f"[RiskPersistence] term_key={term_key} "
+                  f"({academic_year}, sem {sem})")
+
+            # ── Cache program_key lookups to avoid repeated upserts ──────────
+            program_key_cache: Dict[str, Optional[int]] = {}
 
             inserted = 0
-            updated  = 0
             errors: List[str] = []
 
             for pred in predictions:
-                sid = pred.get("student_id", "unknown")
+                sid = str(pred.get("student_id", "")).strip()
                 try:
                     cur.execute("SAVEPOINT sp_pred")
-                    action = RiskPersistenceService._upsert_one(
-                        cur, pred, sem, academic_year, model_run_id
+
+                    # ── dim_student ──────────────────────────────────────────
+                    student_key = _upsert_student(cur, pred)
+
+                    # ── dim_program ──────────────────────────────────────────
+                    prog_code = _str(pred.get("program"), 50) or ""
+                    if prog_code not in program_key_cache:
+                        program_key_cache[prog_code] = _upsert_program(
+                            cur,
+                            prog_code,
+                            pred.get("college", ""),
+                        )
+                    program_key = program_key_cache[prog_code]
+
+                    # ── fact_student_academic_risk ────────────────────────────
+                    fact_id = _insert_fact(
+                        cur,
+                        student_key  = student_key,
+                        program_key  = program_key,
+                        term_key     = term_key,
+                        pred         = pred,
+                        model_run_id = model_run_id,
                     )
+
                     cur.execute("RELEASE SAVEPOINT sp_pred")
-                    if action == "insert":
-                        inserted += 1
-                    else:
-                        updated += 1
+                    inserted += 1
 
                 except Exception as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT sp_pred")
                     cur.execute("RELEASE SAVEPOINT sp_pred")
                     msg = f"Student {sid}: {exc}"
                     errors.append(msg)
-                    print(f"[RiskPersistence] {msg}")
+                    print(f"[RiskPersistence] ERROR — {msg}")
 
             conn.commit()
 
             print(
-                f"[RiskPersistence] Done — inserted={inserted}, "
-                f"updated={updated}, errors={len(errors)}"
+                f"[RiskPersistence] Done — "
+                f"inserted={inserted}, errors={len(errors)}, "
+                f"term_key={term_key}"
             )
             return {
-                "success": True,
-                "inserted": inserted,
-                "updated":  updated,
-                "errors":   errors,
+                "success":         True,
+                "inserted":        inserted,
+                "updated":         0,           # fact rows are always new inserts
+                "errors":          errors,
                 "total_processed": len(predictions),
             }
 
@@ -196,220 +390,18 @@ class RiskPersistenceService:
                 conn.close()
 
     # ------------------------------------------------------------------
-    # Internal — single-row upsert aligned to the v2 schema
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _upsert_one(
-        cur,
-        pred: Dict[str, Any],
-        semester: int,
-        academic_year: str,
-        model_run_id: Optional[int],
-    ) -> str:
-        """
-        INSERT … ON CONFLICT (student_id, academic_year, semester) DO UPDATE.
-
-        Returns 'insert' or 'update' based on xmax heuristic.
-        """
-        student_id = str(pred.get("student_id", "")).strip()
-        if not student_id:
-            raise ValueError("Prediction missing student_id")
-
-        meta = pred  # student_meta dict merged into pred by PredictionEngine
-
-        # ── Risk outputs ──────────────────────────────────────────────
-        # PredictionEngine score is 0–100; schema stores 0.0–1.0
-        raw_score    = float(pred.get("score", 0))
-        risk_score   = round(raw_score / 100.0, 4)
-        category     = pred.get("category", "low_risk")
-        risk_level_id = _RISK_LEVEL_MAP.get(category.lower(), 1)
-        risk_label   = _RISK_LABEL_MAP.get(category.lower(), "Low")
-        top_factor   = str(pred.get("factor", "") or "")[:255]
-
-        # ── Feature fields from student_meta ─────────────────────────
-        program  = str(meta.get("program", "") or "")[:100]
-        college  = str(meta.get("college", "") or "")[:100]
-        sec_code = str(meta.get("sec_code", "") or "")[:50]
-
-        year_level   = _to_numeric(meta.get("year_level", ""), int)
-        final_avg_grd = _to_numeric(meta.get("gwa", ""), float)
-
-        sex_code     = str(meta.get("sex_code", "") or "")[:10]
-        home_address = str(meta.get("home_address", "") or "")
-        civil_status = str(meta.get("civil_status", "") or "")[:20]
-        birthdate    = _to_date(meta.get("birthdate", ""))
-        year_enrolled = _to_numeric(meta.get("year_enrolled", ""), int)
-
-        entrance_exam_score       = _to_numeric(meta.get("entrance_exam_score", ""), float)
-        family_income             = str(meta.get("family_income", "") or "")[:100]
-        parent_highest_education  = str(meta.get("parent_highest_education", "") or "")[:150]
-
-        hs_gpa           = _to_numeric(meta.get("hs_gpa", ""), float)
-        year_graduated   = _to_numeric(meta.get("year_graduated", ""), int)
-        shs_strand       = str(meta.get("shs_strand", "") or "")[:100]
-        hs_type          = str(meta.get("hs_type", "") or "")[:100]
-        graduation_honors = str(meta.get("graduation_honors", "") or "")[:100]
-        hs_school_name   = str(meta.get("hs_school_name", "") or "")[:255]
-
-        scholarship_applicant = _to_bool(meta.get("scholarship_applicant", ""))
-        scholarship_type      = str(meta.get("scholarship_type", "") or "")[:100]
-
-        now = datetime.now()
-
-        upsert_sql = """
-            INSERT INTO public.fact_student_risk (
-                student_id,
-                academic_year,
-                semester,
-                model_run_id,
-                predicted_at,
-                program,
-                college,
-                sec_code,
-                year_level,
-                final_avg_grd,
-                sex_code,
-                home_address,
-                civil_status,
-                birthdate,
-                year_enrolled,
-                entrance_exam_score,
-                family_income,
-                parent_highest_education,
-                hs_gpa,
-                year_graduated,
-                shs_strand,
-                hs_type,
-                graduation_honors,
-                hs_school_name,
-                scholarship_applicant,
-                scholarship_type,
-                risk_score,
-                risk_level_id,
-                risk_label,
-                confidence,
-                top_risk_factor
-            )
-            VALUES (
-                %(student_id)s,
-                %(academic_year)s,
-                %(semester)s,
-                %(model_run_id)s,
-                %(predicted_at)s,
-                %(program)s,
-                %(college)s,
-                %(sec_code)s,
-                %(year_level)s,
-                %(final_avg_grd)s,
-                %(sex_code)s,
-                %(home_address)s,
-                %(civil_status)s,
-                %(birthdate)s,
-                %(year_enrolled)s,
-                %(entrance_exam_score)s,
-                %(family_income)s,
-                %(parent_highest_education)s,
-                %(hs_gpa)s,
-                %(year_graduated)s,
-                %(shs_strand)s,
-                %(hs_type)s,
-                %(graduation_honors)s,
-                %(hs_school_name)s,
-                %(scholarship_applicant)s,
-                %(scholarship_type)s,
-                %(risk_score)s,
-                %(risk_level_id)s,
-                %(risk_label)s,
-                %(confidence)s,
-                %(top_risk_factor)s
-            )
-            ON CONFLICT (student_id, academic_year, semester)
-            DO UPDATE SET
-                model_run_id             = EXCLUDED.model_run_id,
-                predicted_at             = EXCLUDED.predicted_at,
-                program                  = EXCLUDED.program,
-                college                  = EXCLUDED.college,
-                sec_code                 = EXCLUDED.sec_code,
-                year_level               = EXCLUDED.year_level,
-                final_avg_grd            = EXCLUDED.final_avg_grd,
-                sex_code                 = EXCLUDED.sex_code,
-                home_address             = EXCLUDED.home_address,
-                civil_status             = EXCLUDED.civil_status,
-                birthdate                = EXCLUDED.birthdate,
-                year_enrolled            = EXCLUDED.year_enrolled,
-                entrance_exam_score      = EXCLUDED.entrance_exam_score,
-                family_income            = EXCLUDED.family_income,
-                parent_highest_education = EXCLUDED.parent_highest_education,
-                hs_gpa                   = EXCLUDED.hs_gpa,
-                year_graduated           = EXCLUDED.year_graduated,
-                shs_strand               = EXCLUDED.shs_strand,
-                hs_type                  = EXCLUDED.hs_type,
-                graduation_honors        = EXCLUDED.graduation_honors,
-                hs_school_name           = EXCLUDED.hs_school_name,
-                scholarship_applicant    = EXCLUDED.scholarship_applicant,
-                scholarship_type         = EXCLUDED.scholarship_type,
-                risk_score               = EXCLUDED.risk_score,
-                risk_level_id            = EXCLUDED.risk_level_id,
-                risk_label               = EXCLUDED.risk_label,
-                confidence               = EXCLUDED.confidence,
-                top_risk_factor          = EXCLUDED.top_risk_factor
-            RETURNING fact_id, xmax
-        """
-
-        cur.execute(upsert_sql, {
-            "student_id":               student_id,
-            "academic_year":            academic_year,
-            "semester":                 semester,
-            "model_run_id":             model_run_id,
-            "predicted_at":             now,
-            "program":                  program,
-            "college":                  college,
-            "sec_code":                 sec_code or None,
-            "year_level":               year_level,
-            "final_avg_grd":            final_avg_grd,
-            "sex_code":                 sex_code or None,
-            "home_address":             home_address or None,
-            "civil_status":             civil_status or None,
-            "birthdate":                birthdate,
-            "year_enrolled":            year_enrolled,
-            "entrance_exam_score":      entrance_exam_score,
-            "family_income":            family_income or None,
-            "parent_highest_education": parent_highest_education or None,
-            "hs_gpa":                   hs_gpa,
-            "year_graduated":           year_graduated,
-            "shs_strand":               shs_strand or None,
-            "hs_type":                  hs_type or None,
-            "graduation_honors":        graduation_honors or None,
-            "hs_school_name":           hs_school_name or None,
-            "scholarship_applicant":    scholarship_applicant,
-            "scholarship_type":         scholarship_type or None,
-            "risk_score":               risk_score,
-            "risk_level_id":            risk_level_id,
-            "risk_label":               risk_label,
-            "confidence":               risk_score,   # same as risk_score
-            "top_risk_factor":          top_factor or None,
-        })
-
-        row = cur.fetchone()
-        # xmax == 0  →  fresh insert;  xmax != 0  →  updated existing row
-        return "insert" if (row and row[1] == 0) else "update"
-
-    # ------------------------------------------------------------------
     # READ — used by RiskAlertsPage / DashboardPage
     # ------------------------------------------------------------------
 
     @staticmethod
     def get_latest_predictions(
         academic_year: Optional[str] = None,
-        semester: Optional[int] = None,
-        limit: int = 500,
+        semester:      Optional[int] = None,
+        limit:         int           = 500,
     ) -> List[Dict[str, Any]]:
         """
-        Fetch the latest risk snapshot from fact_student_risk via
-        v_student_risk_summary (joins dim_risk_level for color / description).
-
-        Falls back to a direct table query if the view is unavailable.
+        Fetch the latest risk snapshot by joining the star schema.
+        Falls back to a simpler query if the view is unavailable.
         """
         conn = None
         try:
@@ -419,47 +411,45 @@ class RiskPersistenceService:
 
             cur = conn.cursor()
 
-            # Build optional WHERE clause
             filters: List[str] = []
             params:  List[Any] = []
             if academic_year:
-                filters.append("academic_year = %s")
+                filters.append("t.academic_year = %s")
                 params.append(academic_year)
             if semester is not None:
-                filters.append("semester = %s")
-                params.append(_semester_int(semester))
+                filters.append("t.semester = %s")
+                params.append(_semester(semester))
 
-            where = ("WHERE " + " AND ".join(filters)) if filters else ""
+            where  = ("WHERE " + " AND ".join(filters)) if filters else ""
             params.append(limit)
 
-            try:
-                cur.execute(
-                    f"""
-                    SELECT *
-                    FROM   public.v_student_risk_summary
-                    {where}
-                    ORDER  BY risk_score DESC
-                    LIMIT  %s
-                    """,
-                    params,
-                )
-            except psycopg2.Error:
-                # View not yet available — fall back to raw table
-                conn.rollback()
-                cur.execute(
-                    f"""
-                    SELECT fact_id, student_id, academic_year, semester,
-                           program, college, year_level, final_avg_grd,
-                           sex_code, entrance_exam_score, hs_gpa,
-                           scholarship_applicant, risk_score, risk_label,
-                           confidence, top_risk_factor, predicted_at
-                    FROM   public.fact_student_risk
-                    {where}
-                    ORDER  BY risk_score DESC
-                    LIMIT  %s
-                    """,
-                    params,
-                )
+            cur.execute(f"""
+                SELECT
+                    f.fact_id,
+                    s.student_id,
+                    s.first_name,
+                    s.last_name,
+                    p.program_code,
+                    p.college,
+                    t.academic_year,
+                    t.semester,
+                    f.year_level,
+                    f.entrance_exam_score,
+                    f.high_school_gpa,
+                    f.predicted_risk_score,
+                    f.prediction_confidence,
+                    rl.risk_label,
+                    rl.color_hex,
+                    f.predicted_at
+                FROM   public.fact_student_academic_risk f
+                JOIN   public.dim_student       s  ON s.student_key  = f.student_key
+                LEFT JOIN public.dim_program    p  ON p.program_key  = f.program_key
+                JOIN   public.dim_academic_term t  ON t.term_key     = f.term_key
+                LEFT JOIN public.dim_risk_level rl ON rl.risk_level_id = f.risk_level_id
+                {where}
+                ORDER  BY f.predicted_risk_score DESC
+                LIMIT  %s
+            """, params)
 
             columns = [d[0] for d in cur.description]
             return [dict(zip(columns, row)) for row in cur.fetchall()]

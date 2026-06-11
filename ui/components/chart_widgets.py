@@ -35,36 +35,18 @@ class RiskDistributionChart(QChartView):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.series = self._build_series()
-        chart = self._build_chart(self.series)
+        chart = self._build_chart()
 
         self.setChart(chart)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setMinimumHeight(350)
         self.setStyleSheet("background: transparent; border: none;")
 
-    def _build_series(self):
-        series = QPieSeries()
+        # Start blank — populated only after a successful prediction
+        self.show_empty()
 
-        high_risk     = series.append("High Risk",     15)
-        moderate_risk = series.append("Moderate Risk", 28)
-        low_risk      = series.append("Low Risk",      57)
-
-        series.setHoleSize(0.40)
-
-        high_risk.setColor(QColor("#ff5b5b"))
-        moderate_risk.setColor(QColor("#f5b335"))
-        low_risk.setColor(QColor("#34d399"))
-
-        for slice in series.slices():
-            slice.setBorderColor(QColor("transparent"))
-            slice.setLabelVisible(False)
-
-        return series
-
-    def _build_chart(self, series):
+    def _build_chart(self):
         chart = QChart()
-        chart.addSeries(series)
         chart.setBackgroundVisible(False)
         chart.setPlotAreaBackgroundVisible(False)
 
@@ -76,6 +58,23 @@ class RiskDistributionChart(QChartView):
         chart.setMargins(QMargins(0, 0, 0, 0))
 
         return chart
+
+    def show_empty(self) -> None:
+        """Render a blank placeholder ring (no prediction data yet)."""
+        self.chart().removeAllSeries()
+
+        series = QPieSeries()
+        placeholder = series.append("No prediction data", 1)
+        series.setHoleSize(0.40)
+
+        placeholder.setColor(QColor("#2c3038"))
+        placeholder.setBorderColor(QColor("transparent"))
+        placeholder.setLabelVisible(False)
+
+        self.chart().addSeries(series)
+        self.chart().legend().setVisible(True)
+        self.chart().legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        self.chart().legend().setLabelColor(QColor("#6b7280"))
 
     def update_chart(self, high_risk: int, moderate_risk: int, low_risk: int) -> None:
         """
@@ -125,11 +124,10 @@ class RiskAnalyticsChart(QChartView):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        series, axis_x, axis_y = self._build_series()
-        self.series = series
-        self.axis_x = axis_x
-        self.axis_y = axis_y
-        chart = self._build_chart(series, axis_x, axis_y)
+        self.series = None
+        self.axis_x = None
+        self.axis_y = None
+        chart = self._build_chart()
 
         self.setChart(chart)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -139,20 +137,32 @@ class RiskAnalyticsChart(QChartView):
             QSizePolicy.Policy.Expanding,
         )
 
-    def _build_series(self):
-        set_high = QBarSet("High")
-        set_moderate = QBarSet("Moderate")
+        # Start blank — populated only after a successful prediction
+        self.show_empty()
 
-        set_high.setColor(QColor("#C0392B"))
-        set_moderate.setColor(QColor("#D4AC0D"))
+    def _build_chart(self):
+        chart = QChart()
+        chart.setTitle("RISK SCORE BY COLLEGE / DEPARTMENT")
+        chart.setTitleFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        chart.setTitleBrush(QColor("#85929E"))
+        chart.setBackgroundBrush(QBrush(Qt.BrushStyle.NoBrush))
+        chart.setMargins(QMargins(0, 0, 0, 0))
 
-        set_high.append([100, 100, 100, 100, 100, 100])
-        set_moderate.append([68, 62, 55, 48, 38, 71])
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignmentFlag.AlignTop)
+        chart.legend().setLabelColor(QColor("white"))
+        chart.legend().setFont(QFont("Segoe UI", 9))
 
-        series = QStackedBarSeries()
-        series.append(set_high)
-        series.append(set_moderate)
-        series.setLabelsVisible(False)
+        return chart
+
+    def show_empty(self) -> None:
+        """Render blank axes with no bars (no prediction data yet)."""
+        self.chart().removeAllSeries()
+
+        if self.axis_x is not None:
+            self.chart().removeAxis(self.axis_x)
+        if self.axis_y is not None:
+            self.chart().removeAxis(self.axis_y)
 
         axis_x = QBarCategoryAxis()
         axis_x.append(["CITE", "CBAA", "CTE", "COED", "CON", "CAS"])
@@ -167,28 +177,12 @@ class RiskAnalyticsChart(QChartView):
         axis_y.setLabelsFont(QFont("Segoe UI", 10))
         axis_y.setGridLineColor(QColor("#1C2833"))
 
-        return series, axis_x, axis_y
+        self.chart().addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        self.chart().addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
 
-    def _build_chart(self, series, axis_x, axis_y):
-        chart = QChart()
-        chart.addSeries(series)
-        chart.setTitle("RISK SCORE BY COLLEGE / DEPARTMENT")
-        chart.setTitleFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-        chart.setTitleBrush(QColor("#85929E"))
-        chart.setBackgroundBrush(QBrush(Qt.BrushStyle.NoBrush))
-        chart.setMargins(QMargins(0, 0, 0, 0))
-
-        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-        series.attachAxis(axis_x)
-        series.attachAxis(axis_y)
-
-        chart.legend().setVisible(True)
-        chart.legend().setAlignment(Qt.AlignmentFlag.AlignTop)
-        chart.legend().setLabelColor(QColor("white"))
-        chart.legend().setFont(QFont("Segoe UI", 9))
-
-        return chart
+        self.series = None
+        self.axis_x = axis_x
+        self.axis_y = axis_y
 
     def update_chart(self, by_college: dict) -> None:
         """

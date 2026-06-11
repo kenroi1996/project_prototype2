@@ -11,170 +11,54 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
     QGridLayout,
 )
-from PyQt6.QtCore import QTimer, Qt, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon
 
 from .student_profile_drawer import StudentProfileDrawer
 from ui.components.loading_overlay import LoadingOverlay
 from ui.mixins.prediction_mixin import PredictionMixin
+from services.data_store import DataStore
 
-COHORT_STUDENTS = [
-    {
-        "name": "Lea Torres",
-        "id": "2024-10008",
-        "college": "CTE",
-        "program": "BSIE",
-        "gwa": 3.45,
-        "absences": 13,
-        "score": 75,
-        "risk_level": "High",
-        "factor": "GWA drop (sem 1)",
-        "category": "high_risk",
-        "failed_subjects": 2,
-        "referrals": 2,
-        "shap_factors": [
-            ("GWA drop (sem 1)", 39),
-            ("Absences > 20%", 20),
-            ("No org membership", 13),
-            ("Working student", 6),
-            ("Failed ≥ 2 subjects", 11),
-            ("Low psych score", 10),
-        ],
-    },
-    {
-        "name": "Cathy Ramos",
-        "id": "2024-10012",
-        "college": "CBAA",
-        "program": "BSBA",
-        "gwa": 3.12,
-        "absences": 30,
-        "score": 77,
-        "risk_level": "High",
-        "factor": "Absences > 20%",
-        "category": "high_risk",
-    },
-    {
-        "name": "James Reyes",
-        "id": "2024-10019",
-        "college": "CITE",
-        "program": "BSIT",
-        "gwa": 2.98,
-        "absences": 21,
-        "score": 83,
-        "risk_level": "High",
-        "factor": "Absences > 20%",
-        "category": "high_risk",
-    },
-    {
-        "name": "Ana Bautista",
-        "id": "2024-10024",
-        "college": "COED",
-        "program": "BSED",
-        "gwa": 2.85,
-        "absences": 8,
-        "score": 97,
-        "risk_level": "High",
-        "factor": "No org membership",
-        "category": "high_risk",
-    },
-    {
-        "name": "Mark Dela Cruz",
-        "id": "2024-10031",
-        "college": "CON",
-        "program": "BSN",
-        "gwa": 3.28,
-        "absences": 18,
-        "score": 72,
-        "risk_level": "High",
-        "factor": "Failed ≥ 2 subjects",
-        "category": "high_risk",
-    },
-    {
-        "name": "Jane Smith",
-        "id": "2024-10035",
-        "college": "CAS",
-        "program": "BSSW",
-        "gwa": 3.05,
-        "absences": 15,
-        "score": 68,
-        "risk_level": "High",
-        "factor": "Low psych score",
-        "category": "high_risk",
-    },
-    {
-        "name": "Rico Mendoza",
-        "id": "2024-10041",
-        "college": "CTE",
-        "program": "BSME",
-        "gwa": 1.69,
-        "absences": 4,
-        "score": 22,
-        "risk_level": "Low",
-        "factor": "—",
-        "category": "low_risk",
-    },
-    {
-        "name": "Sofia Lim",
-        "id": "2024-10048",
-        "college": "CBAA",
-        "program": "BSA",
-        "gwa": 1.82,
-        "absences": 6,
-        "score": 31,
-        "risk_level": "Low",
-        "factor": "—",
-        "category": "low_risk",
-    },
-    {
-        "name": "Noah Villanueva",
-        "id": "2024-10052",
-        "college": "COED",
-        "program": "BEED",
-        "gwa": 2.15,
-        "absences": 9,
-        "score": 48,
-        "risk_level": "Moderate",
-        "factor": "Working student",
-        "category": "moderate_risk",
-    },
-    {
-        "name": "Ella Cruz",
-        "id": "2024-10059",
-        "college": "CITE",
-        "program": "BSCpE",
-        "gwa": 2.42,
-        "absences": 11,
-        "score": 55,
-        "risk_level": "Moderate",
-        "factor": "Financial aid lapse",
-        "category": "moderate_risk",
-    },
-]
 
 TABLE_COLUMNS = [
-    ("STUDENT ID", 1),
-    ("NAME", 2),
-    ("COLLEGE", 1),
-    ("GWA", 1),
-    ("ABSENCES", 1),
-    ("RISK SCORE", 2),
-    ("RISK LEVEL", 1),
+    ("STUDENT ID",     1),
+    ("NAME",           2),
+    ("COLLEGE",        1),
+    ("GWA",            1),
+    ("ABSENCES",       1),
+    ("RISK SCORE",     2),
+    ("RISK LEVEL",     1),
     ("PRIMARY FACTOR", 2),
-    ("", 1),
+    ("",               1),
 ]
 
 
 class StudentCohortPage(PredictionMixin, QWidget):
     """Student Cohort Explorer — searchable cohort table with risk metrics."""
 
+    _RISK_LEVELS = {
+        "high_risk":     "High",
+        "moderate_risk": "Moderate",
+        "low_risk":      "Low",
+    }
+
     def __init__(self):
         super().__init__()
-        self._table_rows = []
+        self._table_rows    = []
         self._profile_drawer = None
         self.setup_ui()
-        #self._apply_page_styles()
         self._apply_filters()
         self.overlay = LoadingOverlay(self)
+
+        DataStore.get().add_listener(self._on_store_updated)
+
+        existing = DataStore.get().predictions
+        if existing and existing.success:
+            self._apply_predictions(existing)
+
+    # ------------------------------------------------------------------
+    # Window events
+    # ------------------------------------------------------------------
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -186,11 +70,20 @@ class StudentCohortPage(PredictionMixin, QWidget):
             self._profile_drawer._is_open = False
         super().hideEvent(event)
 
+    def closeEvent(self, event):
+        DataStore.get().remove_listener(self._on_store_updated)
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Profile drawer
+    # ------------------------------------------------------------------
+
     def _find_drawer_host(self):
         widget = self.parent()
         while widget:
             parent = widget.parent()
-            if parent is not None and parent.metaObject().className() == "QStackedWidget":
+            if parent is not None and \
+               parent.metaObject().className() == "QStackedWidget":
                 return widget
             widget = parent
         return None
@@ -209,6 +102,36 @@ class StudentCohortPage(PredictionMixin, QWidget):
             profile.setdefault("factor", student.get("factor", "—"))
             self._profile_drawer.open_drawer(profile)
 
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+
+    def _go_to_prediction_page(self):
+        """Navigate to the Prediction page instead of triggering prediction
+        directly from here — which would use already-engineered data and
+        produce 0 or 100 risk scores."""
+        from PyQt6.QtWidgets import QStackedWidget
+        widget = self.parent()
+        while widget is not None:
+            if isinstance(widget, QStackedWidget):
+                for i in range(widget.count()):
+                    page = widget.widget(i)
+                    if page and "Prediction" in type(page).__name__:
+                        widget.setCurrentIndex(i)
+                        return
+            widget = widget.parent()
+        from ui.dialogs.confirmation_dialog import show_info
+        show_info(
+            self,
+            "Go to Prediction",
+            "Navigate to the Prediction page to upload portal datasets "
+            "and run prediction.",
+            "Use the sidebar or navigation to switch pages.",
+        )
+
+    # ------------------------------------------------------------------
+    # Filter combo helper
+    # ------------------------------------------------------------------
 
     def _create_filter_combo(self, items, default_index=0):
         combo = QComboBox()
@@ -220,6 +143,10 @@ class StudentCohortPage(PredictionMixin, QWidget):
         combo.setCursor(Qt.CursorShape.PointingHandCursor)
         return combo
 
+    # ------------------------------------------------------------------
+    # Cell / badge builders
+    # ------------------------------------------------------------------
+
     def _create_risk_score_cell(self, score):
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -227,17 +154,18 @@ class StudentCohortPage(PredictionMixin, QWidget):
         layout.setSpacing(8)
 
         bar = QProgressBar()
-        bar.setValue(score)
+        bar.setValue(max(0, min(100, score)))
         bar.setTextVisible(False)
         bar.setFixedHeight(8)
         bar.setMaximumWidth(80)
 
-        color = "#ff5b5b" if score >= 60 else "#f5b335" if score >= 40 else "#3fb950"
+        color = ("#ff5b5b" if score >= 50
+                 else "#f5b335" if score >= 25
+                 else "#3fb950")
         bar.setStyleSheet(f"""
             QProgressBar {{
-                background-color: rgba(255, 255, 255, 0.08);
-                border-radius: 4px;
-                border: none;
+                background-color: rgba(255,255,255,0.08);
+                border-radius: 4px; border: none;
             }}
             QProgressBar::chunk {{
                 background-color: {color};
@@ -246,9 +174,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         """)
 
         pct = QLabel(f"{score}%")
-        pct.setStyleSheet(
-            "color: rgba(255,255,255,0.55); font-size: 12px;"
-        )
+        pct.setStyleSheet("color: rgba(255,255,255,0.55); font-size: 12px;")
         pct.setFixedWidth(36)
 
         layout.addWidget(bar, 1)
@@ -257,13 +183,16 @@ class StudentCohortPage(PredictionMixin, QWidget):
 
     def _create_risk_badge(self, level):
         badge = QLabel(f"● {level}")
-        if level == "High":
-            badge.setObjectName("cohortRiskBadge")
-        elif level == "Moderate":
-            badge.setObjectName("cohortRiskBadgeModerate")
-        else:
-            badge.setObjectName("cohortRiskBadgeLow")
+        badge.setObjectName(
+            "cohortRiskBadge"         if level == "High"     else
+            "cohortRiskBadgeModerate" if level == "Moderate" else
+            "cohortRiskBadgeLow"
+        )
         return badge
+
+    # ------------------------------------------------------------------
+    # Table row
+    # ------------------------------------------------------------------
 
     def _create_table_row(self, student):
         row = QFrame()
@@ -275,10 +204,8 @@ class StudentCohortPage(PredictionMixin, QWidget):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(0)
 
-        col = 0
-        for _, stretch in TABLE_COLUMNS:
+        for col, (_, stretch) in enumerate(TABLE_COLUMNS):
             grid.setColumnStretch(col, stretch)
-            col += 1
 
         id_lbl = QLabel(student["id"])
         id_lbl.setObjectName("cohortCellId")
@@ -286,56 +213,57 @@ class StudentCohortPage(PredictionMixin, QWidget):
         name_lbl = QLabel(student["name"])
         name_lbl.setObjectName("cohortCellName")
         name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        name_lbl.mousePressEvent = lambda event, s=student: (
+        name_lbl.mousePressEvent = lambda e, s=student: (
             self._open_student_profile(s)
-            if event.button() == Qt.MouseButton.LeftButton
-            else None
+            if e.button() == Qt.MouseButton.LeftButton else None
         )
 
         college_lbl = QLabel(student["college"])
         college_lbl.setObjectName("cohortCellMuted")
 
-        gwa_lbl = QLabel(f"{student['gwa']:.2f}")
+        gwa_val = student.get("gwa", 0.0)
+        gwa_lbl = QLabel(f"{gwa_val:.2f}" if gwa_val else "—")
         gwa_lbl.setObjectName(
-            "cohortGwaRisk" if student["gwa"] >= 2.5 else "cohortGwaGood"
+            "cohortGwaRisk" if isinstance(gwa_val, float) and gwa_val >= 2.5
+            else "cohortGwaGood"
         )
 
-        abs_lbl = QLabel(str(student["absences"]))
+        abs_val = student.get("absences", 0)
+        abs_lbl = QLabel(str(abs_val) if abs_val else "—")
         abs_lbl.setObjectName(
-            "cohortAbsencesRisk" if student["absences"] >= 10 else "cohortCellMuted"
+            "cohortAbsencesRisk" if isinstance(abs_val, int) and abs_val >= 10
+            else "cohortCellMuted"
         )
 
-        factor_lbl = QLabel(student["factor"])
+        factor_lbl = QLabel(student.get("factor", "—"))
         factor_lbl.setObjectName("cohortCellMuted")
 
         view_btn = QPushButton("View")
         view_btn.setObjectName("cohortViewButton")
         view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         view_btn.clicked.connect(
-            lambda checked=False, s=student: self._open_student_profile(s)
+            lambda _, s=student: self._open_student_profile(s)
         )
 
-        grid.addWidget(id_lbl, 0, 0)
-        grid.addWidget(name_lbl, 0, 1)
-        grid.addWidget(college_lbl, 0, 2)
-        grid.addWidget(gwa_lbl, 0, 3)
-        grid.addWidget(abs_lbl, 0, 4)
+        grid.addWidget(id_lbl,     0, 0)
+        grid.addWidget(name_lbl,   0, 1)
+        grid.addWidget(college_lbl,0, 2)
+        grid.addWidget(gwa_lbl,    0, 3)
+        grid.addWidget(abs_lbl,    0, 4)
         grid.addWidget(self._create_risk_score_cell(student["score"]), 0, 5)
-        grid.addWidget(self._create_risk_badge(student["risk_level"]), 0, 6)
+        grid.addWidget(self._create_risk_badge(student["risk_level"]),  0, 6)
         grid.addWidget(factor_lbl, 0, 7)
-        grid.addWidget(view_btn, 0, 8, Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(view_btn,   0, 8, Qt.AlignmentFlag.AlignRight)
 
-        row.mousePressEvent = lambda event, s=student: (
+        row.mousePressEvent = lambda e, s=student: (
             self._open_student_profile(s)
-            if event.button() == Qt.MouseButton.LeftButton
-            else None
+            if e.button() == Qt.MouseButton.LeftButton else None
         )
-
         return row
 
     def _create_table_header(self):
         header = QFrame()
-        grid = QGridLayout(header)
+        grid   = QGridLayout(header)
         grid.setContentsMargins(16, 14, 16, 10)
         grid.setHorizontalSpacing(12)
 
@@ -345,8 +273,66 @@ class StudentCohortPage(PredictionMixin, QWidget):
                 lbl = QLabel(title)
                 lbl.setObjectName("cohortTableHeader")
                 grid.addWidget(lbl, 0, col)
-
         return header
+
+    # ------------------------------------------------------------------
+    # Empty state
+    # ------------------------------------------------------------------
+
+    def _build_empty_state(self) -> QWidget:
+        """Placeholder shown when no prediction results are available."""
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 60, 0, 60)
+        layout.setSpacing(16)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        icon = QLabel("📊")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet("font-size: 48px; background: transparent;")
+
+        title = QLabel("No prediction results yet")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(
+            "color: rgba(255,255,255,0.6); font-size: 15px; "
+            "font-weight: 600; background: transparent;"
+        )
+
+        sub = QLabel(
+            "Go to the Prediction page, upload the four portal datasets,\n"
+            "merge them, and run the pipeline to score incoming students."
+        )
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setWordWrap(True)
+        sub.setStyleSheet(
+            "color: rgba(255,255,255,0.35); font-size: 12px; "
+            "background: transparent;"
+        )
+
+        go_btn = QPushButton("⚡  Go to Prediction")
+        go_btn.setFixedWidth(180)
+        go_btn.setFixedHeight(38)
+        go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        go_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2ecc71;
+                border: none; border-radius: 8px;
+                color: white; font-size: 13px; font-weight: 700;
+            }
+            QPushButton:hover { background-color: #29b765; }
+        """)
+        go_btn.clicked.connect(self._go_to_prediction_page)
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(sub)
+        layout.addSpacing(8)
+        layout.addWidget(go_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        return host
+
+    # ------------------------------------------------------------------
+    # Filters
+    # ------------------------------------------------------------------
 
     def _apply_filters(self):
         if not hasattr(self, "search_input") or not hasattr(self, "college_combo"):
@@ -354,34 +340,114 @@ class StudentCohortPage(PredictionMixin, QWidget):
         if not self._table_rows:
             return
 
-        query = self.search_input.text().strip().lower()
-        risk_filter = self.risk_combo.currentText()
+        query          = self.search_input.text().strip().lower()
+        risk_filter    = self.risk_combo.currentText()
         college_filter = self.college_combo.currentText()
 
         for row, student in self._table_rows:
             visible = True
-
             if query:
                 haystack = f"{student['name']} {student['id']}".lower()
-                visible = query in haystack
-
+                visible  = query in haystack
             if visible and risk_filter != "All risk levels":
                 visible = student["risk_level"] == risk_filter
-
             if visible and college_filter != "All colleges":
                 visible = student["college"] == college_filter
-
             row.setVisible(visible)
+
+    # ------------------------------------------------------------------
+    # Table population
+    # ------------------------------------------------------------------
+
+    def _populate_table(self, students):
+        """Rebuild the cohort table rows from a list of student dicts."""
+        while self.rows_layout.count():
+            item   = self.rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._table_rows = []
+
+        if not students:
+            self.rows_layout.addWidget(self._build_empty_state())
+            return
+
+        for student in students:
+            row = self._create_table_row(student)
+            self._table_rows.append((row, student))
+            self.rows_layout.addWidget(row)
+
+    # ------------------------------------------------------------------
+    # Prediction results → table
+    # ------------------------------------------------------------------
+
+    def _prediction_to_student(self, pred: dict) -> dict:
+        """Map a PredictionEngine record to the cohort table/drawer schema."""
+        category = pred.get("category", "low_risk")
+
+        try:
+            gwa = float(pred.get("gwa") or 0)
+        except (TypeError, ValueError):
+            gwa = 0.0
+
+        try:
+            absences = int(float(pred.get("absences") or 0))
+        except (TypeError, ValueError):
+            absences = 0
+
+        return {
+            "name":         pred.get("name", "—"),
+            "id":           str(pred.get("student_id", "—")),
+            "college":      pred.get("college", "—"),
+            "program":      pred.get("program", "—"),
+            "gwa":          gwa,
+            "absences":     absences,
+            "score":        int(round(float(pred.get("score", 0)))),
+            "risk_level":   self._RISK_LEVELS.get(category, "Low"),
+            "factor":       pred.get("factor", "—"),
+            "category":     category,
+            "shap_factors": pred.get("shap_factors", []),
+        }
+
+    def _on_store_updated(self, key: str):
+        if key in ("predictions", "all"):
+            result = DataStore.get().predictions
+            if result and result.success:
+                self._apply_predictions(result)
+
+    def _apply_predictions(self, result):
+        """Rebuild the cohort table from real prediction results."""
+        if not result or not result.success:
+            return
+
+        students = [self._prediction_to_student(p) for p in result.predictions]
+        self._populate_table(students)
+
+        total    = len(students)
+        high     = sum(1 for s in students if s["risk_level"] == "High")
+        moderate = sum(1 for s in students if s["risk_level"] == "Moderate")
+
+        self.explorer_meta.setText(
+            f"{total:,} students scored  ·  "
+            f"{high:,} high-risk  ·  {moderate:,} moderate  ·  "
+            f"Click a student to view full profile"
+        )
+
+        if self._profile_drawer is not None and self._profile_drawer._is_open:
+            self._profile_drawer.close_drawer()
+
+        self._apply_filters()
+
+    # ------------------------------------------------------------------
+    # UI setup
+    # ------------------------------------------------------------------
 
     def setup_ui(self):
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(30, 30, 30, 30)
         self.main_layout.setSpacing(20)
 
-        # =====================================
-        # FIXED HEADER
-        # =====================================
-
+        # ── Header ────────────────────────────────────────────────────
         self.fixed_header_container = QFrame()
         self.fixed_header_container.setObjectName("fixedHeaderContainer")
         fixed_header_layout = QVBoxLayout()
@@ -402,23 +468,19 @@ class StudentCohortPage(PredictionMixin, QWidget):
 
         header_text_layout.addWidget(header)
         header_text_layout.addWidget(subheader)
-
         header_layout.addLayout(header_text_layout)
         header_layout.addStretch()
 
-        model_card = QFrame()
+        model_card   = QFrame()
         model_card.setObjectName("cohortModelCard")
-
         model_layout = QHBoxLayout()
         model_layout.setContentsMargins(20, 15, 20, 15)
         model_layout.setSpacing(12)
 
         model_status = QLabel("● Model Active")
         model_status.setObjectName("cohortModelStatus")
-
-        opacity_effect = QGraphicsOpacityEffect(model_status)
+        opacity_effect   = QGraphicsOpacityEffect(model_status)
         model_status.setGraphicsEffect(opacity_effect)
-
         status_animation = QPropertyAnimation(opacity_effect, b"opacity")
         status_animation.setDuration(1200)
         status_animation.setStartValue(1.0)
@@ -431,17 +493,19 @@ class StudentCohortPage(PredictionMixin, QWidget):
         semester_pill = QLabel("1st Semester 2024–25  ▾")
         semester_pill.setObjectName("cohortSemesterPill")
 
-        run_button = QPushButton("Run Prediction")
+        # "Go to Prediction →" instead of "Run Prediction"
+        # Triggering prediction directly from here used store.get_prediction_dataset()
+        # which returns already-engineered data → 0 or 100 risk scores.
+        run_button = QPushButton("Go to Prediction →")
         run_button.setObjectName("runButton")
         run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         run_button.setIcon(QIcon("assets/icons/play.svg"))
-        run_button.clicked.connect(self.on_run_prediction)     
-        run_button.setFixedWidth(130)
+        run_button.clicked.connect(self._go_to_prediction_page)
+        run_button.setFixedWidth(155)
 
         model_layout.addWidget(model_status)
         model_layout.addWidget(semester_pill)
         model_layout.addWidget(run_button)
-
         model_card.setLayout(model_layout)
         header_layout.addWidget(model_card)
 
@@ -449,10 +513,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         self.fixed_header_container.setLayout(fixed_header_layout)
         self.main_layout.addWidget(self.fixed_header_container)
 
-        # =====================================
-        # EXPLORER TOOLBAR
-        # =====================================
-
+        # ── Explorer toolbar ──────────────────────────────────────────
         explorer_bar = QHBoxLayout()
         explorer_bar.setSpacing(16)
 
@@ -462,27 +523,28 @@ class StudentCohortPage(PredictionMixin, QWidget):
         explorer_title = QLabel("Student Cohort Explorer")
         explorer_title.setObjectName("cohortExplorerTitle")
 
-        explorer_meta = QLabel(
-            "First-year students · 1,248 enrolled · "
-            "Click a student to view full profile"
+        self.explorer_meta = QLabel(
+            "No prediction results yet  ·  "
+            "Run prediction to populate this table"
         )
-        explorer_meta.setObjectName("cohortExplorerMeta")
+        self.explorer_meta.setObjectName("cohortExplorerMeta")
 
         explorer_left.addWidget(explorer_title)
-        explorer_left.addWidget(explorer_meta)
-
+        explorer_left.addWidget(self.explorer_meta)
         explorer_bar.addLayout(explorer_left, 1)
 
         filters_layout = QHBoxLayout()
         filters_layout.setSpacing(10)
 
-        search_wrap = QFrame()
+        search_wrap  = QFrame()
         search_wrap.setFixedWidth(260)
         search_inner = QHBoxLayout(search_wrap)
         search_inner.setContentsMargins(12, 0, 0, 0)
 
         search_icon = QLabel("🔍")
-        search_icon.setStyleSheet("color: rgba(255,255,255,0.35); font-size: 12px;")
+        search_icon.setStyleSheet(
+            "color: rgba(255,255,255,0.35); font-size: 12px;"
+        )
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("cohortSearchInput")
@@ -493,20 +555,11 @@ class StudentCohortPage(PredictionMixin, QWidget):
         search_inner.addWidget(self.search_input, 1)
 
         self.risk_combo = self._create_filter_combo(
-            ["All risk levels", "High", "Moderate", "Low"],
-            default_index=0,
+            ["All risk levels", "High", "Moderate", "Low"]
         )
-
         self.college_combo = self._create_filter_combo(
-            ["All colleges", "CTE", "CBAA", "CITE", "COED", "CON", "CAS"],
-            default_index=0,
+            ["All colleges", "CTE", "CBAA", "CITE", "COED", "CON", "CAS"]
         )
-
-        self.risk_combo.blockSignals(True)
-        high_index = self.risk_combo.findText("High")
-        if high_index >= 0:
-            self.risk_combo.setCurrentIndex(high_index)
-        self.risk_combo.blockSignals(False)
 
         self.risk_combo.currentIndexChanged.connect(self._apply_filters)
         self.college_combo.currentIndexChanged.connect(self._apply_filters)
@@ -518,13 +571,10 @@ class StudentCohortPage(PredictionMixin, QWidget):
         explorer_bar.addLayout(filters_layout)
         self.main_layout.addLayout(explorer_bar)
 
-        # =====================================
-        # DATA TABLE
-        # =====================================
-
+        # ── Data table ────────────────────────────────────────────────
         table_container = QFrame()
         table_container.setObjectName("cohortTableContainer")
-        table_layout = QVBoxLayout(table_container)
+        table_layout    = QVBoxLayout(table_container)
         table_layout.setContentsMargins(0, 0, 0, 8)
         table_layout.setSpacing(0)
 
@@ -533,16 +583,13 @@ class StudentCohortPage(PredictionMixin, QWidget):
         self.rows_layout = QVBoxLayout()
         self.rows_layout.setSpacing(0)
 
-        for student in COHORT_STUDENTS:
-            row = self._create_table_row(student)
-            self._table_rows.append((row, student))
-            self.rows_layout.addWidget(row)
+        # Start with the empty state — no mock data
+        self._populate_table([])
 
         rows_host = QWidget()
         rows_host.setLayout(self.rows_layout)
         table_layout.addWidget(rows_host)
 
         self.main_layout.addWidget(table_container, 1)
-
         self.setLayout(self.main_layout)
         self.init_prediction()

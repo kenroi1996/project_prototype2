@@ -37,25 +37,31 @@ from services.ml_service import MLService
 # =============================================================================
 
 class TrainingWorker(QThread):
-    """Background worker for model training."""
-    
-    progress = pyqtSignal(str, int)      # step message, percent
-    finished = pyqtSignal(object)        # MLService with results
-    error = pyqtSignal(str)
+    progress = pyqtSignal(str, int)
+    finished = pyqtSignal(object)
+    error    = pyqtSignal(str)
 
-    def __init__(self, model_type: str, test_size: float,
-                 n_folds: int = 5, parent=None):
-        super().__init__(parent)
+    def __init__(self, model_type: str, test_size: float, n_folds: int = 5):
+        # Never pass a QWidget as parent to a QThread
+        super().__init__(parent=None)
         self.model_type = model_type
-        self.test_size = test_size
-        self.n_folds = n_folds
+        self.test_size  = test_size
+        self.n_folds    = n_folds
 
     def run(self):
         try:
             store = DataStore.get()
 
-            # Get unified dataset; accept either DataFrame or {headers, rows} dict
-            if store.unified_dataset is None:
+            # Always use the original raw unified dataset (before any feature
+            # engineering or scaling). store.unified_dataset gets overwritten with
+            # the processed version after the first training run, which causes
+            # subsequent runs to receive already-engineered data and trigger the
+            # "received already-engineered data" warning.
+            # _original_unified_dataset is set once on first merge and never
+            # overwritten by training — it always holds the raw portal data.
+            unified = store._original_unified_dataset or store.unified_dataset
+
+            if unified is None:
                 unified = store.build_unified_dataset()
                 if unified is None:
                     self.error.emit(
@@ -63,12 +69,10 @@ class TrainingWorker(QThread):
                         "Upload data from at least one portal first."
                     )
                     return
-            else:
-                unified = store.unified_dataset
 
             if isinstance(unified, dict):
-                headers = unified.get("headers", [])
-                rows = unified.get("rows", [])
+                headers    = unified.get("headers", [])
+                rows       = unified.get("rows", [])
                 unified_df = pd.DataFrame(rows, columns=headers)
             else:
                 unified_df = unified.copy()
@@ -79,23 +83,35 @@ class TrainingWorker(QThread):
 
             # ── Step 1: Feature engineering ──────────────────────────────────
             self.progress.emit("Defining risk labels from grades & scores...", 10)
-            from services.feature_engineering import (
-                run_full_feature_pipeline,
-                TARGET_COLUMN,
-            )
+            from services.feature_engineering import run_full_feature_pipeline, TARGET_COLUMN
             unified_df = run_full_feature_pipeline(unified_df)
-            target_col = TARGET_COLUMN   # always "risk_label"
+            target_col = TARGET_COLUMN
+
+            # ── Convert string labels → integers ─────────────────────────────
+            # run_full_feature_pipeline() leaves risk_label as "at_risk" /
+            # "not_at_risk" strings. ml_service.train() and DataPipeline both
+            # need integer labels (0 / 1). Without this mapping, compute_sample_weight
+            # and SMOTE receive string y values and raise
+            # "invalid literal for int() with base 10: 'at_risk'".
+            if target_col in unified_df.columns:
+                unified_df[target_col] = unified_df[target_col].map(
+                    {"not_at_risk": 0, "at_risk": 1}
+                ).fillna(0).astype(int)
 
             # ── Step 2: DataPipeline preprocessing ───────────────────────────
+            # NOTE: deduplication is intentionally omitted here.
+            # run_full_feature_pipeline() already deduplicates on Student_ID
+            # BEFORE dropping it (see feature_engineering.py). Calling
+            # remove_duplicates() again at this stage — after Student_ID is
+            # gone — would compare only low-cardinality bucketed feature columns
+            # and incorrectly collapse distinct students with identical feature
+            # vectors, causing ~43% data loss.
             from services.preprocessing_service import DataPipeline
 
             pipeline = DataPipeline(unified_df)
-            pipeline._target_column = target_col   # guard before encode/scale
+            pipeline._target_column = target_col
 
-            self.progress.emit("Removing duplicates...", 20)
-            pipeline.remove_duplicates()
-
-            self.progress.emit("Handling missing values...", 35)
+            self.progress.emit("Handling missing values...", 25)
             pipeline.fill_missing(strategy="auto")
 
             self.progress.emit("Encoding categorical features...", 50)
@@ -119,15 +135,23 @@ class TrainingWorker(QThread):
                 test_size=self.test_size,
             )
 
-            # ── Step 5: Persist to DataStore ──────────────────────────────────
+            # ── Attach fitted preprocessor so PredictionEngine can replay ─────
+            # The DataPipeline holds fitted LabelEncoders and a StandardScaler.
+            # Without these, PredictionEngine would send raw string/unscaled values
+            # to model.predict_proba(), causing all probabilities to collapse to
+            # 0.0 or 1.0 (the "0 or 100 risk score" bug).
+            ml_service.preprocessor = pipeline
+
+            # ── Step 5: Persist plain data to DataStore ───────────────────────
             store.set_trained_model(ml_service)
             processed_headers = list(pipeline.df.columns)
-            processed_rows = pipeline.df.astype(str).fillna("").values.tolist()
+            processed_rows    = pipeline.df.astype(str).fillna("").values.tolist()
             store.set_unified_dataset(
                 {"headers": processed_headers, "rows": processed_rows}
             )
 
             self.progress.emit("Training complete!", 100)
+            # Emit only the plain ml_service object — no QWidgets
             self.finished.emit(ml_service)
 
         except Exception as e:
@@ -141,36 +165,34 @@ class TrainingWorker(QThread):
 class ModelTrainingPage(PredictionMixin, QWidget):
     """Model Training page — model selection, training config, and evaluation."""
 
-    # Model configurations
     MODEL_CONFIGS = {
         "rf": {
-            "name": "Random Forest",
-            "tags": "Ensemble · Interpretable · Recommended",
+            "name":  "Random Forest",
+            "tags":  "Ensemble · Interpretable · Recommended",
             "class": "random_forest",
         },
         "xgb": {
-            "name": "Gradient Boosting",
-            "tags": "High accuracy · Slower to train",
+            "name":  "Gradient Boosting",
+            "tags":  "High accuracy · Slower to train",
             "class": "gradient_boosting",
         },
         "lr": {
-            "name": "Logistic Regression",
-            "tags": "Baseline · Fast · Most interpretable",
+            "name":  "Logistic Regression",
+            "tags":  "Baseline · Fast · Most interpretable",
             "class": "logistic_regression",
         },
     }
 
     def __init__(self):
         super().__init__()
-        self._model_cards = {}
-        self._selected_model_id = "rf"
+        self._model_cards            = {}
+        self._selected_model_id      = "rf"
         self._training_worker: TrainingWorker | None = None
-        
+
         self.setup_ui()
         self._select_model("rf")
         self.overlay = LoadingOverlay(self)
         self._check_dataset_ready()
-
 
     # ------------------------------------------------------------------
     # UI BUILDERS
@@ -203,8 +225,8 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(14)
 
-        header = QHBoxLayout()
-        header_left = QVBoxLayout()
+        header       = QHBoxLayout()
+        header_left  = QVBoxLayout()
         header_left.setSpacing(4)
 
         name = QLabel(config["name"])
@@ -224,16 +246,15 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         header.addWidget(check, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
-        # Placeholder metrics — will be updated after training
         self._metric_tiles[model_id] = {}
         metrics_grid = QGridLayout()
         metrics_grid.setSpacing(10)
-        
+
         for i, (label, default_val) in enumerate([
-            ("Accuracy", "--"),
-            ("F1 Score", "--"),
+            ("Accuracy",  "--"),
+            ("F1 Score",  "--"),
             ("Precision", "--"),
-            ("Recall", "--"),
+            ("Recall",    "--"),
         ]):
             tile = self._create_metric_tile(default_val, label)
             metrics_grid.addWidget(tile, i // 2, i % 2)
@@ -261,7 +282,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
 
         if hasattr(self, "progress_title"):
             config = self.MODEL_CONFIGS.get(model_id, {})
-            name = config.get("name", "Unknown")
+            name   = config.get("name", "Unknown")
             self.progress_title.setText(
                 f'Training <span style="color:white;font-weight:bold;">'
                 f"{name}</span>..."
@@ -333,7 +354,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         series.attachAxis(axis_x)
 
         max_val = max(tn, fp, fn, tp, 1)
-        axis_y = QValueAxis()
+        axis_y  = QValueAxis()
         axis_y.setRange(0, max_val * 1.2)
         axis_y.setTickCount(5)
         axis_y.setLabelsColor(QColor("#8b949e"))
@@ -358,18 +379,16 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         title.setObjectName("trainPanelTitle")
         layout.addWidget(title)
 
-        # Dataset info label
         self._dataset_info_lbl = QLabel("Checking dataset…")
         self._dataset_info_lbl.setStyleSheet(
             "color: rgba(255,255,255,0.4); font-size: 12px; background: transparent;"
         )
         layout.addWidget(self._dataset_info_lbl)
 
-        # Config combos
-        split_widget, self._split_combo = self._create_config_combo(
+        split_widget,  self._split_combo  = self._create_config_combo(
             "Training / Test Split", ["80% / 20%", "70% / 30%", "90% / 10%"]
         )
-        folds_widget, self._folds_combo = self._create_config_combo(
+        folds_widget,  self._folds_combo  = self._create_config_combo(
             "Cross-Validation Folds", ["5-Fold", "10-Fold", "3-Fold"]
         )
         target_widget, self._target_combo = self._create_config_combo(
@@ -448,7 +467,6 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         """)
         layout.addWidget(self._progress_bar)
 
-        # Live log area
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
         self._log_text.setPlaceholderText("Click 'Start Training' to begin...")
@@ -489,7 +507,6 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         self._shap_layout.setContentsMargins(0, 0, 0, 0)
         self._shap_layout.setSpacing(10)
 
-        # Default placeholder
         placeholder = QLabel("Train a model to see feature importance")
         placeholder.setObjectName("trainLogMuted")
         placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -502,9 +519,8 @@ class ModelTrainingPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _check_dataset_ready(self):
-        """Show status of unified dataset."""
         store = DataStore.get()
-        
+
         if store.unified_dataset is not None or store.ready_count() > 0:
             rows = 0
             if store.unified_dataset is not None:
@@ -516,7 +532,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
                 for portal in store.portals.values():
                     if portal:
                         rows += portal["row_count"]
-            
+
             self._dataset_info_lbl.setText(
                 f"✓  {store.ready_count()}/4 portals ready  ·  ~{rows:,} rows available"
             )
@@ -538,22 +554,20 @@ class ModelTrainingPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _on_start_training(self):
-        """Called when Start Training button is clicked."""
         store = DataStore.get()
 
         if store.unified_dataset is None and store.ready_count() == 0:
             QMessageBox.warning(self, "No Data", "Upload data from at least one portal first.")
             return
 
-        # Read config
         split_text = self._split_combo.currentText()
         folds_text = self._folds_combo.currentText()
-        
+
         test_size = float(split_text.split("/")[1].strip().replace("%", "")) / 100
-        n_folds = int(folds_text.split("-")[0].strip())
+        n_folds   = int(folds_text.split("-")[0].strip())
 
         model_config = self.MODEL_CONFIGS.get(self._selected_model_id, {})
-        model_type = model_config.get("class", "random_forest")
+        model_type   = model_config.get("class", "random_forest")
 
         # Reset UI
         self._progress_bar.setValue(0)
@@ -562,20 +576,35 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         self._log_text.append(f"🚀 Starting training with {model_config.get('name', 'Unknown')}...")
         self._start_btn.setEnabled(False)
 
-        # Show overlay
         self.overlay.set_message("Training Model…", "Preparing data")
         self.overlay.show()
 
-        # Start worker
+        # Create worker with no parent — a QWidget parent on a QThread causes
+        # the "Cannot set parent, new parent is in a different thread" warnings
         self._training_worker = TrainingWorker(
             model_type=model_type,
             test_size=test_size,
             n_folds=n_folds,
-            parent=self,
         )
-        self._training_worker.progress.connect(self._on_training_progress)
-        self._training_worker.finished.connect(self._on_training_finished)
-        self._training_worker.error.connect(self._on_training_error)
+
+        # QueuedConnection ensures all slots execute in the main thread
+        self._training_worker.progress.connect(
+            self._on_training_progress,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._training_worker.finished.connect(
+            self._on_training_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._training_worker.error.connect(
+            self._on_training_error,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        # Schedule self-cleanup after the thread finishes
+        self._training_worker.finished.connect(self._training_worker.deleteLater)
+        self._training_worker.error.connect(self._training_worker.deleteLater)
+
         self._training_worker.start()
 
     def _on_training_progress(self, step: str, pct: int):
@@ -585,36 +614,44 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         self.overlay.set_message("Training Model…", step)
 
     def _on_training_finished(self, ml_service: MLService):
+        """Runs in the main thread via QueuedConnection — all UI ops are safe here."""
         self.overlay.hide()
         self._start_btn.setEnabled(True)
 
         history = ml_service.training_history
-        
-        # Update log
+
         self._log_text.append("✅ Training complete!")
         self._log_text.append(f"Accuracy: {history.get('accuracy', 'N/A')}")
-        self._log_text.append(f"CV Mean: {history.get('cv_mean', 'N/A')} ± {history.get('cv_std', 'N/A')}")
+        self._log_text.append(
+            f"CV Mean: {history.get('cv_mean', 'N/A')} ± {history.get('cv_std', 'N/A')}"
+        )
 
-        # Update metric tiles for selected model
+        acc     = history.get("accuracy")
+        acc_txt = f" — {acc * 100:.1f}% accuracy" if isinstance(acc, (int, float)) else ""
+        DataStore.get().add_activity(
+            f"Model trained ({self._selected_model_id.upper()}){acc_txt}",
+            icon="🧠",
+            color="#a78bfa",
+        )
+
+        # Update metric tiles
         model_id = self._selected_model_id
         if model_id in self._metric_tiles:
             metrics = {
-                "Accuracy": f"{history.get('accuracy', 0) * 100:.1f}%",
-                "F1 Score": "--",  # Would need to compute from classification_report
+                "Accuracy":  f"{history.get('accuracy', 0) * 100:.1f}%",
+                "F1 Score":  "--",
                 "Precision": "--",
-                "Recall": "--",
+                "Recall":    "--",
             }
-            # Try to extract from classification report if available
             report = history.get("classification_report", {})
             if "weighted avg" in report:
                 avg = report["weighted avg"]
-                metrics["F1 Score"] = f"{avg.get('f1-score', 0):.3f}"
+                metrics["F1 Score"]  = f"{avg.get('f1-score', 0):.3f}"
                 metrics["Precision"] = f"{avg.get('precision', 0) * 100:.1f}%"
-                metrics["Recall"] = f"{avg.get('recall', 0) * 100:.1f}%"
+                metrics["Recall"]    = f"{avg.get('recall', 0) * 100:.1f}%"
 
             for label, tile in self._metric_tiles[model_id].items():
                 if label in metrics:
-                    # Update the value label inside the tile
                     layout = tile.layout()
                     if layout and layout.count() > 0:
                         val_label = layout.itemAt(0).widget()
@@ -631,13 +668,56 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         if importance_df is not None and not importance_df.empty:
             self._update_shap_chart(importance_df)
 
+        db_msg = self._persist_model_to_db()
+
         QMessageBox.information(
             self, "Training Complete",
             f"Model trained successfully!\n\n"
             f"Accuracy: {history.get('accuracy', 'N/A')}\n"
             f"CV Score: {history.get('cv_mean', 'N/A')} ± {history.get('cv_std', 'N/A')}\n\n"
             f"Model saved to DataStore. Ready for prediction."
+            f"{db_msg}",
         )
+
+        self._training_worker = None
+
+    def _persist_model_to_db(self) -> str:
+        try:
+            from database.connection import get_connection
+
+            conn = get_connection()
+            if conn is None:
+                msg = "Could not open a database connection."
+                self._log_text.append(f"⚠ {msg} Model kept in memory only.")
+                return f"\n\n⚠ {msg}"
+
+            try:
+                save_result = DataStore.get().save_model_to_disk(
+                    self._selected_model_id, db_conn=conn
+                )
+            finally:
+                conn.close()
+
+            if not save_result.get("success"):
+                err = save_result.get("error", "unknown error")
+                self._log_text.append(f"⚠ Model save failed: {err}")
+                return f"\n\n⚠ Model save failed: {err}"
+
+            db_id = save_result.get("db_id")
+            if db_id:
+                size     = save_result.get("metadata", {}).get("model_size_bytes")
+                size_txt = f" ({size:,} bytes)" if size else ""
+                self._log_text.append(
+                    f"💾 Saved to database — model_id={db_id}{size_txt}, now active."
+                )
+                return f"\n\n💾 Stored in database (model_id={db_id}), set as active."
+
+            self._log_text.append("⚠ Saved to disk, but database insert failed.")
+            return "\n\n⚠ Saved to disk, but database insert failed."
+
+        except Exception as e:
+            self._log_text.append(f"⚠ Database save error: {e}")
+            return f"\n\n⚠ Database save error: {e}"
 
     def _on_training_error(self, error_msg: str):
         self.overlay.hide()
@@ -646,44 +726,61 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         QMessageBox.critical(self, "Training Error", error_msg)
 
     # ------------------------------------------------------------------
-    # CHART UPDATES
+    # CHART UPDATES  (called from main thread only, via _on_training_finished)
     # ------------------------------------------------------------------
 
     def _update_confusion_matrix(self, tn, fp, fn, tp):
-        """Rebuild confusion matrix chart with real data."""
-        # Remove old chart if exists
-        if hasattr(self, "_cm_chart_view"):
-            self._cm_chart_view.deleteLater()
+        """
+        Replace the confusion matrix chart view in-place.
 
-        self._cm_chart_view, chart, series = self._create_confusion_matrix_chart(tn, fp, fn, tp)
-        
-        # Replace in layout
-        if hasattr(self, "_cm_card"):
-            old = self._cm_card.layout().itemAt(1).widget()
-            if old:
-                old.deleteLater()
-            self._cm_card.layout().addWidget(self._cm_chart_view)
+        The correct Qt pattern is:
+          1. takeAt() to detach the old item from the layout
+          2. deleteLater() to schedule safe deletion on the next event loop tick
+          3. addWidget() the new widget
+
+        Do NOT call processEvents() here — it pumps the event queue mid-slot,
+        which can trigger pending cross-thread setParent calls and produce the
+        'Cannot set parent, new parent is in a different thread' flood.
+        """
+        layout = self._cm_card.layout()
+
+        # Remove every widget after the title label (index 0)
+        while layout.count() > 1:
+            item = layout.takeAt(1)        # detaches from layout, no setParent warning
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()       # deferred deletion — safe, no processEvents needed
+
+        # Create and add the new chart view (we are on the main thread)
+        new_view, self._cm_chart, self._cm_series = self._create_confusion_matrix_chart(
+            tn, fp, fn, tp
+        )
+        self._cm_chart_view = new_view
+        layout.addWidget(self._cm_chart_view)
 
     def _update_shap_chart(self, importance_df):
-        """Update SHAP chart with real feature importance."""
-        # Clear old
+        """
+        Replace SHAP rows with fresh data.
+
+        Same rule: takeAt() + deleteLater(), no processEvents().
+        """
         while self._shap_layout.count():
-            item = self._shap_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            item   = self._shap_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
 
-        # Colors cycle
-        colors = ["#ff5b5b", "#ff5b5b", "#f5b335", "#f5b335",
-                  "#4f8cff", "#4f8cff", "#4f8cff", "#4f8cff"]
+        colors = [
+            "#ff5b5b", "#ff5b5b",
+            "#f5b335", "#f5b335",
+            "#4f8cff", "#4f8cff", "#4f8cff", "#4f8cff",
+        ]
 
-        # Show top 8 features
         for idx, row in importance_df.head(8).iterrows():
-            feat = row["feature"]
-            pct = min(int(row["importance"] * 100), 100)
+            feat  = row["feature"]
+            pct   = min(int(row["importance"] * 100), 100)
             color = colors[idx % len(colors)]
-            self._shap_layout.addWidget(
-                self._create_shap_row(feat, pct, color)
-            )
+            self._shap_layout.addWidget(self._create_shap_row(feat, pct, color))
 
     # ------------------------------------------------------------------
     # MAIN SETUP
@@ -694,19 +791,15 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         self.main_layout.setContentsMargins(30, 30, 30, 30)
         self.main_layout.setSpacing(20)
 
-        # =====================================
-        # FIXED HEADER
-        # =====================================
-
+        # ── Fixed header ──────────────────────────────────────────────
         self.fixed_header_container = QFrame()
         self.fixed_header_container.setObjectName("fixedHeaderContainer")
         fixed_header_layout = QVBoxLayout()
         fixed_header_layout.setContentsMargins(20, 20, 20, 20)
         fixed_header_layout.setSpacing(0)
 
-        header_layout = QHBoxLayout()
+        header_layout      = QHBoxLayout()
         header_layout.setSpacing(15)
-
         header_text_layout = QVBoxLayout()
         header_text_layout.setSpacing(5)
 
@@ -718,13 +811,11 @@ class ModelTrainingPage(PredictionMixin, QWidget):
 
         header_text_layout.addWidget(header)
         header_text_layout.addWidget(subheader)
-
         header_layout.addLayout(header_text_layout)
         header_layout.addStretch()
 
-        model_card = QFrame()
+        model_card   = QFrame()
         model_card.setObjectName("trainModelCard")
-
         model_layout = QHBoxLayout()
         model_layout.setContentsMargins(20, 15, 20, 15)
         model_layout.setSpacing(12)
@@ -732,32 +823,31 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         model_status = QLabel("● Model Active")
         model_status.setObjectName("trainModelStatus")
 
-        opacity_effect = QGraphicsOpacityEffect(model_status)
-        model_status.setGraphicsEffect(opacity_effect)
+        self._model_status_opacity = QGraphicsOpacityEffect(model_status)
+        model_status.setGraphicsEffect(self._model_status_opacity)
 
-        status_animation = QPropertyAnimation(opacity_effect, b"opacity")
-        status_animation.setDuration(1200)
-        status_animation.setStartValue(1.0)
-        status_animation.setKeyValueAt(0.5, 0.3)
-        status_animation.setEndValue(1.0)
-        status_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        status_animation.setLoopCount(-1)
-        status_animation.start()
+        self._status_animation = QPropertyAnimation(self._model_status_opacity, b"opacity")
+        self._status_animation.setDuration(1200)
+        self._status_animation.setStartValue(1.0)
+        self._status_animation.setKeyValueAt(0.5, 0.3)
+        self._status_animation.setEndValue(1.0)
+        self._status_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._status_animation.setLoopCount(-1)
+        self._status_animation.start()
 
         semester_pill = QLabel("1st Semester 2024–25  ▾")
         semester_pill.setObjectName("trainSemesterPill")
 
-        run_button = QPushButton("Run Prediction")
+        run_button = QPushButton("Go to Prediction →")
         run_button.setObjectName("runButton")
         run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         run_button.setIcon(QIcon("assets/icons/play.svg"))
-        run_button.clicked.connect(self.on_run_prediction)
-        run_button.setFixedWidth(130)
+        run_button.clicked.connect(self._go_to_prediction_page)
+        run_button.setFixedWidth(155)
 
         model_layout.addWidget(model_status)
         model_layout.addWidget(semester_pill)
         model_layout.addWidget(run_button)
-
         model_card.setLayout(model_layout)
         header_layout.addWidget(model_card)
 
@@ -765,28 +855,21 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         self.fixed_header_container.setLayout(fixed_header_layout)
         self.main_layout.addWidget(self.fixed_header_container)
 
-        # =====================================
-        # TRAINING & EVALUATION SECTION
-        # =====================================
-
-        section_row = QHBoxLayout()
+        # ── Section header ────────────────────────────────────────────
+        section_row  = QHBoxLayout()
         section_row.setSpacing(16)
-
         section_left = QVBoxLayout()
         section_left.setSpacing(6)
 
         section_title = QLabel("Model Training & Evaluation")
         section_title.setObjectName("trainSectionTitle")
 
-        section_desc = QLabel(
-            "Train the risk classifier on historical student records"
-        )
+        section_desc = QLabel("Train the risk classifier on historical student records")
         section_desc.setObjectName("trainSectionDesc")
 
         section_left.addWidget(section_title)
         section_left.addWidget(section_desc)
 
-        # Train button (decorative, actual start is in config card)
         train_btn = QPushButton("🧠 Train Model")
         train_btn.setObjectName("trainModelBtn")
         train_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -797,7 +880,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         section_row.addWidget(train_btn, 0, Qt.AlignmentFlag.AlignTop)
         self.main_layout.addLayout(section_row)
 
-        # Model selection cards
+        # ── Model selection cards ─────────────────────────────────────
         self._metric_tiles = {}
         models_row = QHBoxLayout()
         models_row.setSpacing(16)
@@ -805,20 +888,22 @@ class ModelTrainingPage(PredictionMixin, QWidget):
             models_row.addWidget(self._create_model_card(model_id, config), 1)
         self.main_layout.addLayout(models_row)
 
-        # Training config + progress
+        # ── Training config + progress ────────────────────────────────
         train_row = QHBoxLayout()
         train_row.setSpacing(20)
         train_row.addWidget(self._create_training_config_card(), 1)
         train_row.addWidget(self._create_training_progress_card(), 1)
         self.main_layout.addLayout(train_row)
 
-        # Charts row
+        # ── Charts row ────────────────────────────────────────────────
         charts_row = QHBoxLayout()
         charts_row.setSpacing(20)
-        
+
+        # Store initial chart view so _update_confusion_matrix can find it via the card
+        initial_cm_view, self._cm_chart, self._cm_series = self._create_confusion_matrix_chart()
+        self._cm_chart_view = initial_cm_view
         self._cm_card = self._create_chart_card(
-            "CONFUSION MATRIX (LAST RUN)",
-            self._create_confusion_matrix_chart()[0],
+            "CONFUSION MATRIX (LAST RUN)", self._cm_chart_view
         )
         charts_row.addWidget(self._cm_card, 1)
         charts_row.addWidget(self._create_shap_importance_card(), 1)
@@ -828,14 +913,45 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         self.setLayout(self.main_layout)
         self.init_prediction()
 
-        # Listen for DataStore changes
         DataStore.get().add_listener(self._on_store_changed)
 
     def _on_store_changed(self, key: str):
-        """Refresh when portal data changes."""
         self._check_dataset_ready()
 
+    def _go_to_prediction_page(self):
+        """
+        Navigate to the Prediction page.
+        Walks up the widget tree to find the QStackedWidget (main navigation)
+        and switches to the prediction page by object name.
+        Prediction now requires portal uploads + merge — it cannot be triggered
+        directly from this page using the training dataset.
+        """
+        from PyQt6.QtWidgets import QStackedWidget
+        widget = self.parent()
+        while widget is not None:
+            if isinstance(widget, QStackedWidget):
+                # Find the prediction page index by object name
+                for i in range(widget.count()):
+                    page = widget.widget(i)
+                    if page and page.objectName() in ("page", "PredictionPage") and                        type(page).__name__ == "PredictionPage":
+                        widget.setCurrentIndex(i)
+                        return
+                # Fallback: try by class name match on last page
+                for i in range(widget.count()):
+                    page = widget.widget(i)
+                    if page and "Prediction" in type(page).__name__:
+                        widget.setCurrentIndex(i)
+                        return
+            widget = widget.parent()
+        # If navigation not found, show a hint
+        from ui.dialogs.confirmation_dialog import show_info
+        show_info(
+            self,
+            "Go to Prediction",
+            "Navigate to the Prediction page to upload portal datasets and run prediction.",
+            "Use the sidebar or top navigation to switch pages.",
+        )
+
     def closeEvent(self, event):
-        """Clean up listener."""
         DataStore.get().remove_listener(self._on_store_changed)
         super().closeEvent(event)
