@@ -29,16 +29,11 @@ from services.merge_engine import MergeEngine, UNIFIED_COLUMNS
 from services.pipeline_orchestrator import PipelineOrchestrator
 from ui.mixins.prediction_mixin import PredictionMixin
 from ui.components.loading_overlay import LoadingOverlay
+from services.system_config import SystemConfig
 
 # =====================================
 # MERGE WORKER THREAD
 # =====================================
-
-
-
-
-
-
 
 class _MergeWorker(QThread):
     finished = pyqtSignal(object)
@@ -53,8 +48,6 @@ class _MergeWorker(QThread):
             self.error.emit(str(e))
 
 
-
-
 # =====================================
 # FULL DATASET VIEWER DIALOG
 # =====================================
@@ -65,10 +58,9 @@ class FullDatasetDialog(QDialog):
     def __init__(self, headers, rows, parent=None):
         super().__init__(parent)
         self._headers = headers
-        self._all_rows = list(rows)  # ← FORCE TO LIST
-        self._filtered_rows = list(rows)  # ← FORCE TO LIST
+        self._all_rows = list(rows)
+        self._filtered_rows = list(rows)
 
-        # Full-screen, frameless, modal
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Dialog
@@ -76,7 +68,6 @@ class FullDatasetDialog(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setModal(True)
 
-        # Match parent window size
         if parent:
             self.resize(parent.window().size())
         else:
@@ -86,22 +77,20 @@ class FullDatasetDialog(QDialog):
         self._apply_styles()
 
     def _setup_ui(self):
-        # Dark card container (the actual visible part)
-        self._container = QFrame(self)  # ← CHANGED: container → self._container
+        self._container = QFrame(self)
         self._container.setObjectName("datasetDialogContainer")
         self._container.setGeometry(self.rect().adjusted(40, 40, -40, -40))
 
-        layout = QVBoxLayout(self._container)  # ← CHANGED: container → self._container
+        layout = QVBoxLayout(self._container)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
 
-        # ── Header row ─────────────────────────────────────────────
         header_row = QHBoxLayout()
         header_row.setSpacing(16)
 
         title = QLabel("📋 Unified Dataset")
         title.setObjectName("datasetDialogTitle")
-        self._title_lbl = title   # stored so _setup_title() can update it
+        self._title_lbl = title
 
         self._row_count_lbl = QLabel(f"{len(self._all_rows):,} rows")
         self._row_count_lbl.setObjectName("datasetDialogCount")
@@ -125,7 +114,6 @@ class FullDatasetDialog(QDialog):
         header_row.addWidget(close_btn)
         layout.addLayout(header_row)
 
-        # ── Table ──────────────────────────────────────────────────
         self._table = QTableWidget()
         self._table.setObjectName("datasetDialogTable")
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -140,7 +128,6 @@ class FullDatasetDialog(QDialog):
         self._populate_table(self._filtered_rows)
         layout.addWidget(self._table, 1)
 
-        # ── Footer ─────────────────────────────────────────────────
         footer = QHBoxLayout()
         self._status_lbl = QLabel(f"Showing all {len(self._all_rows):,} rows")
         self._status_lbl.setObjectName("datasetDialogStatus")
@@ -156,15 +143,11 @@ class FullDatasetDialog(QDialog):
         layout.addLayout(footer)
 
     def resizeEvent(self, event):
-        """Keep container centered on resize."""
         super().resizeEvent(event)
         if hasattr(self, '_container') and self._container:
             self._container.setGeometry(self.rect().adjusted(40, 40, -40, -40))
 
     def _setup_title(self, title: str):
-        """Update the dialog title label after construction."""
-        # The title QLabel is the first widget in the header_row layout
-        # which is the first layout item inside self._container's layout
         try:
             container_layout = self._container.layout()
             header_layout = container_layout.itemAt(0).layout()
@@ -172,7 +155,7 @@ class FullDatasetDialog(QDialog):
             if isinstance(title_lbl, QLabel):
                 title_lbl.setText(title)
         except Exception:
-            pass  # title update is cosmetic — never crash for this
+            pass
 
     def _populate_table(self, rows):
         self._table.setRowCount(len(rows))
@@ -196,12 +179,11 @@ class FullDatasetDialog(QDialog):
             print(f">>> Search text: '{text}'")
             
             if not text:
-                self._filtered_rows = list(self._all_rows)  # force list copy
+                self._filtered_rows = list(self._all_rows)
             else:
                 self._filtered_rows = []
                 for row_idx, row in enumerate(self._all_rows):
                     try:
-                        # Defensive: ensure row is iterable
                         if not hasattr(row, '__iter__'):
                             print(f"  ✗ Row {row_idx} is not iterable: {type(row)} = {row}")
                             continue
@@ -214,7 +196,6 @@ class FullDatasetDialog(QDialog):
                             self._filtered_rows.append(row)
                     except Exception as row_e:
                         print(f"  ✗ Row {row_idx} failed: {row_e}")
-                        print(f"     Row type: {type(row)}, content: {row[:5] if hasattr(row, '__getitem__') else row}")
                         continue
 
             print(f"  ✓ Filtered: {len(self._filtered_rows)} rows")
@@ -359,10 +340,10 @@ class FullDatasetDialog(QDialog):
 class PipelineWorker(QThread):
     """Background worker for the full ML pipeline."""
 
-    step_started     = pyqtSignal(str, str)   # step_name, message
-    step_progress    = pyqtSignal(int)         # 0-100
-    finished_success = pyqtSignal(dict)        # results
-    finished_error   = pyqtSignal(str)         # error message
+    step_started     = pyqtSignal(str, str)
+    step_progress    = pyqtSignal(int)
+    finished_success = pyqtSignal(dict)
+    finished_error   = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -372,38 +353,43 @@ class PipelineWorker(QThread):
         try:
             store = DataStore.get()
 
-            # Use the already-merged unified dataset
-            unified = store.unified_dataset
-            if unified is None:
+            # ── FIX: always use raw_merged_dataset as training source ──────────
+            # unified_dataset may have been overwritten by a previous pipeline
+            # run with engineered data (Final_Avg_GRD dropped), which causes
+            # define_target() to be skipped → risk_label missing → training fails.
+            # raw_merged_dataset is set once after merge and never overwritten.
+            raw = store.get_raw_merged_dataset()
+            if raw is None:
                 raise ValueError(
-                    "No unified dataset found. "
+                    "No merged dataset found. "
                     "Please run the Data Merge step first."
                 )
 
             temp_path = Path("outputs/_unified_temp.csv")
             temp_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # unified_dataset may be a dict {"headers": [...], "rows": [...]}
-            # or a DataFrame — handle both
             import pandas as pd
-            if isinstance(unified, dict):
-                df = pd.DataFrame(unified["rows"], columns=unified["headers"])
+            if isinstance(raw, dict):
+                df = pd.DataFrame(raw["rows"], columns=raw["headers"])
             else:
-                df = unified
+                df = raw
             df.to_csv(temp_path, index=False)
+
+            print(
+                f"[PipelineWorker] Writing temp CSV from raw_merged_dataset: "
+                f"{len(df):,} rows | Final_Avg_GRD present: {'Final_Avg_GRD' in df.columns}"
+            )
 
             def on_step(step, msg):
                 self.step_started.emit(step, msg)
 
             results = self.orchestrator.run(
                 excel_path=str(temp_path),
-                required_columns=None,
-                target_column="risk_label",
-                risk_based_on=None,
                 model_type="random_forest",
                 save_path="outputs",
                 on_step=on_step,
             )
+
             self.finished_success.emit(results)
         except Exception as e:
             self.finished_error.emit(str(e))
@@ -536,7 +522,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._pipeline_worker: PipelineWorker | None = None
         self._accent                      = "#4f8cff"
         self._on_proceed_training         = None
-        self._pipeline_engineered_dataset = None   # set after pipeline success
+        self._pipeline_engineered_dataset = None
         self.setup_ui()
         self.overlay = LoadingOverlay(self)
 
@@ -554,44 +540,29 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self.main_layout.setContentsMargins(30, 30, 30, 30)
         self.main_layout.setSpacing(28)
 
-        # ── Shared header ─────────────────────────────────────────────
         self.fixed_header_container = self._build_shared_header()
         self.main_layout.addWidget(self.fixed_header_container)
 
-        # ══════════════════════════════════════════════════════════════
-        # SECTION A — DATA MERGE
-        # ══════════════════════════════════════════════════════════════
         self.main_layout.addWidget(self._section_divider("🔀", "SECTION A", "Data Merge"))
-
-        # Source readiness
         self.main_layout.addWidget(self._build_source_panel())
-
-        # Merge config + run
         self.main_layout.addWidget(self._build_merge_config_card())
 
-        # Results (hidden until merge runs)
         self._merge_results_stack = QStackedWidget()
-        self._merge_results_stack.addWidget(QWidget())          # placeholder
+        self._merge_results_stack.addWidget(QWidget())
         self._merge_results_stack.addWidget(self._build_merge_results_section())
         self._merge_results_stack.setCurrentIndex(0)
         self.main_layout.addWidget(self._merge_results_stack)
 
-        # ══════════════════════════════════════════════════════════════
-        # SECTION B — DATA PIPELINE
-        # ══════════════════════════════════════════════════════════════
         self.main_layout.addWidget(self._section_divider("⚙️", "SECTION B", "Data Pipeline"))
 
-        # Gate banner (shown when merge not yet done)
         self._pipeline_gate_banner = self._build_pipeline_gate_banner()
         self.main_layout.addWidget(self._pipeline_gate_banner)
 
-        # Pipeline content (stages, quality, log)
         self._pipeline_content = QWidget()
         pipeline_content_layout = QVBoxLayout(self._pipeline_content)
         pipeline_content_layout.setContentsMargins(0, 0, 0, 0)
         pipeline_content_layout.setSpacing(20)
 
-        # Description + Run button row
         preprocess_row = QHBoxLayout()
         preprocess_row.setSpacing(16)
 
@@ -615,13 +586,11 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._run_pipeline_btn.setObjectName("pipelineRunBtn")
         self._run_pipeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._run_pipeline_btn.setFixedHeight(40)
-        self._run_pipeline_btn.setEnabled(False)       # locked until merge done
+        self._run_pipeline_btn.setEnabled(False)
         self._run_pipeline_btn.clicked.connect(self._run_pipeline)
 
         preprocess_row.addLayout(preprocess_left, 1)
-        preprocess_row.addWidget(
-            self._run_pipeline_btn, 0, Qt.AlignmentFlag.AlignTop
-        )
+        preprocess_row.addWidget(self._run_pipeline_btn, 0, Qt.AlignmentFlag.AlignTop)
         pipeline_content_layout.addLayout(preprocess_row)
 
         pipeline_content_layout.addWidget(self._create_pipeline_stages())
@@ -640,10 +609,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self.init_prediction()
         self._apply_styles()
 
-    # ------------------------------------------------------------------
-    # Shared header (replaces both pages' individual headers)
-    # ------------------------------------------------------------------
-
     def _build_shared_header(self) -> QFrame:
         container = QFrame()
         container.setObjectName("mergeHeaderCard")
@@ -657,7 +622,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         title_col = QVBoxLayout()
         title_col.setSpacing(4)
 
-        title = QLabel("Data Merge & Pipeline Center")
+        title = QLabel("DATA MERGE & PIPELINE CENTER")
         title.setObjectName("mergeTitle")
 
         sub = QLabel(
@@ -670,7 +635,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         title_col.addWidget(sub)
         row.addLayout(title_col, 1)
 
-        # Model status pill
         model_pill = QFrame()
         model_pill.setObjectName("mergeModelPill")
         pill_layout = QHBoxLayout(model_pill)
@@ -697,8 +661,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         anim.start()
         self._status_anim = anim
 
-        semester_pill = QLabel("1st Semester 2024–25  ▾")
-        semester_pill.setObjectName("pipelineSemesterPill")
+        self._sem_pill_lbl = QLabel(f"{SystemConfig.term_label()}  ▾")
+        self._sem_pill_lbl.setObjectName("pipelineSemesterPill")
+        self._sem_pill_lbl.setObjectName("pipelineSemesterPill")
 
         run_pred_btn = QPushButton("Run Prediction")
         run_pred_btn.setObjectName("mergeRunPredBtn")
@@ -709,15 +674,11 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         pill_layout.addWidget(dot)
         pill_layout.addWidget(status_lbl)
         pill_layout.addSpacing(8)
-        pill_layout.addWidget(semester_pill)
+        pill_layout.addWidget(self._sem_pill_lbl)
         pill_layout.addWidget(run_pred_btn)
         row.addWidget(model_pill)
         layout.addLayout(row)
         return container
-
-    # ------------------------------------------------------------------
-    # Section divider (visual separator between A and B)
-    # ------------------------------------------------------------------
 
     def _section_divider(self, icon: str, tag: str, title: str) -> QFrame:
         frame = QFrame()
@@ -1129,7 +1090,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._view_full_btn.setObjectName("mergeViewFullBtn")
         self._view_full_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._view_full_btn.clicked.connect(self._on_view_full_dataset)
-        self._view_full_btn.setEnabled(False)  # enabled after merge
+        self._view_full_btn.setEnabled(False)
 
         print(f">>> View Full Dataset button created, enabled={self._view_full_btn.isEnabled()}")
 
@@ -1159,10 +1120,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
     # ==================================================================
 
     def _build_pipeline_gate_banner(self) -> QFrame:
-        """
-        Banner shown at the top of the pipeline section when the
-        unified dataset is not yet available.
-        """
         banner = QFrame()
         banner.setObjectName("pipelineGateBanner")
         layout = QHBoxLayout(banner)
@@ -1301,7 +1258,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         layout.setContentsMargins(24, 20, 24, 16)
         layout.setSpacing(12)
 
-        # ── Title row with View Dataset button ────────────────────────
         title_row = QHBoxLayout()
         title_row.setSpacing(12)
 
@@ -1339,10 +1295,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         """)
         layout.addWidget(self._pipeline_log)
         return card
-
-    # ------------------------------------------------------------------
-    # Metric row helper (pipeline quality report)
-    # ------------------------------------------------------------------
 
     def _create_metric_row(self, label, value, color, display_value=None) -> QWidget:
         row = QWidget()
@@ -1504,7 +1456,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._view_full_btn.setEnabled(True)
         print(f">>> View Full Dataset button enabled={self._view_full_btn.isEnabled()}")
 
-
         if not result.success:
             for err in result.report.errors:
                 self._merge_log_line(f"ERROR: {err}", "error")
@@ -1524,6 +1475,14 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         )
         self._merge_log_line("Merge complete ✅", "success")
 
+        # ── FIX 1: store raw merged data separately so retraining always ──────
+        # has access to the original columns (including Final_Avg_GRD).
+        # raw_merged_dataset is NEVER overwritten by the pipeline or prediction
+        # flow — only by a new merge run.
+        DataStore.get().set_raw_merged_dataset({
+            "headers": result.headers,
+            "rows":    result.rows,
+        })
         DataStore.get().set_unified_dataset({
             "headers": result.headers,
             "rows":    result.rows,
@@ -1583,7 +1542,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             f"font-size: 12px; background: transparent;"
         )
 
-        # Rebuild quality cards
         while self._result_qcards.count():
             item = self._result_qcards.takeAt(0)
             if item.widget():
@@ -1615,10 +1573,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             "color: #34d399; font-size: 12px; background: transparent;"
         )
 
-        # Show results section
         self._merge_results_stack.setCurrentIndex(1)
-
-        # ── Unlock pipeline ──────────────────────────────────────────
         self._refresh_pipeline_gate()
         self._refresh_pipeline_quality()
 
@@ -1691,32 +1646,24 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             self._result_note.setText(f"Save failed: {e}")
             self._merge_log_line(f"Save failed: {e}", "error")
 
-
-
-
     def _on_view_full_dataset(self):
         if not self._merge_result or not self._merge_result.success:
             return
-        
+
         dialog = FullDatasetDialog(
             self._merge_result.headers,
             self._merge_result.rows,
             parent=self,
         )
-        dialog.exec()  # blocks until closed — no GC issues
-
+        dialog.exec()
 
     # ==================================================================
     # SECTION B — LOGIC
     # ==================================================================
 
     def _refresh_pipeline_gate(self):
-        """
-        Show/hide the gate banner and enable/disable the Run Pipeline
-        button depending on whether a unified dataset exists.
-        """
-        store        = DataStore.get()
-        merge_done   = store.unified_dataset is not None
+        store      = DataStore.get()
+        merge_done = store.unified_dataset is not None
 
         self._pipeline_gate_banner.setVisible(not merge_done)
         self._pipeline_content.setEnabled(merge_done)
@@ -1786,7 +1733,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._highlight_stage(step_map.get(step, -1))
 
     def _on_pipeline_progress(self, progress: int):
-        pass  # extend if you add a global progress bar
+        pass
 
     def _highlight_stage(self, active_idx: int):
         for i, (stage, icon, name, key) in enumerate(self._stage_widgets):
@@ -1821,28 +1768,27 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
     def _on_pipeline_success(self, results: dict):
         self._highlight_stage(4)
 
-        store      = DataStore.get()
-        ml_service = results.get("model")
-        if ml_service:
-            store.set_trained_model(ml_service)
+        store           = DataStore.get()
+        training_result = results.get("training_result")
+        metrics = {
+            "accuracy": results.get("recall", 0) / 100,
+            "cv_mean":  results.get("f1_score", 0),
+            "cv_std":   0,
+        }
 
-        metrics = results.get("training_metrics", {})
-
-        # ── Store the engineered dataset for the view button ──────────────────
         eng_headers = results.get("engineered_headers", [])
         eng_rows    = results.get("engineered_rows", [])
         if eng_headers and eng_rows:
-            # Keep a page-level reference so the view button always shows
-            # the last pipeline run, independent of DataStore state
             self._pipeline_engineered_dataset = {
                 "headers": eng_headers,
                 "rows":    eng_rows,
             }
-            # Also update DataStore so prediction engine gets engineered columns
-            store.set_unified_dataset({
-                "headers": eng_headers,
-                "rows":    eng_rows,
-            })
+            # ── FIX 2: do NOT overwrite unified_dataset with engineered output ─
+            # raw_merged_dataset remains the training source (set in
+            # _on_merge_finished and never touched here).
+            # unified_dataset is also left as-is: the raw merged data set by
+            # _on_merge_finished is still the correct input for prediction
+            # (PredictionEngine runs feature engineering on demand).
             self._pipeline_log.append(
                 f"📊 Engineered dataset: {len(eng_rows):,} rows "
                 f"· {len(eng_headers)} features"
@@ -1872,7 +1818,8 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             self,
             "Pipeline Complete",
             f"Model trained successfully!\n\n"
-            f"Accuracy: {metrics.get('accuracy', 'N/A')}\n"
+            f"Recall: {results.get('recall', 'N/A')}%\n"
+            f"F1: {results.get('f1_score', 'N/A')}  PR-AUC: {results.get('pr_auc', 'N/A')}\n"
             f"Features: {len(eng_headers) - 1} engineered columns\n"
             f"Rows: {len(eng_rows):,}\n\n"
             f"Click '👁 View Engineered Dataset' to inspect the result.",
@@ -1884,7 +1831,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         QMessageBox.critical(self, "Pipeline Error", error)
 
     def _on_view_pipeline_dataset(self):
-        """Open the engineered dataset (post-pipeline) in the full viewer dialog."""
         dataset = getattr(self, "_pipeline_engineered_dataset", None)
 
         if not dataset:
@@ -1921,7 +1867,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         if not path:
             return
 
-        store = DataStore.get()
+        store   = DataStore.get()
         unified = store.unified_dataset
         if unified is None:
             QMessageBox.warning(self, "No Data", "No unified dataset available.")
@@ -1939,7 +1885,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             QMessageBox.critical(self, "Save Error", str(e))
 
     def _refresh_pipeline_quality(self):
-        """Rebuild the pipeline quality report from current DataStore state."""
         store = DataStore.get()
 
         while self._metrics_container.count():
@@ -1971,7 +1916,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             f" — {store.ready_count()}/4 portals ready"
         )
 
-        # Column tags
         while self._tags_grid.count():
             item = self._tags_grid.takeAt(0)
             if item.widget():
@@ -2021,6 +1965,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
     # ==================================================================
 
     def _on_store_updated(self, key: str):
+        if key in ("system_config", "all"):
+            if hasattr(self, "_sem_pill_lbl"):
+                self._sem_pill_lbl.setText(f"{SystemConfig.term_label()}  ▾")
         self._refresh_source_panel()
         self._refresh_pipeline_gate()
         self._refresh_pipeline_quality()
@@ -2031,7 +1978,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            /* ── Cards ────────────────────────────────────────────────── */
             #mergeHeaderCard {
                 background-color: #13172a;
                 border: 1px solid rgba(255,255,255,0.10);
@@ -2042,8 +1988,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 border: 1px solid rgba(255,255,255,0.10);
                 border-radius: 16px;
             }
-
-            /* ── Card internals ────────────────────────────────────────── */
             #mergeCardTitleBar { background: transparent; }
             #mergeCardTitle {
                 color: #e8eaf0;
@@ -2056,11 +2000,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Header ────────────────────────────────────────────────── */
             #mergeTitle {
                 color: #e8eaf0;
-                font-size: 18px;
+                font-size: 30px;
                 font-weight: bold;
                 background: transparent;
             }
@@ -2079,8 +2021,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Section divider ───────────────────────────────────────── */
             #sectionTag {
                 color: rgba(255,255,255,0.25);
                 font-size: 10px;
@@ -2094,8 +2034,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-weight: bold;
                 background: transparent;
             }
-
-            /* ── Gate banner ───────────────────────────────────────────── */
             #pipelineGateBanner {
                 background-color: rgba(245,179,53,0.07);
                 border: 1px solid rgba(245,179,53,0.25);
@@ -2106,8 +2044,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 13px;
                 background: transparent;
             }
-
-            /* ── Source rows ───────────────────────────────────────────── */
             #mergeSourceRow {
                 background-color: rgba(255,255,255,0.02);
                 border: 1px solid rgba(255,255,255,0.05);
@@ -2120,8 +2056,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 background: transparent;
                 min-width: 80px;
             }
-
-            /* ── Progress bar ──────────────────────────────────────────── */
             #mergeSourceProgress {
                 background-color: rgba(255,255,255,0.08);
                 border-radius: 3px;
@@ -2131,8 +2065,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 background-color: #4f8cff;
                 border-radius: 3px;
             }
-
-            /* ── Merge config tiles ────────────────────────────────────── */
             #mergeConfigTile {
                 background-color: rgba(255,255,255,0.03);
                 border: 1px solid rgba(255,255,255,0.08);
@@ -2143,8 +2075,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Run prediction button ─────────────────────────────────── */
             #mergeRunPredBtn {
                 background-color: rgba(79,140,255,0.15);
                 border: 1px solid rgba(79,140,255,0.30);
@@ -2155,8 +2085,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 padding: 8px 16px;
             }
             #mergeRunPredBtn:hover { background-color: rgba(79,140,255,0.25); }
-
-            /* ── Quality bar ───────────────────────────────────────────── */
             #mergeQualityBar {
                 background-color: rgba(0,0,0,0.15);
                 border: 1px solid rgba(255,255,255,0.08);
@@ -2180,8 +2108,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 border: none;
             }
             #mergeQualityProgress::chunk { border-radius: 4px; }
-
-            /* ── Preview table ─────────────────────────────────────────── */
             #mergeTableContainer { background: transparent; }
             #mergeTable {
                 background-color: transparent;
@@ -2203,20 +2129,14 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 padding: 8px 10px;
             }
             #mergeTable QHeaderView::section:last { border-right: none; }
-            #mergeTable QScrollBar:vertical {
-                background: transparent; width: 8px;
-            }
+            #mergeTable QScrollBar:vertical { background: transparent; width: 8px; }
             #mergeTable QScrollBar::handle:vertical {
                 background: rgba(255,255,255,0.15);
                 border-radius: 4px;
                 min-height: 30px;
             }
-            #mergeTable QScrollBar::handle:vertical:hover {
-                background: rgba(255,255,255,0.28);
-            }
-            #mergeTable QScrollBar:horizontal {
-                background: transparent; height: 8px;
-            }
+            #mergeTable QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.28); }
+            #mergeTable QScrollBar:horizontal { background: transparent; height: 8px; }
             #mergeTable QScrollBar::handle:horizontal {
                 background: rgba(255,255,255,0.15);
                 border-radius: 4px;
@@ -2224,11 +2144,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             #mergeTable QScrollBar::add-line:vertical,
             #mergeTable QScrollBar::sub-line:vertical,
             #mergeTable QScrollBar::add-line:horizontal,
-            #mergeTable QScrollBar::sub-line:horizontal {
-                height: 0; width: 0;
-            }
-
-            /* ── Merge log ─────────────────────────────────────────────── */
+            #mergeTable QScrollBar::sub-line:horizontal { height: 0; width: 0; }
             #mergeLogContainer { background: transparent; }
             #mergeLog {
                 background-color: rgba(0,0,0,0.25);
@@ -2244,8 +2160,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Result footer ─────────────────────────────────────────── */
             #mergeResultFooter {
                 background-color: rgba(0,0,0,0.12);
                 border: 1px solid rgba(255,255,255,0.08);
@@ -2256,8 +2170,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Buttons ───────────────────────────────────────────────── */
             #mergeSaveBtn {
                 background-color: rgba(52,211,153,0.10);
                 border: 1px solid rgba(52,211,153,0.35);
@@ -2268,7 +2180,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 padding: 9px 20px;
             }
             #mergeSaveBtn:hover { background-color: rgba(52,211,153,0.20); }
-
             #mergeProceedBtn {
                 background-color: #4f8cff;
                 border: none;
@@ -2278,10 +2189,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-weight: 600;
                 padding: 9px 20px;
             }
-            #mergeProceedBtn:hover {
-                background-color: rgba(79,140,255,0.85);
-            }
-
+            #mergeProceedBtn:hover { background-color: rgba(79,140,255,0.85); }
             #pipelineDownloadBtn {
                 background-color: rgba(79,140,255,0.10);
                 border: 1px solid rgba(79,140,255,0.30);
@@ -2297,7 +2205,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 border-color: rgba(255,255,255,0.08);
                 color: rgba(255,255,255,0.2);
             }
-
             #pipelineViewDatasetBtn {
                 background-color: rgba(167,139,250,0.10);
                 border: 1px solid rgba(167,139,250,0.30);
@@ -2313,15 +2220,11 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 border-color: rgba(255,255,255,0.08);
                 color: rgba(255,255,255,0.2);
             }
-
-            /* ── Stat tiles ────────────────────────────────────────────── */
             #mergeStatTile {
                 background-color: rgba(255,255,255,0.03);
                 border: 1px solid rgba(255,255,255,0.08);
                 border-radius: 10px;
             }
-
-            /* ── Pipeline section titles ───────────────────────────────── */
             #pipelineSectionTitle {
                 color: #e8eaf0;
                 font-size: 15px;
@@ -2333,8 +2236,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Pipeline card titles ──────────────────────────────────── */
             #pipelineCardTitle {
                 color: rgba(255,255,255,0.35);
                 font-size: 10px;
@@ -2342,8 +2243,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 letter-spacing: 1.2px;
                 background: transparent;
             }
-
-            /* ── Pipeline stages ───────────────────────────────────────── */
             #pipelineStage {
                 background-color: rgba(255,255,255,0.03);
                 border: 1px solid rgba(255,255,255,0.08);
@@ -2364,8 +2263,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 20px;
                 background: transparent;
             }
-
-            /* ── Pipeline quality metrics ──────────────────────────────── */
             #pipelineMetricLabel {
                 color: rgba(255,255,255,0.55);
                 font-size: 12px;
@@ -2381,8 +2278,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 12px;
                 background: transparent;
             }
-
-            /* ── Pipeline dataset preview ──────────────────────────────── */
             #pipelinePreviewMeta {
                 color: rgba(255,255,255,0.4);
                 font-size: 12px;
@@ -2420,17 +2315,13 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 font-size: 11px;
                 padding: 3px 8px;
             }
-
-            /* ── Global scrollbars ─────────────────────────────────────── */
             QScrollBar:vertical { background: transparent; width: 8px; }
             QScrollBar::handle:vertical {
                 background: rgba(255,255,255,0.10);
                 border-radius: 4px;
                 min-height: 30px;
             }
-            QScrollBar::handle:vertical:hover {
-                background: rgba(255,255,255,0.20);
-            }
+            QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.20); }
             QScrollBar::add-line:vertical,
             QScrollBar::sub-line:vertical { height: 0; }
         """)

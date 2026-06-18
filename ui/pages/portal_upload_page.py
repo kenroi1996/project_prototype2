@@ -21,6 +21,7 @@ from ui.dialogs.preview_dataset import DatasetPreviewDialog
 from ui.dialogs.clean_data_window import CleanDataWindow
 from ui.dialogs.portal_dataset_dialog import PortalDatasetDialog
 from services.data_store import DataStore
+from services.system_config import SystemConfig
 from services.excel_service import read_excel_file, dataframe_to_rows, rows_to_dataframe
 from services.database_service import DatabaseService, PORTAL_SOURCE_CONFIGS
 from services.preprocessing_service import CleaningEngine, compute_issues
@@ -28,7 +29,7 @@ from services.preprocessing_service import CleaningEngine, compute_issues
 
 PORTAL_CONFIGS = {
     "mis": {
-        "title": "MIS Portal",
+        "title": "MIS PORTAL",
         "office": "Management Information System",
         "subtitle": "Academic records & enrollment data",
         "description": (
@@ -44,7 +45,7 @@ PORTAL_CONFIGS = {
         ],
     },
     "sao": {
-        "title": "SAO Portal",
+        "title": "SAO PORTAL",
         "office": "Student Affairs Office",
         "subtitle": "Attendance, conduct & student life data",
         "description": (
@@ -59,7 +60,7 @@ PORTAL_CONFIGS = {
         ],
     },
     "guidance": {
-        "title": "Guidance Portal",
+        "title": "Guidance PORTAL",
         "office": "Guidance & Counseling Office",
         "subtitle": "Psychological screening & referral records",
         "description": (
@@ -76,7 +77,7 @@ PORTAL_CONFIGS = {
         ],
     },
     "registrar": {
-        "title": "Registrar Portal",
+        "title": "Registrar PORTAL",
         "office": "Office of the Registrar",
         "subtitle": "Student biographical & high school background data",
         "description": (
@@ -113,6 +114,7 @@ class PortalUploadPage(QWidget):
         self.setup_ui()
         self._apply_page_styles()
         self._refresh_from_datastore()
+        DataStore.get().add_listener(self._on_system_config_updated)
 
     # ── DYNAMIC STATE HELPERS ─────────────────────────────────────
 
@@ -773,6 +775,18 @@ class PortalUploadPage(QWidget):
             f"({ready}/4 portals ready)  {readiness}")
 
 
+    def _on_system_config_updated(self, key: str):
+        """Update header labels when system config changes in Settings."""
+        if key in ("system_config", "all"):
+            if hasattr(self, "_ay_sub_lbl"):
+                self._ay_sub_lbl.setText(
+                    f"Academic Year {SystemConfig.academic_year()}"
+                )
+            if hasattr(self, "_sem_pill_lbl"):
+                self._sem_pill_lbl.setText(
+                    f"{SystemConfig.term_label()}  ▾"
+                )
+
     def _apply_page_styles(self):
         accent = self.config["accent"]
         self.setStyleSheet(f"""
@@ -996,11 +1010,11 @@ class PortalUploadPage(QWidget):
         header = QLabel(cfg["title"])
         header.setObjectName("header")
 
-        subheader = QLabel("Academic Year 2024–2025")
-        subheader.setObjectName("subHeader")
+        self._ay_sub_lbl = QLabel(f"Academic Year {SystemConfig.academic_year()}")
+        self._ay_sub_lbl.setObjectName("subHeader")
 
         header_text_layout.addWidget(header)
-        header_text_layout.addWidget(subheader)
+        header_text_layout.addWidget(self._ay_sub_lbl)
 
         header_layout.addLayout(header_text_layout)
         header_layout.addStretch()
@@ -1027,8 +1041,8 @@ class PortalUploadPage(QWidget):
         status_animation.setLoopCount(-1)
         status_animation.start()
 
-        semester_pill = QLabel("1st Semester 2024–25  ▾")
-        semester_pill.setObjectName("portalSemesterPill")
+        self._sem_pill_lbl = QLabel(f"{SystemConfig.term_label()}  ▾")
+        self._sem_pill_lbl.setObjectName("portalSemesterPill")
 
         self._save_db_btn = QPushButton("💾 Save to DB")
         self._save_db_btn.setObjectName("runButton")
@@ -1050,7 +1064,7 @@ class PortalUploadPage(QWidget):
         self._etl_btn.setFixedWidth(130)
 
         model_layout.addWidget(model_status)
-        model_layout.addWidget(semester_pill)
+        model_layout.addWidget(self._sem_pill_lbl)
         model_layout.addWidget(self._save_db_btn)
         model_layout.addWidget(self._pull_db_btn)
         model_layout.addWidget(self._etl_btn)

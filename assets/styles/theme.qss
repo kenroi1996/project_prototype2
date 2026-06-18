@@ -851,3 +851,287 @@
                 color: rgba(255, 255, 255, 0.35);
                 font-size: 12px;
             }
+            #logoutBtn {
+                background-color: rgba(255, 91, 91, 0.08);
+                border: 1px solid rgba(255, 91, 91, 0.25);
+                border-radius: 6px;
+                color: #ff5b5b;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            #logoutBtn:hover {
+                background-color: rgba(255, 91, 91, 0.18);
+            }
+            /* ======================================================
+            PREDICTION PAGE STYLING
+            Mirrors the conventions of the main theme:
+                - Cards: rgba(0,0,0,0.2) bg, border-radius 15px,
+                        border-top 4px accent per step
+                - Buttons: #1a73e8 primary, transparent secondary
+                - Inputs: rgba(255,255,255,0.06) bg, 0.12 border
+            ====================================================== */
+
+            #predPageContainer { background: transparent; }
+
+            #predHeaderCard { background: transparent; border: none; }
+
+            #predModelPill {
+                background-color: rgba(0, 0, 0, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }
+            #predModelDot { color: #2ecc71; font-size: 10px; background: transparent; }
+            #predModelStatus { color: #2ecc71; font-size: 12px; font-weight: bold; background: transparent; }
+
+            #predSemesterPill {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 12px;
+                padding: 8px 14px;
+            }
+
+            #predCard {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+            }
+            #predCardDetails {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-top: 4px solid #4f8cff;
+            }
+            #predCardPortals {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-top: 4px solid #a78bfa;
+            }
+            #predCardMerge {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-top: 4px solid #34d399;
+            }
+            #predCardPredict {
+                background-color: rgba(0, 0, 0, 0.2);
+                border-radius: 15px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-top: 4px solid #f5b335;
+            }
+
+            #predStepNumber {
+                color: #4f8cff;
+                font-size: 11px;
+                font-weight: bold;
+                letter-spacing: 1px;
+                background: transparent;
+            }
+            #predStepTitle { color: white; font-size: 16px; font-weight: bold; background: transparent; }
+
+            #predHint { color: rgba(255, 255, 255, 0.45); font-size: 12px; background: transparent; }
+            #predSuccess { color: #34d399; font-size: 12px; background: transparent; }
+
+            #predInputLabel {
+                color: rgba(255, 255, 255, 0.65);
+                font-size: 11px;
+                font-weight: bold;
+                letter-spacing: 0.5px;
+                background: transparent;
+            }
+
+            #predInput {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                color: white;
+                font-size: 13px;
+                padding: 10px 14px;
+                selection-background-color: #4f8cff;
+            }
+            #predInput:focus {
+                border: 1px solid rgba(79, 140, 255, 0.5);
+                background-color: rgba(255, 255, 255, 0.08);
+            }
+
+            #predPortalTile {
+                background-color: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                min-height: 100px;
+            }
+
+            #predPrimaryBtn {
+                background-color: #1a73e8;
+                border: none;
+                border-radius: 8px;
+                color: white;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 0 22px;
+            }
+            #predPrimaryBtn:hover { background-color: #2980d9; }
+            #predPrimaryBtn:disabled {
+                background-color: rgba(255, 255, 255, 0.06);
+                color: rgba(255, 255, 255, 0.28);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+            }
+
+            #predSecondaryBtn {
+                background-color: transparent;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 0.75);
+                font-size: 12px;
+                padding: 0 18px;
+            }
+            #predSecondaryBtn:hover { background-color: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.28); }
+            #predSecondaryBtn:disabled { background-color: transparent; color: rgba(255, 255, 255, 0.25); border-color: rgba(255, 255, 255, 0.08); }
+
+            #predRunBtn {
+                background-color: #1a73e8;
+                border: none;
+                border-radius: 8px;
+                color: white;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 0 20px;
+            }
+            #predRunBtn:hover { background-color: #2980d9; }
+            #predRunBtn:disabled { background-color: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.30); }
+
+            #predProgressBar {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 6px;
+                border: none;
+                height: 10px;
+            }
+            #predProgressBar::chunk { background-color: #34d399; border-radius: 6px; }
+            /* Prediction page scroll area — must be transparent to show card backgrounds */
+            #predScroll {
+                background: transparent;
+                border: none;
+            }
+            #predScroll > QWidget > QWidget {
+                background: transparent;
+            }
+
+            /* Portal browse buttons */
+            #predPortalBtn {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 6px;
+                color: rgba(255, 255, 255, 0.80);
+                font-size: 11px;
+                font-weight: 600;
+                text-align: left;
+                padding-left: 10px;
+            }
+            #predPortalBtn:hover {
+                background-color: rgba(255, 255, 255, 0.10);
+                border-color: rgba(255, 255, 255, 0.30);
+                }       
+                /* ======================================================
+                DASHBOARD — Risk Trend & Program Heatmap (Row 3)
+                ====================================================== */
+
+                #trendChartHost {
+                    background: transparent;
+                    border: none;
+                }
+
+                #heatmapHeader {
+                    color: rgba(255, 255, 255, 0.4);
+                    font-size: 10px;
+                    font-weight: bold;
+                    letter-spacing: 0.5px;
+                    padding: 6px 4px;
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                }
+
+                #heatmapProgram {
+                    color: rgba(255, 255, 255, 0.80);
+                    font-size: 12px;
+                    font-weight: 600;
+                    padding: 4px 2px;
+                }
+                #predTermCombo {
+                    background-color: rgba(255, 255, 255, 0.06);
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    border-radius: 8px;
+                    color: rgba(255, 255, 255, 0.85);
+                    font-size: 12px;
+                    padding: 8px 12px;
+                }
+                #predTermCombo::drop-down { border: none; width: 20px; }
+                #predTermCombo QAbstractItemView {
+                    background-color: #1a1d24;
+                    color: white;
+                    selection-background-color: #2a3f6e;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                }
+                #predTermPreview {
+                    color: #4f8cff;
+                    font-size: 11px;
+                    font-weight: 600;
+                    background: transparent;
+                }
+                /* ======================================================
+                PREDICTION PAGE — Model Status Panel
+                ====================================================== */
+
+                #predModelStatusPanel {
+                    background-color: rgba(0, 0, 0, 0.2);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 15px;
+                    border-left: 4px solid #34d399;
+                }
+
+                #predStatusDot {
+                    font-size: 11px;
+                    background: transparent;
+                }
+
+                #predStatusTitle {
+                    font-size: 14px;
+                    font-weight: 700;
+                    background: transparent;
+                }
+
+                #predStatusSub {
+                    color: rgba(255, 255, 255, 0.45);
+                    font-size: 12px;
+                    background: transparent;
+                }
+
+                #predMetricChip {
+                    background-color: rgba(255, 255, 255, 0.04);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 10px;
+                    min-width: 72px;
+                }
+
+            /* ======================================================
+            GLOBAL TOOLTIP — replaces Qt's default white box
+            Background: deep navy matching the app surface
+            Border: subtle blue accent so it reads as "UI chrome"
+            Text: warm silver — readable, not stark white
+            ====================================================== */
+
+            QToolTip {
+                background-color: #1a1f35;
+                color: #c9d0e0;
+                border: 1px solid rgba(79, 140, 255, 0.35);
+                border-radius: 7px;
+                padding: 7px 11px;
+                font-family: 'Segoe UI';
+                font-size: 12px;
+                opacity: 245;
+            }
+            #mergeTitle {
+                font-size: 24px;
+                font-weight: bold;
+                color: #e8eaf0;
+            }

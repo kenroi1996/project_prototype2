@@ -6,37 +6,22 @@ import random
 # RISK THRESHOLDS
 # =====================================
 
-# Risk thresholds — applied to model.predict_proba() probability (0–100 scale).
-# These are used for DISPLAY and RANKING only.
-# The binary at_risk / not_at_risk label comes from model.predict() directly,
-# which uses sklearn's optimal decision boundary (shifted by class_weight=balanced).
-#
-# Thresholds are calibrated for a ~5% minority class:
-#   High Risk     ≥ 50%  (model is confident the student is at risk)
-#   Moderate Risk ≥ 25%  (elevated probability, worth monitoring)
-#   Low Risk      <  25%
 RISK_HIGH     = 50
 RISK_MODERATE = 25
 
 
-def classify_risk(score: float, binary_pred: int = None) -> str:
+def classify_risk(score: float, binary_pred=None) -> str:
     """
-    Classify a student's risk tier.
+    Classify a student's risk level from probability score and binary prediction.
+    Handles both integer (0/1) and string ('at_risk'/'not_at_risk') predictions.
+    """
+    _POSITIVE = {1, '1', 'at_risk', 'at-risk', True}
+    is_positive = binary_pred in _POSITIVE
 
-    Parameters
-    ----------
-    score       : float  — predict_proba probability * 100  (0–100 scale)
-    binary_pred : int    — model.predict() output (1=at_risk, 0=not_at_risk).
-                           When provided, at_risk students are always placed in
-                           at least Moderate Risk regardless of probability.
-    """
-    if binary_pred == 1:
-        # Model's optimal decision boundary says at_risk —
-        # always at least Moderate, High if probability also confirms it
+    if is_positive:
         return "high_risk" if score >= RISK_HIGH else "moderate_risk"
-    # Not flagged as at_risk by model — use probability for gradation
     if score >= RISK_HIGH:
-        return "moderate_risk"   # high probability but model says not_at_risk → moderate
+        return "high_risk"
     elif score >= RISK_MODERATE:
         return "moderate_risk"
     return "low_risk"
@@ -48,6 +33,82 @@ def risk_label(category: str) -> str:
         "moderate_risk": "Moderate Risk",
         "low_risk":      "Low Risk",
     }.get(category, "Unknown")
+
+
+# =====================================
+# FEATURE DISPLAY METADATA
+# =====================================
+
+# Human-readable labels and value formatters for each training feature.
+# Used by _shap_factors() to produce meaningful per-student explanations.
+_FEATURE_LABELS: dict[str, str] = {
+    "Entrance_Exam_Score":  "Entrance Exam Score",
+    "HS_GPA":               "High School GPA",
+    "Strand_Program_Match": "SHS Strand–Program Alignment",
+    "Financial_Stress":     "Financial Stress Index",
+    "First_Gen_Student":    "First-Generation Student",
+    "Has_Scholarship":      "Has Scholarship",
+    "Gap_Years":            "Gap Years Before College",
+    "Private_HS":           "Attended Private High School",
+    "Has_HS_Honors":        "Graduated with HS Honors",
+    "Age_At_Enrollment":    "Age at Enrollment",
+    "Distance_KM":          "Distance from Campus (km)",
+}
+
+# Features where a HIGH value is the risk signal (bad = high).
+# For these, contribution = importance × value (higher → more risk).
+# Features NOT in this set are "protective" — a high value reduces risk,
+# so contribution = importance × (1 / (1 + value)) to invert the direction.
+_HIGH_IS_RISKY: set[str] = {
+    "Financial_Stress",
+    "First_Gen_Student",
+    "Gap_Years",
+    "Distance_KM",
+}
+
+# Features where a LOW value is the risk signal (bad = low).
+# Contribution = importance × (1 / (1 + value)) — lower score → higher risk weight.
+_LOW_IS_RISKY: set[str] = {
+    "Entrance_Exam_Score",
+    "HS_GPA",
+    "Has_HS_Honors",
+    "Has_Scholarship",
+    "Strand_Program_Match",
+}
+
+
+def _feature_label(name: str) -> str:
+    """Return a human-readable label for a feature, stripping one-hot suffixes."""
+    # One-hot encoded features look like "Program_BSCS" or "Age_Group_adult"
+    for base, label in _FEATURE_LABELS.items():
+        if name == base or name.startswith(base + "_"):
+            return label
+    # Fallback: replace underscores and title-case
+    return name.replace("_", " ").title()
+
+
+def _format_value(feature: str, value: float) -> str:
+    """Format a raw feature value for display in the risk card."""
+    if feature == "Entrance_Exam_Score":
+        return f"{value:.0f}/100"
+    if feature == "HS_GPA":
+        return f"{value:.2f}"
+    if feature == "Financial_Stress":
+        return f"{value:.0f}/10"
+    if feature == "Gap_Years":
+        return f"{value:.0f} yr{'s' if value != 1 else ''}"
+    if feature == "Distance_KM":
+        return f"{value:.1f} km"
+    if feature == "Age_At_Enrollment":
+        return f"{value:.0f} yrs old"
+    if feature in ("First_Gen_Student", "Has_Scholarship",
+                   "Private_HS", "Has_HS_Honors"):
+        return "Yes" if value >= 0.5 else "No"
+    if feature == "Strand_Program_Match":
+        return {2: "Aligned", 1: "Partial", 0: "Misaligned", -1: "Unknown"}.get(
+            int(round(value)), str(value)
+        )
+    return str(value)
 
 
 # =====================================
@@ -81,9 +142,9 @@ class PredictionEngine:
         target_col    = model_data.get("target_col", "Final_Avg_GRD")
 
         cb("Preparing feature matrix…", 15)
-        X, student_ids, student_meta = cls._prepare(
+        X, student_ids, student_meta, raw_feature_rows = cls._prepare(
             headers, rows, feature_names, target_col,
-            preprocessor = model_data.get("preprocessor"),
+            preprocessor=model_data.get("preprocessor"),
         )
 
         if not X:
@@ -101,27 +162,59 @@ class PredictionEngine:
             scores, probas = cls._predict_mock(X)
             is_mock = True
 
+        # Apply the optimised decision threshold saved during training.
+        # model.predict() always uses 0.5; our threshold (e.g. 0.15) was
+        # tuned to maximise recall on the imbalanced training set.
+        threshold = 0.15  # fallback if not stored
+        try:
+            meta_block = model_data.get("metadata", {}) or {}
+            threshold  = float(
+                model_data.get("decision_threshold")
+                or meta_block.get("decision_threshold")
+                or meta_block.get("threshold")
+                or 0.15
+            )
+        except (TypeError, ValueError):
+            pass
+        print(f"[PredictionEngine] Using decision threshold: {threshold}")
+
+        # Override binary scores using threshold on probabilities
+        _POSITIVE = {1, '1', 'at_risk', 'at-risk', True}
+        scores = ['at_risk' if p >= threshold else 'not_at_risk' for p in probas]
+
         cb("Computing risk categories…", 70)
+
+        # Pre-extract global importances once — used as weights, not as the
+        # final contribution score.  Per-student values modulate these weights.
+        try:
+            global_importances = list(model_data["model"].feature_importances_)
+        except Exception:
+            global_importances = [1.0 / max(len(feature_names), 1)] * len(feature_names)
+
         predictions = []
         for i, sid in enumerate(student_ids):
             score    = round(probas[i] * 100, 1)
-            category = classify_risk(score, binary_pred=int(scores[i]))
+            category = classify_risk(score, binary_pred=scores[i])
             meta     = student_meta[i]
+            raw_vals = raw_feature_rows[i]   # dict: feature_name → raw float value
+
+            shap_factors = cls._shap_factors(
+                feature_names, global_importances, raw_vals
+            )
+            top_factor = shap_factors[0][0] if shap_factors else "—"
 
             predictions.append({
-                "student_id": sid,
-                # Display
-                "name":       meta.get("name", "—"),
-                "program":    meta.get("program", "—"),
-                "college":    meta.get("college", "—"),
-                "score":      score,
-                "category":   category,
-                "label":      risk_label(category),
-                "factor":     cls._top_factor(model_data, feature_names, X[i]),
-                "shap_factors": cls._shap_factors(model_data, feature_names, X[i]),
-                "gwa":        meta.get("gwa", "—"),
-                "absences":   meta.get("absences", "—"),
-                # All meta fields (passed through for persistence layer)
+                "student_id":   sid,
+                "name":         meta.get("name", "—"),
+                "program":      meta.get("program", "—"),
+                "college":      meta.get("college", "—"),
+                "score":        score,
+                "category":     category,
+                "label":        risk_label(category),
+                "factor":       top_factor,
+                "shap_factors": shap_factors,
+                "gwa":          meta.get("gwa", "—"),
+                "absences":     meta.get("absences", "—"),
                 **{k: v for k, v in meta.items()},
             })
 
@@ -170,20 +263,18 @@ class PredictionEngine:
         feature_names: list,
         target_col:    str,
         preprocessor   = None,
-    ) -> tuple[list, list, list]:
+    ) -> tuple[list, list, list, list]:
         """
-        Returns (X, student_ids, student_meta).
+        Returns (X, student_ids, student_meta, raw_feature_rows).
 
-        When a fitted preprocessor (DataPipeline) is provided, X is a
-        properly encoded + scaled numpy array matching the training feature
-        space exactly. Without it, X falls back to float-converted raw values
-        (categorical strings become 0.0 — fine for approximate scoring only).
+        raw_feature_rows is a list of dicts {feature_name: float_value}
+        containing the PRE-SCALING numeric value for each feature and student.
+        These are used by _shap_factors() to produce per-student explanations.
         """
 
         col_idx   = {h: i for i, h in enumerate(headers)}
         feat_idxs = [col_idx.get(f) for f in feature_names]
 
-        # Student ID
         student_id_keywords = [
             "student_id", "id_no", "id", "keyid", "systemcode",
             "student code", "studentid"
@@ -205,39 +296,36 @@ class PredictionEngine:
                     return v
             return None
 
-        # ── Display / meta column resolution ─────────────────────────────────
-        # first_name and last_name are stored separately so dim_student can
-        # receive them as distinct fields (rather than a combined "name" string).
-        fname_idx   = _idx("firstname", "first_name", "First_Name")
-        lname_idx   = _idx("lastname",  "last_name",  "Last_Name")
-        program_idx = _idx("Program",   "program",    "PROGRAM",   "program_code")
-        college_idx = _idx("College",   "college",    "COLLEGE")
-        gwa_idx     = _idx("Final_Avg_GRD", "final_avg_grd", "FINAL_AVG_GRD")
-        abs_idx     = _idx("Attendance_Rate", "absences")
-
+        fname_idx        = _idx("firstname", "first_name", "First_Name",
+                                "FIRSTNAME", "FIRST_NAME", "fname", "FNAME",
+                                "given_name", "Given_Name", "GIVEN_NAME")
+        lname_idx        = _idx("lastname", "last_name", "Last_Name",
+                                "LASTNAME", "LAST_NAME", "lname", "LNAME",
+                                "surname", "Surname", "SURNAME")
+        fullname_idx     = _idx("full_name", "Full_Name", "FULL_NAME",
+                                "name", "NAME", "student_name",
+                                "Student_Name", "STUDENT_NAME")
+        program_idx      = _idx("Program",   "program",    "PROGRAM",   "program_code")
+        college_idx      = _idx("College",   "college",    "COLLEGE")
+        gwa_idx          = _idx("Final_Avg_GRD", "final_avg_grd", "FINAL_AVG_GRD")
+        abs_idx          = _idx("Attendance_Rate", "absences")
         seccode_idx      = _idx("SecCode",                  "seccode",                  "sec_code")
         year_idx         = _idx("Year",                     "year",                     "year_level")
         sex_idx          = _idx("Sex_code",                 "sex_code",                 "gender", "GENDER")
         address_idx      = _idx("Home_Address",             "home_address",             "HOME_ADDRESS")
-        # Municipality — stored as home_municipality in dim_student
-        municipality_idx = _idx("Municipality",             "municipality",             "home_municipality",
-                                "MUNICIPALITY")
+        municipality_idx = _idx("Municipality",             "municipality",             "home_municipality", "MUNICIPALITY")
         civil_idx        = _idx("Civil_Status",             "civil_status",             "CIVIL_STATUS")
         birthdate_idx    = _idx("Birthdate",                "birthdate",                "BIRTHDATE")
         yr_enrolled_idx  = _idx("Year_Enrolled",            "year_enrolled",            "YEAR_ENROLLED")
         exam_score_idx   = _idx("Entrance_Exam_Score",      "entrance_exam_score",      "ENTRANCE_EXAM_SCORE")
-        # family_income_bracket — dim_student uses this name; portals may use
-        # Family_Income or family_income_bracket interchangeably
-        income_idx       = _idx("Family_Income",            "family_income_bracket",    "family_income",
-                                "FAMILY_INCOME")
+        income_idx       = _idx("Family_Income",            "family_income_bracket",    "family_income", "FAMILY_INCOME")
         parent_edu_idx   = _idx("Parent_Highest_Education", "parent_highest_education", "PARENT_HIGHEST_EDUCATION")
         hs_gpa_idx       = _idx("HS_GPA",                   "hs_gpa",                   "HS_GPA")
         yr_grad_idx      = _idx("Year_Graduated",           "year_graduated",           "YEAR_GRADUATED")
         strand_idx       = _idx("SHS_Strand",               "shs_strand",               "SHS_STRAND")
         hs_type_idx      = _idx("HS_Type",                  "hs_type",                  "HS_TYPE")
         honors_idx       = _idx("Graduation_Honors",        "graduation_honors",        "GRADUATION_HONORS")
-        hs_school_idx    = _idx("HS_School",                "hs_school",                "HS_SCHOOL",
-                                "hs_school_name")
+        hs_school_idx    = _idx("HS_School",                "hs_school",                "HS_SCHOOL", "hs_school_name")
         scholar_idx      = _idx("Scholarship_Applicant",    "scholarship_applicant",    "SCHOLARSHIP_APPLICANT")
         scholar_type_idx = _idx("Scholarship_Type",         "scholarship_type",         "SCHOLARSHIP_TYPE")
         religion_idx     = _idx("Religion",                 "religion",                 "RELIGION")
@@ -261,67 +349,91 @@ class PredictionEngine:
         if _missing:
             print(f"[PredictionEngine] NULL columns (not in headers): {_missing}")
 
-        X_raw        = []   # raw string values per feature — for preprocessing
-        X            = []   # float matrix (fallback when no preprocessor)
-        student_ids  = []
-        student_meta = []
+        X_raw         = []
+        X             = []
+        student_ids   = []
+        student_meta  = []
+        raw_feat_rows = []   # list of {feature_name: float} per student
 
         def _cell(row, idx):
             if idx is not None and idx < len(row):
                 return str(row[idx]).strip()
             return ""
 
-        # Load the raw meta snapshot captured before feature engineering
         from services.data_store import DataStore
         raw_meta: dict = DataStore.get().raw_meta_snapshot or {}
 
+        # Normalise snapshot keys: strip whitespace + remove '.0' suffix
+        # that pandas adds when reading numeric-looking IDs from Excel.
+        def _norm_sid(raw_sid: str) -> str:
+            s = str(raw_sid).strip()
+            return s[:-2] if s.endswith(".0") else s
+
+        raw_meta_norm: dict = {_norm_sid(k): v for k, v in raw_meta.items()}
+
         for row in rows:
-            sid = _cell(row, id_idx)
-            if not sid:
+            sid = _norm_sid(_cell(row, id_idx) or "")
+            if not sid or sid in ("", "nan", "None"):
                 continue
 
-            raw_feature_row = {}   # col_name → raw string value
+            raw_feature_row = {}
             float_feature_row = []
+            raw_vals: dict[str, float] = {}
 
             for feat, idx in zip(feature_names, feat_idxs):
                 if idx is None or idx >= len(row):
                     raw_feature_row[feat] = ""
                     float_feature_row.append(0.0)
+                    raw_vals[feat] = 0.0
                 else:
                     val = row[idx].strip()
                     raw_feature_row[feat] = val
                     try:
-                        float_feature_row.append(float(val))
+                        fval = float(val)
                     except ValueError:
-                        float_feature_row.append(0.0)
+                        fval = 0.0
+                    float_feature_row.append(fval)
+                    raw_vals[feat] = fval
 
             X_raw.append(raw_feature_row)
             X.append(float_feature_row)
+            raw_feat_rows.append(raw_vals)
             student_ids.append(sid)
 
             first_name = _cell(row, fname_idx)
             last_name  = _cell(row, lname_idx)
+            snap = raw_meta_norm.get(sid, {})
 
-            # Pull from the raw snapshot when names aren't in engineered headers
-            snap = raw_meta.get(sid, {})
+            # Try snapshot for first/last name
             if not first_name:
-                first_name = (snap.get("First_Name") or snap.get("firstname")
-                              or snap.get("first_name") or "")
+                first_name = (
+                    snap.get("First_Name") or snap.get("FIRSTNAME")
+                    or snap.get("firstname") or snap.get("first_name")
+                    or snap.get("fname") or snap.get("given_name") or ""
+                )
             if not last_name:
-                last_name  = (snap.get("Last_Name") or snap.get("lastname")
-                              or snap.get("last_name") or "")
-            full_name = f"{first_name} {last_name}".strip() or sid
+                last_name = (
+                    snap.get("Last_Name") or snap.get("LASTNAME")
+                    or snap.get("lastname") or snap.get("last_name")
+                    or snap.get("lname") or snap.get("surname") or ""
+                )
 
-            # Build meta: start with engineered-dataset fields, then overlay
-            # the raw snapshot so stripped columns are always populated.
+            # Try combined full_name column as last resort
+            full_name = f"{first_name} {last_name}".strip()
+            if not full_name:
+                full_name = (
+                    _cell(row, fullname_idx)
+                    or snap.get("full_name") or snap.get("FULL_NAME")
+                    or snap.get("student_name") or snap.get("STUDENT_NAME")
+                    or snap.get("name") or snap.get("NAME") or sid
+                )
+
             meta = {
-                # ── Display ───────────────────────────────────────────────────
                 "name":    full_name,
                 "program": _cell(row, program_idx) or snap.get("Program") or "—",
                 "college": _cell(row, college_idx) or snap.get("College") or "—",
                 "gwa":     _cell(row, gwa_idx)     or snap.get("Final_Avg_GRD") or "—",
                 "absences":_cell(row, abs_idx)     or "—",
-                # ── dim_student fields ────────────────────────────────────────
                 "first_name":               first_name,
                 "last_name":                last_name,
                 "sex_code":                 _cell(row, sex_idx)         or snap.get("Sex_code", ""),
@@ -337,84 +449,114 @@ class PredictionEngine:
                 "graduation_honors":        _cell(row, honors_idx)      or snap.get("Graduation_Honors", ""),
                 "scholarship_type":         _cell(row, scholar_type_idx)or snap.get("Scholarship_Type", ""),
                 "religion":                 _cell(row, religion_idx)    or snap.get("Religion", ""),
-                # ── fact fields ───────────────────────────────────────────────
                 "sec_code":                 _cell(row, seccode_idx)      or snap.get("SecCode", ""),
                 "year_level":               _cell(row, year_idx)         or snap.get("Year", ""),
                 "entrance_exam_score":      _cell(row, exam_score_idx)   or "",
                 "hs_gpa":                   _cell(row, hs_gpa_idx)       or snap.get("HS_GPA", ""),
-                # ── legacy / extra ────────────────────────────────────────────
                 "year_enrolled":            _cell(row, yr_enrolled_idx)  or snap.get("Year_Enrolled", ""),
                 "year_graduated":           _cell(row, yr_grad_idx)      or snap.get("Year_Graduated", ""),
                 "family_income":            _cell(row, income_idx)       or snap.get("Family_Income", ""),
                 "scholarship_applicant":    _cell(row, scholar_idx)      or snap.get("Scholarship_Applicant", ""),
             }
-
             student_meta.append(meta)
 
+        # ── pd.get_dummies fallback (no preprocessor — mirrors TrainingEngine) ─
+        # TrainingEngine uses pd.get_dummies on categoricals rather than a fitted
+        # LabelEncoder preprocessor. When no preprocessor is saved we replicate
+        # that encoding here so categoricals are not silently converted to 0.0.
+        if preprocessor is None and X_raw and feature_names:
+            import pandas as pd
+            import numpy as np
+
+            _CATEGORICAL = {"Program", "Age_Group", "Distance_Bucket"}
+
+            try:
+                df_raw = pd.DataFrame(X_raw, columns=feature_names)
+
+                # Force numeric on continuous columns
+                num_cols = [c for c in feature_names if c not in _CATEGORICAL]
+                for col in num_cols:
+                    if col in df_raw.columns:
+                        df_raw[col] = pd.to_numeric(
+                            df_raw[col], errors="coerce"
+                        ).fillna(0.0)
+
+                # One-hot encode categoricals — same as TrainingEngine
+                cat_present = [c for c in _CATEGORICAL if c in df_raw.columns]
+                if cat_present:
+                    df_raw = pd.get_dummies(df_raw, columns=cat_present, dtype=float)
+
+                df_raw = df_raw.fillna(0.0)
+
+                # Align to the model's stored feature_names (includes dummy cols
+                # produced during training). Missing → 0, extra → dropped.
+                missing_cols = [c for c in feature_names if c not in df_raw.columns]
+                aligned_cols = [c for c in feature_names if c in df_raw.columns]
+
+                for mc in missing_cols:
+                    df_raw[mc] = 0.0
+
+                df_raw = df_raw[feature_names]
+                df_raw = df_raw.fillna(0.0)
+
+                import numpy as np
+                X_arr = np.array(df_raw.values, dtype=float)
+                X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+                X = X_arr.tolist()
+
+                print(
+                    f"[PredictionEngine] get_dummies encoding — "
+                    f"{len(aligned_cols)}/{len(feature_names)} matched, "
+                    f"{len(missing_cols)} defaulted to 0"
+                )
+
+            except Exception as enc_exc:
+                print(f"[PredictionEngine] get_dummies fallback failed: {enc_exc}")
+
         # ── Apply preprocessor (encode + scale) if available ─────────────────
-        # X_raw holds original string values per feature column name.
-        # We rebuild a DataFrame from these, apply the fitted LabelEncoders
-        # and StandardScaler, then overwrite X with the properly typed array.
         if preprocessor is not None and X_raw and feature_names:
             import pandas as pd
             try:
                 df_pred = pd.DataFrame(X_raw, columns=feature_names)
 
-                # Re-encode categorical columns using fitted LabelEncoders
                 for col, le in preprocessor._encoders.items():
                     if col in df_pred.columns:
                         filled = df_pred[col].fillna("__MISSING__").astype(str)
                         known  = set(le.classes_)
-                        # Map unseen labels to the first known class
                         filled = filled.apply(
                             lambda v: v if v in known else le.classes_[0]
                         )
                         df_pred[col] = le.transform(filled)
                     else:
-                        # Column not in prediction data — fill with 0
                         df_pred[col] = 0
 
-                # Convert all columns to numeric — '' and unparseable strings → 0.0
                 for col in df_pred.columns:
                     df_pred[col] = pd.to_numeric(
                         df_pred[col], errors="coerce"
                     ).fillna(0.0)
 
-                # Extra safety: ensure no NaN remains before scaling
-                # (object-dtype columns may not convert cleanly in all pandas versions)
                 df_pred = df_pred.fillna(0.0)
 
-                # Re-scale using fitted StandardScaler.
-                # CRITICAL: pass columns in the EXACT order the scaler was fitted on
-                # (_numerical_columns preserves training order). Mismatched column
-                # order silently produces NaN which causes sklearn to reject X.
                 if preprocessor._scaler is not None and preprocessor._numerical_columns:
                     scale_cols = [c for c in preprocessor._numerical_columns
                                   if c in df_pred.columns]
                     if scale_cols:
                         import numpy as _np
-                        # Pass DataFrame (not .values) so sklearn doesn't warn about
-                        # missing feature names. Use a fresh DataFrame with the
-                        # scaler's expected column order.
                         scale_df = pd.DataFrame(
-                            df_pred[scale_cols].values,
-                            columns=scale_cols
+                            df_pred[scale_cols].values, columns=scale_cols
                         )
                         scaled = preprocessor._scaler.transform(scale_df)
                         scaled = _np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
                         df_pred[scale_cols] = scaled
 
-                # Final safety net — ensure absolutely no NaN reaches the model
                 df_pred = df_pred.fillna(0.0)
 
-                # Select features in training order
                 avail = [f for f in feature_names if f in df_pred.columns]
                 if len(avail) == len(feature_names):
                     X = df_pred[feature_names].values.tolist()
                 elif avail:
                     X = df_pred[avail].values.tolist()
 
-                # Verify no NaN in final X
                 import numpy as _np2
                 X_arr = _np2.array(X, dtype=float)
                 nan_count = _np2.isnan(X_arr).sum()
@@ -431,7 +573,7 @@ class PredictionEngine:
                 print(f"[PredictionEngine] WARNING: preprocessor failed "
                       f"({prep_exc}), using raw float values")
 
-        return X, student_ids, student_meta
+        return X, student_ids, student_meta, raw_feat_rows
 
     # ------------------------------------------------------------------
     # Inference
@@ -445,18 +587,6 @@ class PredictionEngine:
         feature_names: list = None,
         pred_headers:  list = None,
     ) -> tuple[list, list]:
-        """
-        Run sklearn inference, applying the fitted preprocessor first.
-
-        The model was trained on LabelEncoded + StandardScaled data.
-        PredictionEngine builds X from raw string rows (categorical columns
-        become 0.0 because float("traditional") fails). Without re-applying
-        the same transformations, predict_proba raises ValueError and falls
-        back to binary [0,1] outputs → scores of 0 or 100.
-
-        When a preprocessor (fitted DataPipeline) is available, we rebuild
-        a properly encoded + scaled matrix before calling the model.
-        """
         import numpy as np
         import pandas as pd
 
@@ -464,25 +594,20 @@ class PredictionEngine:
 
         if preprocessor is not None and feature_names and pred_headers:
             try:
-                # Build a DataFrame from raw prediction rows using pred_headers
-                # (excludes Student_ID — first column of PREDICTION_FEATURES)
                 feat_cols = [h for h in pred_headers if h != "Student_ID"]
                 df_pred = pd.DataFrame(X, columns=feat_cols
                           if len(feat_cols) == len(X[0]) else
                           pred_headers[:len(X[0])])
 
-                # Re-encode categorical columns using fitted LabelEncoders
                 for col, le in preprocessor._encoders.items():
                     if col in df_pred.columns:
                         filled = df_pred[col].fillna("__MISSING__").astype(str)
-                        # Handle unseen labels gracefully
                         known = set(le.classes_)
                         filled = filled.apply(
                             lambda v: v if v in known else le.classes_[0]
                         )
                         df_pred[col] = le.transform(filled)
 
-                # Re-scale numerical columns using fitted scaler
                 if preprocessor._scaler is not None and preprocessor._numerical_columns:
                     scale_cols = [c for c in preprocessor._numerical_columns
                                   if c in df_pred.columns]
@@ -494,10 +619,7 @@ class PredictionEngine:
                         scaled = _np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
                         df_pred[scale_cols] = scaled
 
-                # Final safety net
                 df_pred = df_pred.fillna(0.0)
-
-                # Select only the features the model was trained on, in order
                 avail = [f for f in feature_names if f in df_pred.columns]
                 if avail:
                     import numpy as _np2
@@ -514,14 +636,31 @@ class PredictionEngine:
         preds = model.predict(X_arr)
         try:
             proba_matrix = model.predict_proba(X_arr)
-            classes  = list(model.classes_)
-            pos_idx  = classes.index(1) if 1 in classes else -1
+            classes = list(model.classes_)
+
+            # Detect positive class — handles int labels (0/1) AND
+            # string labels ('at_risk'/'not_at_risk') so probas are always
+            # the probability of the at-risk class (0.0–1.0).
+            _POSITIVE = {1, '1', 'at_risk', 'at-risk', 'high_risk',
+                         'risk', 'positive', True}
+            pos_idx = next(
+                (i for i, c in enumerate(classes) if c in _POSITIVE), -1
+            )
+            print(f'[PredictionEngine] classes={classes}, pos_idx={pos_idx}')
+
             if pos_idx >= 0:
                 probas = [float(row[pos_idx]) for row in proba_matrix]
             else:
-                probas = [float(p) for p in preds]
+                # Fallback: minority class has lowest mean probability
+                import numpy as _np
+                proba_arr = _np.array(proba_matrix)
+                pos_idx   = int(_np.argmin(proba_arr.mean(axis=0)))
+                probas = [float(row[pos_idx]) for row in proba_matrix]
+                print(f'[PredictionEngine] WARNING: guessed pos class '
+                      f'col {pos_idx} from {classes}')
+
         except (AttributeError, ValueError) as exc:
-            print(f"[PredictionEngine] predict_proba failed ({exc}), using binary preds")
+            print(f'[PredictionEngine] predict_proba failed ({exc}), using binary preds')
             probas = [float(p) for p in preds]
         return list(preds), probas
 
@@ -538,47 +677,110 @@ class PredictionEngine:
         return preds, probas
 
     # ------------------------------------------------------------------
-    # Top factor helpers
+    # Per-student risk factor computation
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _top_factor(model_data: dict, feature_names: list, row: list) -> str:
-        try:
-            importances = model_data["model"].feature_importances_
-            top_idx     = max(range(len(importances)), key=lambda i: importances[i])
-            return feature_names[top_idx] if top_idx < len(feature_names) else "—"
-        except Exception:
-            if not row or not feature_names:
-                return "—"
-            top_idx = max(range(len(row)), key=lambda i: row[i])
-            return feature_names[top_idx] if top_idx < len(feature_names) else "—"
-
-    @staticmethod
     def _shap_factors(
-        model_data:    dict,
-        feature_names: list,
-        row:           list,
-    ) -> list[tuple[str, int]]:
-        try:
-            importances = model_data["model"].feature_importances_
-            total       = sum(importances) or 1
-            pairs       = [
-                (feature_names[i], round(v / total * 100))
-                for i, v in enumerate(importances)
-                if i < len(feature_names)
-            ]
-            pairs.sort(key=lambda x: x[1], reverse=True)
-            return pairs[:6]
-        except Exception:
-            if not row or not feature_names:
-                return []
-            total = sum(abs(v) for v in row) or 1
-            pairs = [
-                (feature_names[i], round(abs(row[i]) / total * 100))
-                for i in range(min(len(row), len(feature_names)))
-            ]
-            pairs.sort(key=lambda x: x[1], reverse=True)
-            return pairs[:6]
+        feature_names:      list,
+        global_importances: list,
+        raw_vals:           dict,
+    ) -> list[tuple[str, str, str]]:
+        """
+        Compute per-student risk factor contributions.
+
+        Returns a list of (feature_name, human_label, formatted_value) tuples
+        sorted by contribution, highest first, top 6 only.
+
+        How it works
+        ------------
+        Global feature importance tells us which features the model relies on
+        most overall.  But to explain WHY a specific student is flagged, we
+        need to weight those importances by the student's actual values.
+
+        For "risky-when-high" features (Financial_Stress, Gap_Years, etc.):
+            contribution = importance × normalised_value
+
+        For "risky-when-low" features (Entrance_Exam_Score, HS_GPA, etc.):
+            contribution = importance × (1 - normalised_value)
+            — a low exam score produces a HIGH contribution, correctly
+              identifying it as a risk factor for THIS student.
+
+        One-hot encoded features (Program_BSCS, Age_Group_adult, etc.) are
+        only included when their value is 1 (the student belongs to that
+        category) — otherwise they contribute nothing and are skipped.
+        """
+        # Normalisation ranges for continuous features
+        _RANGES: dict[str, tuple[float, float]] = {
+            "Entrance_Exam_Score": (0,   100),
+            "HS_GPA":              (60,  100),   # Philippine GPA scale
+            "Financial_Stress":    (1,   10),
+            "Gap_Years":           (0,   5),
+            "Distance_KM":         (0,   100),
+            "Age_At_Enrollment":   (15,  30),
+            "Distance_KM":         (0,   100),
+        }
+
+        contributions: list[tuple[float, str, float]] = []
+        # importance sum for normalising contribution percentages
+        importance_total = sum(global_importances) or 1.0
+
+        for feat, imp in zip(feature_names, global_importances):
+            if imp <= 0:
+                continue
+
+            raw_val = raw_vals.get(feat, 0.0)
+
+            # ── One-hot columns ───────────────────────────────────────────────
+            # e.g. "Program_BSCS", "Age_Group_adult", "Distance_Bucket_far"
+            is_onehot = False
+            for cat_prefix in ("Program_", "Sex_code_", "Age_Group_",
+                               "Distance_Bucket_"):
+                if feat.startswith(cat_prefix):
+                    is_onehot = True
+                    break
+
+            if is_onehot:
+                # Only include when the student actually belongs to this category
+                if raw_val < 0.5:
+                    continue
+                contribution = imp / importance_total
+                contributions.append((contribution, feat, raw_val))
+                continue
+
+            # ── Continuous / binary features ──────────────────────────────────
+            lo, hi = _RANGES.get(feat, (0.0, 1.0))
+            span = (hi - lo) or 1.0
+            norm = max(0.0, min(1.0, (raw_val - lo) / span))
+
+            if feat in _LOW_IS_RISKY:
+                # Low value = more risk → invert
+                contribution = imp / importance_total * (1.0 - norm)
+            elif feat in _HIGH_IS_RISKY:
+                contribution = imp / importance_total * norm
+            else:
+                # Binary flags (Has_HS_Honors, Private_HS, etc.)
+                # Only meaningful when value is 1; contribution = raw importance
+                if raw_val < 0.5:
+                    continue
+                contribution = imp / importance_total
+
+            if contribution > 0:
+                contributions.append((contribution, feat, raw_val))
+
+        # Sort by contribution descending, take top 6
+        contributions.sort(key=lambda x: x[0], reverse=True)
+        top6 = contributions[:6]
+
+        # Format for display: (feature_name, human_label, formatted_value)
+        result = []
+        for contribution, feat, raw_val in top6:
+            label = _feature_label(feat)
+            value = _format_value(feat, raw_val)
+            pct   = round(contribution * 100)
+            result.append((feat, label, value, pct))
+
+        return result
 
     # ------------------------------------------------------------------
     # Summary
@@ -646,11 +848,11 @@ class PredictionSummary:
 class PredictionResult:
     def __init__(
         self,
-        success:     bool             = False,
-        predictions: list             = None,
+        success:     bool               = False,
+        predictions: list               = None,
         summary:     "PredictionSummary" = None,
-        errors:      list             = None,
-        is_mock:     bool             = False,
+        errors:      list               = None,
+        is_mock:     bool               = False,
     ):
         self.success     = success
         self.predictions = predictions or []

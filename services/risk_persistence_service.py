@@ -1,462 +1,360 @@
 """
-Risk Persistence Service
-========================
-Saves PredictionEngine results into the EarlyAlert star schema.
+services/risk_persistence_service.py
+=====================================
+Saves prediction results to the star-schema fact table.
 
-Target tables (in dependency order)
--------------------------------------
-  dim_student              — one row per student, upserted on student_id
-  dim_program              — one row per program code, upserted on program_code
-  dim_academic_term        — one row per (academic_year, semester) pair
-  fact_student_academic_risk — one row per prediction run per student
-
-Write strategy
---------------
-  - dim_* tables: INSERT … ON CONFLICT … DO UPDATE (upsert)
-    Dimension rows are created on first encounter and refreshed with the
-    latest values on every subsequent prediction run.
-  - fact table: plain INSERT (no unique constraint on the table — each
-    prediction run produces a new snapshot row).
-  - Every student row is wrapped in its own SAVEPOINT so a single bad
-    record never aborts the entire batch.
-  - dim lookups (student_key, program_key, term_key) are resolved once per
-    batch where possible, then cached in a local dict to avoid N+1 queries.
-
-Risk level mapping  (matches dim_risk_level seed rows)
--------------------------------------------------------
-  1 = Low       (low_risk)
-  2 = Medium    (moderate_risk)
-  3 = High      (high_risk)
+Changes vs previous version:
+  - Extracts `primary_factor` (top SHAP feature human label) per student
+    and persists it in `fact_student_academic_risk.primary_factor`.
+  - Falls back gracefully if the column doesn't exist yet (pre-migration).
 """
-
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Tuple
-
-from database.connection import get_connection
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_RISK_LEVEL_MAP: Dict[str, int] = {
-    "low_risk":      1,
-    "moderate_risk": 2,
-    "high_risk":     3,
-    "low":           1,
-    "medium":        2,
-    "moderate":      2,
-    "high":          3,
+_FEATURE_HUMAN_LABELS = {
+    # feature_engineering.py output names → human labels
+    "Entrance_Exam_Score":      "Entrance Exam Score",
+    "entrance_exam_score":      "Entrance Exam Score",
+    "HS_GPA":                   "High School GPA",
+    "high_school_gpa":          "High School GPA",
+    "Financial_Stress":         "Financial Stress Index",
+    "Financial_Stress_Index":   "Financial Stress Index",
+    "First_Gen_Student":        "First-Generation Student",
+    "Gap_Years":                "Gap Years Before College",
+    "Distance_Bucket":          "Distance from Campus",
+    "Distance_KM":              "Distance from Campus",
+    "Strand_Program_Match":     "SHS Strand–Program Alignment",
+    "Strand_Program_Alignment": "SHS Strand–Program Alignment",
+    "Has_Scholarship":          "Has Scholarship",
+    "Has_HS_Honors":            "Graduated with HS Honors",
+    "Graduation_Honors":        "Graduated with HS Honors",
+    "Private_HS":               "Attended Private High School",
+    "HS_Type_Private":          "Attended Private High School",
+    "Age_At_Enrollment":        "Age at Enrollment",
+    "Age_Group":                "Age at Enrollment",
 }
 
 
-# ---------------------------------------------------------------------------
-# Type helpers
-# ---------------------------------------------------------------------------
+def _extract_primary_factor(pred: dict) -> str | None:
+    """
+    Return the human-readable label of the top SHAP factor for this student.
 
-def _str(value, maxlen: int = None) -> Optional[str]:
-    """Strip and truncate a value; return None if blank/sentinel."""
-    v = str(value).strip() if value is not None else ""
-    if not v or v in ("—", "None", "nan", "none"):
+    shap_factors entry formats supported:
+      (feature_name, human_label, formatted_value, pct)  ← 4-tuple
+      (feature_name, pct)                                 ← 2-tuple
+      (human_label, pct)                                  ← 2-tuple (legacy)
+    """
+    factors = pred.get("shap_factors") or []
+    if not factors:
+        # Fall back to the "factor" string if shap_factors is absent
+        return pred.get("factor") or None
+
+    top = factors[0]
+
+    if len(top) == 4:
+        # (feature_name, human_label, formatted_value, pct)
+        return str(top[1])
+
+    if len(top) == 2:
+        label_or_feat = str(top[0])
+        # Check if it's a known machine feature name → map to human label
+        human = _FEATURE_HUMAN_LABELS.get(label_or_feat)
+        return human if human else label_or_feat
+
+    return None
+
+
+def _to_numeric(value) -> float | None:
+    """Convert a value to float, returning None for blanks/nulls."""
+    if value is None:
         return None
-    return v[:maxlen] if maxlen else v
-
-
-def _num(value, cast):
-    """Cast to numeric type; return None on blank or error."""
-    v = str(value).strip() if value is not None else ""
-    if not v or v in ("—", "None", "nan"):
+    s = str(value).strip()
+    if s in ("", "nan", "None", "null", "NULL", "—", "-"):
         return None
     try:
-        return cast(v)
+        return float(s)
     except (ValueError, TypeError):
         return None
 
 
-def _bool(value) -> Optional[bool]:
-    v = str(value).strip().lower() if value is not None else ""
-    if not v or v in ("—", "none", "nan", ""):
-        return None
-    return v in ("true", "1", "yes", "t", "y", "with", "approved", "scholar")
-
-
-def _date(value) -> Optional[date]:
-    v = str(value).strip() if value is not None else ""
-    if not v or v in ("—", "None", "nan"):
-        return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(v, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
-def _semester(value) -> int:
-    return 2 if str(value).strip().startswith("2") else 1
-
-
-# ---------------------------------------------------------------------------
-# Dimension upserts  (return the surrogate key)
-# ---------------------------------------------------------------------------
-
-def _upsert_student(cur, pred: Dict[str, Any]) -> int:
-    """
-    Upsert dim_student on student_id.
-    Returns student_key.
-    """
-    cur.execute("""
-        INSERT INTO public.dim_student (
-            student_id, first_name, last_name, sex_code, birthdate,
-            civil_status, home_address, home_municipality,
-            family_income_bracket, parent_highest_education,
-            hs_school_name, hs_type, shs_strand, graduation_honors,
-            scholarship_type, religion
-        )
-        VALUES (
-            %(student_id)s, %(first_name)s, %(last_name)s, %(sex_code)s,
-            %(birthdate)s, %(civil_status)s, %(home_address)s,
-            %(home_municipality)s, %(family_income_bracket)s,
-            %(parent_highest_education)s, %(hs_school_name)s,
-            %(hs_type)s, %(shs_strand)s, %(graduation_honors)s,
-            %(scholarship_type)s, %(religion)s
-        )
-        ON CONFLICT (student_id) DO UPDATE SET
-            first_name               = EXCLUDED.first_name,
-            last_name                = EXCLUDED.last_name,
-            sex_code                 = EXCLUDED.sex_code,
-            birthdate                = COALESCE(EXCLUDED.birthdate,
-                                                dim_student.birthdate),
-            civil_status             = EXCLUDED.civil_status,
-            home_address             = EXCLUDED.home_address,
-            home_municipality        = EXCLUDED.home_municipality,
-            family_income_bracket    = EXCLUDED.family_income_bracket,
-            parent_highest_education = EXCLUDED.parent_highest_education,
-            hs_school_name           = EXCLUDED.hs_school_name,
-            hs_type                  = EXCLUDED.hs_type,
-            shs_strand               = EXCLUDED.shs_strand,
-            graduation_honors        = EXCLUDED.graduation_honors,
-            scholarship_type         = EXCLUDED.scholarship_type,
-            religion                 = EXCLUDED.religion
-        RETURNING student_key
-    """, {
-        "student_id":               _str(pred.get("student_id"), 50),
-        "first_name":               _str(pred.get("first_name"), 100),
-        "last_name":                _str(pred.get("last_name"),  100),
-        "sex_code":                 _str(pred.get("sex_code"),   10),
-        "birthdate":                _date(pred.get("birthdate")),
-        "civil_status":             _str(pred.get("civil_status"), 50),
-        "home_address":             _str(pred.get("home_address")),
-        "home_municipality":        _str(pred.get("home_municipality"), 100),
-        "family_income_bracket":    _str(pred.get("family_income_bracket"), 100),
-        "parent_highest_education": _str(pred.get("parent_highest_education"), 150),
-        "hs_school_name":           _str(pred.get("hs_school_name"), 255),
-        "hs_type":                  _str(pred.get("hs_type"), 50),
-        "shs_strand":               _str(pred.get("shs_strand"), 100),
-        "graduation_honors":        _str(pred.get("graduation_honors"), 100),
-        "scholarship_type":         _str(pred.get("scholarship_type"), 100),
-        "religion":                 _str(pred.get("religion"), 100),
-    })
-    row = cur.fetchone()
-    return row[0]
-
-
-def _upsert_program(cur, program_code: str, college: str) -> Optional[int]:
-    """
-    Upsert dim_program on program_code.
-    Returns program_key, or None if program_code is blank.
-    """
-    code = _str(program_code, 50)
-    if not code:
-        return None
-
-    cur.execute("""
-        INSERT INTO public.dim_program (program_code, program_name, college)
-        VALUES (%(code)s, %(code)s, %(college)s)
-        ON CONFLICT (program_code) DO UPDATE SET
-            college = COALESCE(EXCLUDED.college, dim_program.college)
-        RETURNING program_key
-    """, {
-        "code":    code,
-        "college": _str(college, 150),
-    })
-    row = cur.fetchone()
-    return row[0] if row else None
-
-
-def _upsert_term(cur, academic_year: str, semester: int) -> int:
-    """
-    Upsert dim_academic_term on (academic_year, semester).
-    Returns term_key.
-    """
-    cur.execute("""
-        INSERT INTO public.dim_academic_term (academic_year, semester)
-        VALUES (%(academic_year)s, %(semester)s)
-        ON CONFLICT (academic_year, semester) DO UPDATE SET
-            academic_year = EXCLUDED.academic_year
-        RETURNING term_key
-    """, {
-        "academic_year": _str(academic_year, 20),
-        "semester":      semester,
-    })
-    row = cur.fetchone()
-    return row[0]
-
-
-# ---------------------------------------------------------------------------
-# Fact insert
-# ---------------------------------------------------------------------------
-
-def _insert_fact(
-    cur,
-    student_key:  int,
-    program_key:  Optional[int],
-    term_key:     int,
-    pred:         Dict[str, Any],
-    model_run_id: Optional[int],
-) -> int:
-    """
-    Insert one row into fact_student_academic_risk.
-    Returns the new fact_id.
-    """
-    raw_score          = float(pred.get("score", 0))
-    predicted_risk_score = round(raw_score / 100.0, 4)   # store as 0.0–1.0
-    risk_level_id      = _RISK_LEVEL_MAP.get(
-        str(pred.get("category", "")).lower(), 1
-    )
-
-    cur.execute("""
-        INSERT INTO public.fact_student_academic_risk (
-            student_key,
-            program_key,
-            term_key,
-            risk_level_id,
-            model_run_id,
-            predicted_at,
-            year_level,
-            entrance_exam_score,
-            high_school_gpa,
-            predicted_risk_score,
-            prediction_confidence
-        )
-        VALUES (
-            %(student_key)s,
-            %(program_key)s,
-            %(term_key)s,
-            %(risk_level_id)s,
-            %(model_run_id)s,
-            %(predicted_at)s,
-            %(year_level)s,
-            %(entrance_exam_score)s,
-            %(high_school_gpa)s,
-            %(predicted_risk_score)s,
-            %(prediction_confidence)s
-        )
-        RETURNING fact_id
-    """, {
-        "student_key":          student_key,
-        "program_key":          program_key,
-        "term_key":             term_key,
-        "risk_level_id":        risk_level_id,
-        "model_run_id":         model_run_id,
-        "predicted_at":         datetime.now(),
-        "year_level":           _num(pred.get("year_level"), int),
-        "entrance_exam_score":  _num(pred.get("entrance_exam_score"), float),
-        "high_school_gpa":      _num(pred.get("hs_gpa"), float),
-        "predicted_risk_score": predicted_risk_score,
-        "prediction_confidence": predicted_risk_score,   # use same value
-    })
-    row = cur.fetchone()
-    return row[0]
-
-
-# ---------------------------------------------------------------------------
-# Main service
-# ---------------------------------------------------------------------------
-
 class RiskPersistenceService:
-    """
-    Persist prediction results into the EarlyAlert star schema.
+    """Save / upsert prediction results to fact_student_academic_risk."""
 
-    Public API (called from PredictionMixin._on_prediction_complete):
-        RiskPersistenceService.save_predictions(
-            predictions, model_id, academic_year, semester, model_run_id
-        )
-    """
+    # ── Public API ────────────────────────────────────────────────────
 
     @staticmethod
     def save_predictions(
-        predictions:   List[Dict[str, Any]],
-        model_id:      str           = "rf",
-        academic_year: str           = "2024-2025",
-        semester:      str           = "1",
-        model_run_id:  Optional[int] = None,
-    ) -> Dict[str, Any]:
+        predictions:   list,
+        model_id:      str,
+        academic_year: str,
+        semester:      str | int,
+    ) -> dict:
         """
-        Populate dim_student, dim_program, dim_academic_term, and
-        fact_student_academic_risk for every prediction in the batch.
+        Upsert prediction rows into the star schema.
 
-        Each student row is wrapped in a SAVEPOINT so a single bad record
-        never aborts the batch.
+        Parameters
+        ----------
+        predictions   : list of prediction dicts from PredictionEngine
+        model_id      : e.g. "rf"
+        academic_year : e.g. "2024-2025"
+        semester      : 1 or 2 (or "1" / "2")
 
         Returns
         -------
-        dict  {"success": bool, "inserted": int, "errors": list[str],
-               "total_processed": int}
+        {"success": bool, "inserted": int, "errors": int}
         """
-        conn = None
+        from services.data_store import DataStore
+        conn = DataStore.get().db_conn
+        if not conn:
+            print("[RiskPersistence] No DB connection — skipping save.")
+            return {"success": False, "inserted": 0, "errors": 0}
+
+        semester_int = int(semester)
+
         try:
-            conn = get_connection()
-            if not conn:
-                return {"success": False, "error": "Could not connect to database."}
-
-            cur = conn.cursor()
-            sem = _semester(semester)
-
-            # ── Resolve / create dim_academic_term once for the whole batch ──
-            term_key = _upsert_term(cur, academic_year, sem)
+            term_key = RiskPersistenceService._ensure_term(
+                conn, academic_year, semester_int
+            )
             print(f"[RiskPersistence] term_key={term_key} "
-                  f"({academic_year}, sem {sem})")
+                  f"({academic_year}, sem {semester_int})")
 
-            # ── Cache program_key lookups to avoid repeated upserts ──────────
-            program_key_cache: Dict[str, Optional[int]] = {}
+            # Check whether the primary_factor column exists
+            has_factor_col = RiskPersistenceService._column_exists(
+                conn, "fact_student_academic_risk", "primary_factor"
+            )
 
             inserted = 0
-            errors: List[str] = []
+            errors   = 0
 
-            for pred in predictions:
-                sid = str(pred.get("student_id", "")).strip()
-                try:
-                    cur.execute("SAVEPOINT sp_pred")
-
-                    # ── dim_student ──────────────────────────────────────────
-                    student_key = _upsert_student(cur, pred)
-
-                    # ── dim_program ──────────────────────────────────────────
-                    prog_code = _str(pred.get("program"), 50) or ""
-                    if prog_code not in program_key_cache:
-                        program_key_cache[prog_code] = _upsert_program(
-                            cur,
-                            prog_code,
-                            pred.get("college", ""),
+            with conn.cursor() as cur:
+                for pred in predictions:
+                    try:
+                        RiskPersistenceService._upsert_one(
+                            cur, pred, term_key, model_id, has_factor_col
                         )
-                    program_key = program_key_cache[prog_code]
-
-                    # ── fact_student_academic_risk ────────────────────────────
-                    fact_id = _insert_fact(
-                        cur,
-                        student_key  = student_key,
-                        program_key  = program_key,
-                        term_key     = term_key,
-                        pred         = pred,
-                        model_run_id = model_run_id,
-                    )
-
-                    cur.execute("RELEASE SAVEPOINT sp_pred")
-                    inserted += 1
-
-                except Exception as exc:
-                    cur.execute("ROLLBACK TO SAVEPOINT sp_pred")
-                    cur.execute("RELEASE SAVEPOINT sp_pred")
-                    msg = f"Student {sid}: {exc}"
-                    errors.append(msg)
-                    print(f"[RiskPersistence] ERROR — {msg}")
+                        inserted += 1
+                    except Exception as e:
+                        errors += 1
+                        if errors <= 3:
+                            print(f"[RiskPersistence] Row error: {e}")
 
             conn.commit()
+            print(f"[RiskPersistence] Done — "
+                  f"inserted={inserted}, errors={errors}, term_key={term_key}")
+            return {"success": True, "inserted": inserted, "errors": errors}
 
-            print(
-                f"[RiskPersistence] Done — "
-                f"inserted={inserted}, errors={len(errors)}, "
-                f"term_key={term_key}"
-            )
-            return {
-                "success":         True,
-                "inserted":        inserted,
-                "updated":         0,           # fact rows are always new inserts
-                "errors":          errors,
-                "total_processed": len(predictions),
-            }
-
-        except Exception as exc:
-            if conn:
+        except Exception as e:
+            print(f"[RiskPersistence] FATAL: {e}")
+            try:
                 conn.rollback()
-            print(f"[RiskPersistence] Fatal error: {exc}")
-            return {"success": False, "error": str(exc)}
+            except Exception:
+                pass
+            return {"success": False, "inserted": 0, "errors": 0}
 
-        finally:
-            if conn:
-                conn.close()
-
-    # ------------------------------------------------------------------
-    # READ — used by RiskAlertsPage / DashboardPage
-    # ------------------------------------------------------------------
+    # ── Internals ─────────────────────────────────────────────────────
 
     @staticmethod
-    def get_latest_predictions(
-        academic_year: Optional[str] = None,
-        semester:      Optional[int] = None,
-        limit:         int           = 500,
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch the latest risk snapshot by joining the star schema.
-        Falls back to a simpler query if the view is unavailable.
-        """
-        conn = None
+    def _column_exists(conn, table: str, column: str) -> bool:
         try:
-            conn = get_connection()
-            if not conn:
-                return []
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 1
+                    FROM   information_schema.columns
+                    WHERE  table_schema = 'public'
+                      AND  table_name   = %s
+                      AND  column_name  = %s
+                """, (table, column))
+                return cur.fetchone() is not None
+        except Exception:
+            return False
 
-            cur = conn.cursor()
+    @staticmethod
+    def _ensure_term(conn, academic_year: str, semester: int) -> int:
+        """Return term_key, inserting the term row if it doesn't exist."""
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT term_key FROM public.dim_academic_term
+                WHERE  academic_year = %s AND semester = %s
+            """, (academic_year, semester))
+            row = cur.fetchone()
+            if row:
+                return row[0]
 
-            filters: List[str] = []
-            params:  List[Any] = []
-            if academic_year:
-                filters.append("t.academic_year = %s")
-                params.append(academic_year)
-            if semester is not None:
-                filters.append("t.semester = %s")
-                params.append(_semester(semester))
+            sem_label = "1st" if semester == 1 else "2nd"
+            cur.execute("""
+                INSERT INTO public.dim_academic_term
+                    (academic_year, semester, term_label)
+                VALUES (%s, %s, %s)
+                RETURNING term_key
+            """, (academic_year, semester,
+                  f"{sem_label} Semester {academic_year}"))
+            conn.commit()
+            return cur.fetchone()[0]
 
-            where  = ("WHERE " + " AND ".join(filters)) if filters else ""
-            params.append(limit)
+    @staticmethod
+    def _normalise_risk_label(label: str, score: float) -> str:
+        """
+        Normalise whatever the prediction engine emits to a human label
+        that will match dim_risk_level.risk_label values like
+        'High Risk', 'Moderate Risk', 'Low Risk'.
 
-            cur.execute(f"""
-                SELECT
-                    f.fact_id,
-                    s.student_id,
-                    s.first_name,
-                    s.last_name,
-                    p.program_code,
-                    p.college,
-                    t.academic_year,
-                    t.semester,
-                    f.year_level,
-                    f.entrance_exam_score,
-                    f.high_school_gpa,
-                    f.predicted_risk_score,
-                    f.prediction_confidence,
-                    rl.risk_label,
-                    rl.color_hex,
-                    f.predicted_at
-                FROM   public.fact_student_academic_risk f
-                JOIN   public.dim_student       s  ON s.student_key  = f.student_key
-                LEFT JOIN public.dim_program    p  ON p.program_key  = f.program_key
-                JOIN   public.dim_academic_term t  ON t.term_key     = f.term_key
-                LEFT JOIN public.dim_risk_level rl ON rl.risk_level_id = f.risk_level_id
-                {where}
-                ORDER  BY f.predicted_risk_score DESC
-                LIMIT  %s
-            """, params)
+        Handles:
+          - "at_risk" / "not_at_risk"   (raw model binary output)
+          - "high_risk" / "moderate_risk" / "low_risk"  (category keys)
+          - "High Risk" / "Moderate Risk" / "Low Risk"  (already correct)
+          - Anything else → derive from score thresholds
+        """
+        lc = (label or "").lower().strip()
 
-            columns = [d[0] for d in cur.description]
-            return [dict(zip(columns, row)) for row in cur.fetchall()]
+        # Already a human label — return as-is
+        if "high" in lc:                    return "High"
+        if "moderate" in lc or "medium" in lc: return "Medium"
+        if "low" in lc:                     return "Low"
 
-        except Exception as exc:
-            print(f"[RiskPersistence] get_latest_predictions error: {exc}")
-            return []
-        finally:
-            if conn:
-                conn.close()
+        # Binary model output — derive from score
+        if lc in ("at_risk", "1", "true", "yes"):
+            return "High" if score >= 0.50 else "Medium"
+        if lc in ("not_at_risk", "0", "false", "no"):
+            return "Low"
+
+        # Unknown label — fall back to score thresholds
+        if score >= 0.50:   return "High"
+        if score >= 0.25:   return "Medium"
+        return "Low"
+
+    @staticmethod
+    def _ensure_risk_level(conn, label: str) -> int | None:
+        """Return risk_level_id for label, or None if not found."""
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT risk_level_id FROM public.dim_risk_level
+                    WHERE  risk_label ILIKE %s
+                    LIMIT  1
+                """, (f"%{label}%",))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ensure_student(conn, student_id: str) -> int | None:
+        """Return student_key for student_id, or None."""
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT student_key FROM public.dim_student
+                    WHERE  student_id = %s
+                    LIMIT  1
+                """, (student_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ensure_program(conn, program_name: str, college: str) -> int | None:
+        """Return program_key for program_name, or None."""
+        if not program_name or program_name in ("—", "Unknown"):
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT program_key FROM public.dim_program
+                    WHERE  program_name = %s
+                    LIMIT  1
+                """, (program_name,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _upsert_one(cur, pred: dict, term_key: int,
+                    model_id: str, has_factor_col: bool) -> None:
+        from services.data_store import DataStore
+
+        conn = DataStore.get().db_conn
+
+        student_id   = str(pred.get("student_id", "")).strip()
+        student_key  = RiskPersistenceService._ensure_student(conn, student_id)
+        if student_key is None:
+            return  # Can't link to dim_student — skip
+
+        program_name = pred.get("program", "")
+        college      = pred.get("college", "")
+        program_key  = RiskPersistenceService._ensure_program(
+            conn, program_name, college)
+
+        raw_label    = pred.get("label", "") or pred.get("category", "")
+        score_raw    = pred.get("score", 0)
+        score_norm   = float(score_raw) / 100.0 if float(score_raw or 0) > 1 else float(score_raw or 0)
+        risk_label   = RiskPersistenceService._normalise_risk_label(
+            raw_label, score_norm)
+        risk_level_id = RiskPersistenceService._ensure_risk_level(
+            conn, risk_label)
+
+        score_raw    = _to_numeric(pred.get("score", 0)) or 0.0
+        score        = score_raw / 100.0 if score_raw > 1 else score_raw
+
+        entrance     = _to_numeric(pred.get("entrance_exam_score"))
+        hs_gpa       = _to_numeric(
+            pred.get("hs_gpa") or pred.get("high_school_gpa")
+        )
+
+        primary_factor = _extract_primary_factor(pred)
+
+        if has_factor_col:
+            cur.execute("""
+                INSERT INTO public.fact_student_academic_risk (
+                    student_key, program_key, term_key, risk_level_id,
+                    predicted_risk_score, prediction_confidence,
+                    entrance_exam_score, high_school_gpa,
+                    primary_factor, predicted_at
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, NOW()
+                )
+                ON CONFLICT (student_key, term_key)
+                DO UPDATE SET
+                    risk_level_id        = EXCLUDED.risk_level_id,
+                    predicted_risk_score = EXCLUDED.predicted_risk_score,
+                    prediction_confidence= EXCLUDED.prediction_confidence,
+                    entrance_exam_score  = EXCLUDED.entrance_exam_score,
+                    high_school_gpa      = EXCLUDED.high_school_gpa,
+                    primary_factor       = EXCLUDED.primary_factor,
+                    predicted_at         = NOW()
+            """, (
+                student_key, program_key, term_key, risk_level_id,
+                score, score,
+                entrance, hs_gpa,
+                primary_factor,
+            ))
+        else:
+            # Graceful fallback: table doesn't have primary_factor yet
+            cur.execute("""
+                INSERT INTO public.fact_student_academic_risk (
+                    student_key, program_key, term_key, risk_level_id,
+                    predicted_risk_score, prediction_confidence,
+                    entrance_exam_score, high_school_gpa,
+                    predicted_at
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    NOW()
+                )
+                ON CONFLICT (student_key, term_key)
+                DO UPDATE SET
+                    risk_level_id        = EXCLUDED.risk_level_id,
+                    predicted_risk_score = EXCLUDED.predicted_risk_score,
+                    prediction_confidence= EXCLUDED.prediction_confidence,
+                    entrance_exam_score  = EXCLUDED.entrance_exam_score,
+                    high_school_gpa      = EXCLUDED.high_school_gpa,
+                    predicted_at         = NOW()
+            """, (
+                student_key, program_key, term_key, risk_level_id,
+                score, score,
+                entrance, hs_gpa,
+            ))

@@ -13,6 +13,12 @@ Year_Level) are computed for display purposes only and are NEVER fed to the
 model.  Including them causes ~100 % training accuracy that collapses to
 near-chance on real incoming students who have no grades yet.
 
+Program_Risk_Index and Municipality_Risk_Index have been REMOVED from the
+training feature set.  Both were computed from risk_label on the full dataset
+before splitting, causing direct target leakage.  If you want to reintroduce
+them in a future iteration, compute them inside each training fold only and
+apply the learned mapping to held-out rows — never on the full dataset.
+
 Two-phase usage
 ---------------
   Phase 1 — Training (historical data that has Final_Avg_GRD):
@@ -114,8 +120,8 @@ _NON_COLLEGE_LABELS = {
 
 _GEO_CACHE: dict[str, tuple[float, float]] = {}
 
-CAMPUS_LAT = 11.0442
-CAMPUS_LON = 124.0130
+CAMPUS_LAT = 11.2527   # Daanbantayan, Cebu — verified
+CAMPUS_LON = 124.0165
 
 _DISTANCE_BUCKETS = {
     "on_campus": (0,   2),
@@ -126,14 +132,10 @@ _DISTANCE_BUCKETS = {
     "very_far":  (50, float("inf")),
 }
 
-_PROGRAM_RISK_MAP:      dict[str, float] = {}
-_MUNICIPALITY_RISK_MAP: dict[str, float] = {}
-_GLOBAL_PROGRAM_RISK      = 0.50
-_GLOBAL_MUNICIPALITY_RISK = 0.50
-
 
 def load_geo_cache(rows: list[dict]) -> None:
     global _GEO_CACHE
+
     def _norm_muni(name: str) -> str:
         """Normalise a municipality name: lowercase, strip, remove ' city' suffix."""
         return name.strip().lower().replace(" city", "").strip()
@@ -150,32 +152,40 @@ def load_geo_cache(rows: list[dict]) -> None:
 
 
 def _ensure_geo_cache() -> None:
+    """Load geo cache from public.geo_cache via psycopg2 (DataStore.db_conn)."""
     if _GEO_CACHE:
         return
     try:
-        from db import get_session
-        from models.geo_cache import GeoCache
-
-        with get_session() as session:
+        from services.data_store import DataStore
+        conn = DataStore.get().db_conn
+        if conn is None:
+            print("[FeatureEngineering] GeoCache: no DB connection available.")
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT municipality, latitude, longitude "
+                "FROM public.geo_cache ORDER BY municipality"
+            )
             rows = [
                 {
-                    "municipality": row.municipality,
-                    "latitude":     float(row.latitude),
-                    "longitude":    float(row.longitude),
+                    "municipality": row[0],
+                    "latitude":     float(row[1]),
+                    "longitude":    float(row[2]),
                 }
-                for row in session.query(GeoCache).all()
+                for row in cur.fetchall()
             ]
-        load_geo_cache(rows)
+        if rows:
+            load_geo_cache(rows)
+        else:
+            print(
+                "[FeatureEngineering] WARNING: geo_cache table is empty. "
+                "Run geo_cache_setup.sql to seed municipality coordinates."
+            )
     except Exception as exc:
         print(
             f"[FeatureEngineering] GeoCache DB load failed ({exc}); "
-            "_GEO_CACHE left empty."
+            "distance features will default to 'unknown'."
         )
-        if not _GEO_CACHE:
-            print(
-                "[FeatureEngineering] WARNING: "
-                "Geo cache is empty. Distance features will be unknown."
-            )
 
 
 # ── Columns to drop after engineering ────────────────────────────────────────
@@ -205,8 +215,9 @@ COLS_TO_DROP: list[str] = [
 TRAINING_FEATURES = [
     "Entrance_Exam_Score",
     "HS_GPA",
-    "Entrance_Exam_Tier",
-    "HS_Performance_Tier",
+    # Entrance_Exam_Tier and HS_Performance_Tier removed: both are discretized
+    # versions of the continuous scores above.  Keeping only the raw scores
+    # avoids redundancy and lets the model find its own decision boundaries.
     "Strand_Program_Match",
     "Financial_Stress",
     "First_Gen_Student",
@@ -219,18 +230,40 @@ TRAINING_FEATURES = [
     "Distance_KM",
     "Distance_Bucket",
     "Program",
-    "Program_Risk_Index",
-    "Municipality_Risk_Index",
-    "Sex_code",
+    # Sex_code intentionally omitted: sex is not a causal risk factor and
+    # including it causes two students with identical academic and socioeconomic
+    # profiles to receive different risk scores based solely on sex — a fairness
+    # violation. Any correlation in historical data is a proxy for program
+    # composition or other confounders, not a direct predictor of failure.
+    # Program_Risk_Index and Municipality_Risk_Index intentionally omitted.
+    # Both were derived from risk_label on the full dataset before any
+    # train/test split, which is direct target leakage.
+    # To reintroduce them safely: compute inside each training fold only,
+    # then apply the learned mapping to held-out / prediction rows.
+    # sklearn's TargetEncoder inside a Pipeline is the cleanest way to do this.
 ]
 
 DISPLAY_ONLY_FEATURES: list[str] = [
     "GPA_Tier",
     "Has_College_Grade",
     "Year_Level",
+    "Entrance_Exam_Tier",
+    "HS_Performance_Tier",
 ]
 
 FINAL_FEATURES = TRAINING_FEATURES
+
+# ── Feature schema version ────────────────────────────────────────────────────
+# Short SHA-1 fingerprint of the sorted TRAINING_FEATURES list.
+# Stored in every model artifact by ModelRegistry.save_model() and checked on
+# load — a mismatch means the artifact was trained on a different feature set
+# and must be rejected rather than served silently.
+# Updates automatically whenever TRAINING_FEATURES changes; no manual bump needed.
+import hashlib as _hashlib, json as _json
+FEATURE_SCHEMA_VERSION: str = _hashlib.sha1(
+    _json.dumps(sorted(TRAINING_FEATURES)).encode()
+).hexdigest()[:8]
+del _hashlib, _json
 
 TARGET_COLUMN = "risk_label"
 
@@ -239,8 +272,6 @@ PREDICTION_ID_COLUMN = "Student_ID"
 PREDICTION_FEATURES: list[str] = [PREDICTION_ID_COLUMN] + TRAINING_FEATURES
 
 _PREDICTION_FEATURE_DEFAULTS: dict[str, Any] = {
-    "Entrance_Exam_Tier":      1,
-    "HS_Performance_Tier":     1,
     "Strand_Program_Match":    0.5,
     "Financial_Stress":        3,
     "First_Gen_Student":       0,
@@ -252,9 +283,7 @@ _PREDICTION_FEATURE_DEFAULTS: dict[str, Any] = {
     "Age_Group":               "traditional",
     "Distance_Bucket":         "unknown",
     "Program":                 "UNKNOWN",
-    "Program_Risk_Index":      0.50,
-    "Municipality_Risk_Index": 0.50,
-    "Sex_code":                "UNKNOWN",
+    # Sex_code removed — not a training feature
 }
 
 
@@ -292,7 +321,14 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "religion":                 "Religion",
         "municipality":             "Municipality",
     }
-    rename_dict = {old: new for old, new in column_map.items() if old in df.columns}
+    # Case-insensitive match so HOME_ADDRESS, home_address, Home_Address
+    # all map to the canonical "Home_Address" form.
+    actual_lower = {col.lower(): col for col in df.columns}
+    rename_dict = {
+        actual_lower[key]: canonical
+        for key, canonical in column_map.items()
+        if key in actual_lower and actual_lower[key] != canonical
+    }
     if rename_dict:
         df = df.rename(columns=rename_dict)
     return df
@@ -321,10 +357,10 @@ def define_target(df: pd.DataFrame) -> pd.DataFrame:
 
     df[TARGET_COLUMN] = [_label(g, e) for g, e in zip(grd, exam)]
 
-    counts      = df[TARGET_COLUMN].value_counts().to_dict()
-    n_at_risk   = counts.get("at_risk", 0)
-    n_not_risk  = counts.get("not_at_risk", 0)
-    n_total     = n_at_risk + n_not_risk
+    counts     = df[TARGET_COLUMN].value_counts().to_dict()
+    n_at_risk  = counts.get("at_risk", 0)
+    n_not_risk = counts.get("not_at_risk", 0)
+    n_total    = n_at_risk + n_not_risk
 
     print(
         f"[FeatureEngineering] Target distribution: "
@@ -332,9 +368,6 @@ def define_target(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # ── Early detection: degenerate label distribution ────────────────────────
-    # If Final_Avg_GRD is absent and all exam scores are above the threshold,
-    # every student gets labeled 'not_at_risk' — training will fail with a
-    # single-class error. Raise a clear error here rather than crashing later.
     has_grades   = "Final_Avg_GRD" in df.columns and grd.notna().sum() > 0
     grade_source = "Final_Avg_GRD" if has_grades else "Entrance_Exam_Score"
 
@@ -379,14 +412,18 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
               "engineered data — skipping to prevent corruption.")
         return df
 
-    # ── 1. Entrance Exam Tier ─────────────────────────────────────────────────
+    # ── 1. Entrance Exam Tier (display-only — not in TRAINING_FEATURES) ───────
+    # Entrance_Exam_Score (continuous) is used by the model directly.
+    # The tier bucket is kept here for UI display and interpretability only.
     exam = pd.to_numeric(
         df.get("Entrance_Exam_Score", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
     )
     df["Entrance_Exam_Tier"] = exam.apply(_exam_tier)
 
-    # ── 2. HS Performance Tier ────────────────────────────────────────────────
+    # ── 2. HS Performance Tier (display-only — not in TRAINING_FEATURES) ─────
+    # HS_GPA (continuous) is used by the model directly.
+    # The tier bucket is kept here for UI display and interpretability only.
     hs_gpa = pd.to_numeric(
         df.get("HS_GPA", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
@@ -479,23 +516,63 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # ── 11. Distance from campus ──────────────────────────────────────────────
     municipality = pd.Series("", index=df.index)
 
-    if "Municipality" in df.columns:
-        # Normalise: lowercase + strip " city" so "BOGO CITY" and "BOGO"
-        # resolve to the same geo cache key ("bogo")
-        municipality = (df["Municipality"].fillna("")
-                        .str.strip().str.lower()
-                        .str.replace(r"\s+city$", "", regex=True)
-                        .str.strip())
-    elif "Home_Address" in df.columns:
-        def _extract_muni(addr: str) -> str:
-            if not addr or addr.strip().lower() in ("", "nan", "none", "n/a"):
-                return ""
-            addr_clean = addr.lower().replace(" city", "")
-            for muni_name in _GEO_CACHE.keys():
-                if muni_name in addr_clean:
-                    return muni_name
+    def _normalise_muni(raw: str) -> str:
+        """
+        Normalise a raw municipality/address string to match geo cache keys.
+        Handles: 'BOGO CITY', 'Brgy. Punta, Daanbantayan, Cebu',
+                 'City of Lapu-Lapu', 'DAAN BANTAYAN', typos, all-caps.
+        """
+        if not raw or str(raw).strip().lower() in ("", "nan", "none", "n/a", "-"):
             return ""
-        municipality = df["Home_Address"].fillna("").astype(str).apply(_extract_muni)
+        s = str(raw).strip().lower()
+        # Remove common noise tokens
+        for noise in ("city of ", "municipality of ", "brgy.", "barangay",
+                      "purok ", "sitio ", "poblacion", ", cebu", ", leyte",
+                      ", bohol", ", southern leyte"):
+            s = s.replace(noise, " ")
+        # Collapse whitespace
+        import re as _re
+        s = _re.sub(r"\s+", " ", s).strip()
+        # Strip trailing " city" so "bogo city" → "bogo"
+        s = _re.sub(r"\s+city$", "", s).strip()
+        return s
+
+    def _match_muni(normalised: str) -> str:
+        """
+        Match a normalised address token to a geo cache key.
+        Uses exact match first, then substring containment both ways,
+        so 'daanbantayan' matches key 'daanbantayan' and
+        'medellin cebu' matches key 'medellin'.
+        """
+        if not normalised or not _GEO_CACHE:
+            return ""
+        # Exact match
+        if normalised in _GEO_CACHE:
+            return normalised
+        # Geo key contained in the address string
+        for key in _GEO_CACHE:
+            if key in normalised:
+                return key
+        # Address string contained in geo key (handles abbreviations)
+        for key in _GEO_CACHE:
+            if normalised in key and len(normalised) >= 4:
+                return key
+        return ""
+
+    if "Municipality" in df.columns:
+        municipality = (
+            df["Municipality"].fillna("").astype(str)
+            .apply(_normalise_muni)
+            .apply(_match_muni)
+        )
+    elif "Home_Address" in df.columns:
+        municipality = (
+            df["Home_Address"].fillna("").astype(str)
+            .apply(_normalise_muni)
+            .apply(_match_muni)
+        )
+    else:
+        municipality = pd.Series("", index=df.index)
 
     df["Distance_KM"]     = municipality.apply(_calc_distance)
     df["Distance_Bucket"] = df["Distance_KM"].apply(
@@ -516,22 +593,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         )
         .fillna(1).clip(lower=1).astype(int)
     )
-
-    # ── Risk index features ───────────────────────────────────────────────────
-    df["Program_Risk_Index"] = (
-        df["Program"].astype(str).str.strip().str.upper()
-        .map(_PROGRAM_RISK_MAP)
-        .fillna(_GLOBAL_PROGRAM_RISK)
-    )
-
-    if "Municipality" in df.columns:
-        df["Municipality_Risk_Index"] = (
-            df["Municipality"].astype(str).str.strip().str.lower()
-            .map(_MUNICIPALITY_RISK_MAP)
-            .fillna(_GLOBAL_MUNICIPALITY_RISK)
-        )
-    else:
-        df["Municipality_Risk_Index"] = _GLOBAL_MUNICIPALITY_RISK
 
     # ── Final safety: cast any residual Categorical columns to object ─────────
     for col in df.select_dtypes(include="category").columns:
@@ -611,8 +672,9 @@ def run_full_feature_pipeline(df: pd.DataFrame) -> pd.DataFrame:
 
     df = normalize_columns(df)
     df = define_target(df)
-    _build_program_risk_map(df)
-    _build_municipality_risk_map(df)
+    # NOTE: _build_program_risk_map and _build_municipality_risk_map calls
+    # removed here. They computed target-derived statistics on the full dataset
+    # before splitting, leaking the label into training features.
     df = engineer_features(df)
 
     df = deduplicate_on_student_id(df)
@@ -677,7 +739,7 @@ def run_prediction_pipeline(df: pd.DataFrame) -> pd.DataFrame:
 
 def _is_already_engineered(df: pd.DataFrame) -> bool:
     engineered_markers = {
-        "Entrance_Exam_Tier", "HS_Performance_Tier", "Strand_Program_Match",
+        "Strand_Program_Match",
         "First_Gen_Student", "Has_Scholarship", "Financial_Stress",
         "Gap_Years", "Private_HS", "Has_HS_Honors", "Age_At_Enrollment",
         "Distance_Bucket",
@@ -709,40 +771,6 @@ def _distance_bucket(km: float) -> str:
         if lo <= km < hi:
             return label
     return "unknown"
-
-
-def _build_program_risk_map(df: pd.DataFrame) -> None:
-    global _PROGRAM_RISK_MAP, _GLOBAL_PROGRAM_RISK
-
-    if TARGET_COLUMN not in df.columns:
-        return
-
-    risk_rate = (
-        df.assign(Program=df["Program"].astype(str).str.strip().str.upper())
-          .groupby("Program")[TARGET_COLUMN]
-          .apply(lambda x: (x == "at_risk").mean())
-    )
-    _PROGRAM_RISK_MAP = risk_rate.to_dict()
-    if len(risk_rate):
-        _GLOBAL_PROGRAM_RISK = float(risk_rate.mean())
-
-
-def _build_municipality_risk_map(df: pd.DataFrame) -> None:
-    global _MUNICIPALITY_RISK_MAP, _GLOBAL_MUNICIPALITY_RISK
-
-    if TARGET_COLUMN not in df.columns or "Municipality" not in df.columns:
-        return
-
-    risk_rate = (
-        df.assign(
-            Municipality=df["Municipality"].astype(str).str.strip().str.lower()
-        )
-        .groupby("Municipality")[TARGET_COLUMN]
-        .apply(lambda x: (x == "at_risk").mean())
-    )
-    _MUNICIPALITY_RISK_MAP = risk_rate.to_dict()
-    if len(risk_rate):
-        _GLOBAL_MUNICIPALITY_RISK = float(risk_rate.mean())
 
 
 def _gpa_tier(v: Any) -> int:

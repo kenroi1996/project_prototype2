@@ -8,7 +8,7 @@ class _PredictionWorker(QThread):
     progress = pyqtSignal(str, int)
     finished = pyqtSignal(object)   # PredictionResult
     error    = pyqtSignal(str)
- 
+
     def run(self):
         try:
             from services.prediction_engine import PredictionEngine
@@ -28,13 +28,19 @@ class PredictionMixin:
     """
     Mixin that provides confirmation dialog + loading overlay
     for any page that has a Run Prediction button.
+
+    NOTE: Persistence (saving to fact_student_academic_risk) is handled
+    exclusively by _FusedPredictionWorker in prediction_page.py, which has
+    access to the user-selected academic term. This mixin only handles the
+    Dashboard's "Run Prediction" shortcut button — it updates the UI but
+    does NOT duplicate the persistence write.
     """
 
     def init_prediction(
         self,
         dialog_title:    str = "Run Prediction",
         dialog_message:  str = "Are you sure you want to run the prediction model?",
-        dialog_detail:   str = "This will overwrite all existing prediction results.",
+        dialog_detail:   str = "This will score all students in the current dataset.",
         overlay_message: str = "Running Prediction...",
         overlay_sub:     str = "Analyzing student records",
     ):
@@ -54,7 +60,6 @@ class PredictionMixin:
             detail=self._dialog_detail,
             parent=self,
         )
-
         if not dialog.exec():
             return
 
@@ -69,25 +74,24 @@ class PredictionMixin:
 
         store = DataStore.get()
 
-        # ── Try to load model from disk if not in memory ──
+        # ── Load model from registry if not in memory ─────────────────
         if not store.trained_model:
             model_pkg = ModelRegistry.load_latest_model()
             if model_pkg:
                 try:
                     store.trained_model = {
-                        "model": model_pkg["model"],
-                        "model_id": model_pkg["model_id"],
+                        "model":         model_pkg["model"],
+                        "model_id":      model_pkg["model_id"],
                         "feature_names": model_pkg["feature_names"],
-                        "metadata": model_pkg["metadata"],
-                        "target_col": "risk_label",
+                        "metadata":      model_pkg["metadata"],
+                        "target_col":    "risk_label",
                     }
                     store.model_ready = True
-                    timestamp = model_pkg["metadata"].get("timestamp", "unknown")
-                    print(f"[PredictionMixin] Loaded model from disk: {timestamp}")
+                    print(f"[PredictionMixin] Loaded model from registry")
                 except Exception as e:
                     print(f"[PredictionMixin] Failed to load model: {e}")
 
-        # ── Try to build unified dataset if not in memory ──
+        # ── Build unified dataset if portals are loaded ────────────────
         if not store.unified_dataset and store.ready_count() > 0:
             try:
                 unified = store.build_unified_dataset()
@@ -96,97 +100,76 @@ class PredictionMixin:
             except Exception as e:
                 print(f"[PredictionMixin] Failed to build unified dataset: {e}")
 
-        # ── Check if we can run real prediction ──
+        # ── Guard: no model ───────────────────────────────────────────
         if not store.trained_model:
-            self.overlay.set_message("Running Prediction…", "No model trained yet — using demo mode")
-            QTimer.singleShot(3000, self._on_prediction_complete_mock)
+            self.overlay.hide()
+            from ui.dialogs.confirmation_dialog import show_warning
+            show_warning(
+                self,
+                "No Trained Model",
+                "No trained model found.",
+                "Go to Model Training and train a model first.",
+            )
             return
 
+        # ── Guard: no dataset ─────────────────────────────────────────
         if not store.unified_dataset:
-            self.overlay.set_message("Running Prediction…", "No unified dataset — using demo mode")
-            QTimer.singleShot(3000, self._on_prediction_complete_mock)
+            self.overlay.hide()
+            from ui.dialogs.confirmation_dialog import show_warning
+            show_warning(
+                self,
+                "No Dataset",
+                "No student dataset is loaded.",
+                "Upload portal files and run a prediction from the Prediction page.",
+            )
             return
 
-        # ── Run real prediction ──
+        # ── Run prediction ────────────────────────────────────────────
         self.overlay.set_message("Running Prediction…", "Scoring students")
-
         self._pred_worker = _PredictionWorker()
         self._pred_worker.progress.connect(
             lambda s, p: self.overlay.set_message("Running Prediction…", s)
         )
         self._pred_worker.finished.connect(self._on_prediction_complete)
         self._pred_worker.error.connect(self._on_prediction_error)
+        self._pred_worker.finished.connect(
+            self._pred_worker.deleteLater,
+            __import__("PyQt6.QtCore", fromlist=["Qt"]).Qt.ConnectionType.QueuedConnection,
+        )
         self._pred_worker.start()
 
     def _on_prediction_complete(self, result):
+        """
+        Called when _PredictionWorker finishes.
+
+        Persistence is intentionally NOT done here — the canonical write path
+        is _FusedPredictionWorker in prediction_page.py, which has the
+        user-selected academic term.  This handler only updates the in-memory
+        store and refreshes the UI.
+        """
         from services.data_store import DataStore
-        from services.risk_persistence_service import RiskPersistenceService
-        from services.prediction_config import PredictionConfig
-        from database.connection import get_connection
         self.overlay.hide()
 
-        if result.success:
-            store = DataStore.get()
-            store.predictions = result
-            store.set_last_prediction_run()
+        if not result or not result.success:
+            return
 
-            try:
-                summary = result.summary
-                store.add_activity(
-                    f"Prediction completed — {summary.total:,} students scored, "
-                    f"{summary.high_risk:,} high-risk",
-                    icon="🎯",
-                    color="#34d399",
-                )
-            except Exception:
-                store.add_activity("Prediction completed", icon="🎯", color="#34d399")
+        store = DataStore.get()
+        store.predictions = result
+        store.set_last_prediction_run()
 
-            # Resolve model_id from the stored model package (default "rf")
-            model_id = "rf"
-            if store.trained_model:
-                model_id = store.trained_model.get("model_id", "rf")
-
-            # Fetch the latest merge_log run_id to populate model_run_id
-            model_run_id = None
-            try:
-                conn = get_connection()
-                if conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT run_id FROM public.merge_log "
-                            "ORDER BY run_at DESC LIMIT 1"
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            model_run_id = row[0]
-                    conn.close()
-            except Exception as e:
-                print(f"[PredictionMixin] Could not fetch model_run_id: {e}")
-
-            # Save prediction results to fact_student_risk
-            persist_result = RiskPersistenceService.save_predictions(
-                result.predictions,
-                model_id=model_id,
-                academic_year=PredictionConfig.get_current_academic_year(),
-                semester=PredictionConfig.get_current_semester(),
-                model_run_id=model_run_id,
+        try:
+            s = result.summary
+            store.add_activity(
+                f"Prediction run — {s.total:,} students scored, "
+                f"{s.high_risk:,} high-risk  ·  {s.moderate_risk:,} moderate-risk",
+                icon="⚡",
+                color="#34d399",
             )
+        except Exception:
+            store.add_activity("Prediction completed", icon="⚡", color="#34d399")
 
-            if persist_result.get("success"):
-                inserted = persist_result.get("inserted", 0)
-                updated  = persist_result.get("updated", 0)
-                print(
-                    f"[PredictionMixin] Persisted predictions: "
-                    f"{inserted} inserted, {updated} updated"
-                )
-            else:
-                print(
-                    f"[PredictionMixin] Failed to save predictions: "
-                    f"{persist_result.get('error')}"
-                )
-
-            store._notify("predictions")
-            self._apply_predictions(result)
+        store._notify("predictions")
+        self._apply_predictions(result)
 
     def _on_prediction_complete_mock(self):
         self.overlay.hide()
@@ -194,6 +177,12 @@ class PredictionMixin:
     def _on_prediction_error(self, error_msg: str):
         self.overlay.hide()
         print(f"[PredictionMixin] Prediction error: {error_msg}")
+        try:
+            from ui.dialogs.confirmation_dialog import show_error
+            show_error(self, "Prediction Failed",
+                       "The prediction could not complete.", error_msg)
+        except Exception:
+            pass
 
     def _apply_predictions(self, result):
         """Override in each page to update UI with prediction results."""

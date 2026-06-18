@@ -1,151 +1,74 @@
 {
-  "summary": {
-    "original_rows": 3360,
-    "current_rows": 3360,
-    "columns": [
-      "Program",
-      "Sex_code",
+  "recall": 81.2,
+  "f1_score": 0.254,
+  "precision": 15.0,
+  "pr_auc": 0.303,
+  "decision_threshold": 0.15,
+  "cv_recalls": [
+    0.314,
+    0.288,
+    0.346,
+    0.275,
+    0.098
+  ],
+  "cv_f1s": [
+    0.305,
+    0.37,
+    0.33,
+    0.311,
+    0.127
+  ],
+  "cv_pr_aucs": [
+    0.245,
+    0.344,
+    0.308,
+    0.325,
+    0.202
+  ],
+  "train_size": 2688,
+  "test_size": 672,
+  "feature_count": 23,
+  "smote_applied": true,
+  "feature_importance": [
+    [
       "Entrance_Exam_Score",
-      "HS_GPA",
-      "risk_label",
-      "Entrance_Exam_Tier",
-      "HS_Performance_Tier",
-      "Strand_Program_Match",
-      "First_Gen_Student",
-      "Has_Scholarship",
-      "Financial_Stress",
-      "Gap_Years",
-      "Private_HS",
-      "Has_HS_Honors",
-      "Age_Group",
-      "Age_At_Enrollment",
-      "Distance_KM",
-      "Distance_Bucket",
-      "Program_Risk_Index",
-      "Municipality_Risk_Index"
+      22.1
     ],
-    "numeric_columns": [
-      "Program",
-      "Sex_code",
-      "Entrance_Exam_Score",
+    [
       "HS_GPA",
-      "risk_label",
-      "Entrance_Exam_Tier",
-      "HS_Performance_Tier",
-      "Strand_Program_Match",
-      "First_Gen_Student",
-      "Has_Scholarship",
-      "Financial_Stress",
-      "Gap_Years",
-      "Private_HS",
-      "Has_HS_Honors",
-      "Age_Group",
-      "Age_At_Enrollment",
-      "Distance_KM",
-      "Distance_Bucket",
-      "Program_Risk_Index",
-      "Municipality_Risk_Index"
+      13.8
     ],
-    "categorical_columns": [],
-    "missing_values": 0,
-    "memory_mb": 0.51
-  },
-  "training": {
-    "model_type": "random_forest",
-    "test_size": 0.2,
-    "train_samples": 5108,
-    "test_samples": 672,
-    "accuracy": 0.9315,
-    "cv_mean": 0.5447,
-    "cv_std": 0.0244,
-    "cv_metric": "balanced_accuracy",
-    "class_distribution": {
-      "0": 2554,
-      "1": 2554
-    },
-    "class_balancing": "SMOTE + class_weight=balanced",
-    "smote_applied": true,
-    "smote_error": null,
-    "classification_report": {
-      "0": {
-        "precision": 0.9625585023400937,
-        "recall": 0.9655712050078247,
-        "f1-score": 0.9640625,
-        "support": 639.0
-      },
-      "1": {
-        "precision": 0.2903225806451613,
-        "recall": 0.2727272727272727,
-        "f1-score": 0.28125,
-        "support": 33.0
-      },
-      "accuracy": 0.9315476190476191,
-      "macro avg": {
-        "precision": 0.6264405414926275,
-        "recall": 0.6191492388675487,
-        "f1-score": 0.62265625,
-        "support": 672.0
-      },
-      "weighted avg": {
-        "precision": 0.9295469168997176,
-        "recall": 0.9315476190476191,
-        "f1-score": 0.9305315290178572,
-        "support": 672.0
-      }
-    },
-    "confusion_matrix": [
-      [
-        617,
-        22
-      ],
-      [
-        24,
-        9
-      ]
+    [
+      "Has_Scholarship",
+      9.3
+    ],
+    [
+      "First_Gen_Student",
+      6.8
+    ],
+    [
+      "Strand_Program_Match",
+      6.5
+    ],
+    [
+      "Age_At_Enrollment",
+      5.2
+    ],
+    [
+      "Financial_Stress",
+      4.9
+    ],
+    [
+      "Program_BIT-CT",
+      3.8
+    ],
+    [
+      "Program_BSHM",
+      3.7
+    ],
+    [
+      "Has_HS_Honors",
+      3.4
     ]
-  },
-  "feature_importance": {
-    "feature": {
-      "0": "Entrance_Exam_Score",
-      "1": "HS_Performance_Tier",
-      "2": "HS_GPA",
-      "3": "Entrance_Exam_Tier",
-      "4": "Has_HS_Honors",
-      "5": "Age_At_Enrollment",
-      "6": "Program_Risk_Index",
-      "7": "Financial_Stress",
-      "8": "Program",
-      "9": "Strand_Program_Match",
-      "10": "Has_Scholarship",
-      "11": "Distance_KM",
-      "12": "Distance_Bucket",
-      "13": "First_Gen_Student",
-      "14": "Sex_code",
-      "15": "Private_HS",
-      "16": "Age_Group",
-      "17": "Gap_Years",
-      "18": "Municipality_Risk_Index"
-    },
-    "importance": {
-      "0": 0.3535606316711035,
-      "1": 0.20144962044082268,
-      "2": 0.1573553524694422,
-      "3": 0.04115540783792906,
-      "4": 0.0362545363646165,
-      "5": 0.028983005937925875,
-      "6": 0.026986172088232625,
-      "7": 0.025980645773324765,
-      "8": 0.02385406449628065,
-      "9": 0.021444473654410007,
-      "10": 0.020163728123370535,
-      "11": 0.01669322107011928,
-      "12": 0.015958936453200023,
-      "13": 0.01323222052778,
-      "14": 0.01095018232870832,
-      "15": 0.0058653193498245035,
-      "16": 0.00011248141290949485,
-      "17": 0.0,
-      "18": 0.0
-    }
-  }
+  ]
 }

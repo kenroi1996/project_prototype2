@@ -53,10 +53,5 @@ RISK_CATEGORIES = {
 }
 
 COLLEGES = {
-    "CITE": "College of Information Technology and Engineering",
-    "CBAA": "College of Business, Accountancy and Administration",
-    "CTE": "College of Teacher Education",
-    "COED": "College of Education",
-    "CON": "College of Nursing",
-    "CAS": "College of Arts and Sciences",
+    "COTE": "College of Information Technology and Engineering",
 }

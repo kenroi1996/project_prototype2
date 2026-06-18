@@ -47,7 +47,7 @@ class StudentProfilePanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("profilePanel")
-        self._panel_width = 500
+        self._panel_width = 720
         self.setFixedWidth(self._panel_width)
         self._build_ui()
         self._apply_styles()
@@ -115,25 +115,6 @@ class StudentProfilePanel(QFrame):
                 font-size: 11px;
                 font-weight: bold;
                 letter-spacing: 1px;
-            }
-            #profileMetricCard {
-                background-color: rgba(255, 255, 255, 0.04);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 12px;
-            }
-            #profileMetricValue {
-                font-size: 22px;
-                font-weight: bold;
-                color: white;
-            }
-            #profileMetricValueRisk {
-                font-size: 22px;
-                font-weight: bold;
-                color: #ff5b5b;
-            }
-            #profileMetricLabel {
-                color: rgba(255, 255, 255, 0.4);
-                font-size: 12px;
             }
             #profileDivider {
                 background-color: rgba(255, 255, 255, 0.08);
@@ -218,10 +199,10 @@ class StudentProfilePanel(QFrame):
         content = QWidget()
         content.setObjectName("profileScrollContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 20, 24, 24)
-        layout.setSpacing(20)
+        layout.setContentsMargins(32, 24, 32, 32)
+        layout.setSpacing(22)
 
-        # Top bar
+        # ── Top bar ───────────────────────────────────────────────────
         top_bar = QHBoxLayout()
         self.back_btn = QPushButton("←  Back")
         self.back_btn.setObjectName("profileBackButton")
@@ -240,9 +221,9 @@ class StudentProfilePanel(QFrame):
         top_bar.addWidget(self.log_btn)
         layout.addLayout(top_bar)
 
-        # Identity
+        # ── Identity ──────────────────────────────────────────────────
         identity = QHBoxLayout()
-        identity.setSpacing(16)
+        identity.setSpacing(20)
 
         self.avatar = QLabel("🎓")
         self.avatar.setObjectName("profileAvatar")
@@ -272,19 +253,11 @@ class StudentProfilePanel(QFrame):
 
         layout.addWidget(self._divider())
 
-        # Academic profile
-        layout.addWidget(self._section_title("ACADEMIC PROFILE"))
-        self.metrics_grid = QGridLayout()
-        self.metrics_grid.setSpacing(12)
-        self._metric_labels = {}
-        metrics_host = QWidget()
-        metrics_host.setLayout(self.metrics_grid)
-        layout.addWidget(metrics_host)
-
-        layout.addWidget(self._divider())
-
-        # SHAP
-        layout.addWidget(self._section_title("RISK FACTOR BREAKDOWN (SHAP)"))
+        # ── SHAP breakdown ────────────────────────────────────────────
+        # Academic Profile section removed — GWA and Absences are
+        # post-enrollment data not available at prediction time.
+        # SHAP factors provide the pre-enrollment risk explanation.
+        layout.addWidget(self._section_title("RISK FACTOR BREAKDOWN"))
         self.shap_container = QVBoxLayout()
         self.shap_container.setSpacing(10)
         shap_host = QWidget()
@@ -293,23 +266,28 @@ class StudentProfilePanel(QFrame):
 
         layout.addWidget(self._divider())
 
-        # Background
+        # ── Background ────────────────────────────────────────────────
         layout.addWidget(self._section_title("BACKGROUND"))
         self.tags_layout = QHBoxLayout()
         self.tags_layout.setSpacing(8)
+        self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         tags_host = QWidget()
         tags_host.setLayout(self.tags_layout)
         layout.addWidget(tags_host)
 
         layout.addWidget(self._divider())
 
-        # Recommended actions
+        # ── Recommended actions ───────────────────────────────────────
         layout.addWidget(self._section_title("RECOMMENDED ACTIONS"))
         self.rec_container = QVBoxLayout()
         self.rec_container.setSpacing(10)
         rec_host = QWidget()
         rec_host.setLayout(self.rec_container)
         layout.addWidget(rec_host)
+
+        # ── Action buttons ────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
 
         notify_btn = QPushButton("✉  Notify Advisor")
         notify_btn.setObjectName("profileNotifyBtn")
@@ -323,9 +301,11 @@ class StudentProfilePanel(QFrame):
         export_btn.setObjectName("profileExportBtn")
         export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        layout.addWidget(notify_btn)
-        layout.addWidget(counsel_btn)
-        layout.addWidget(export_btn)
+        btn_row.addWidget(notify_btn, 2)
+        btn_row.addWidget(counsel_btn, 2)
+        btn_row.addWidget(export_btn, 1)
+        layout.addLayout(btn_row)
+
         layout.addStretch()
 
         scroll.setWidget(content)
@@ -337,6 +317,10 @@ class StudentProfilePanel(QFrame):
         shadow.setYOffset(0)
         shadow.setColor(QColor(0, 0, 0, 160))
         self.setGraphicsEffect(shadow)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _section_title(self, text):
         label = QLabel(text)
@@ -361,14 +345,15 @@ class StudentProfilePanel(QFrame):
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(12)
+        row_layout.setSpacing(14)
 
         label = QLabel(label_text)
         label.setObjectName("profileShapLabel")
-        label.setFixedWidth(150)
+        label.setMinimumWidth(200)
+        label.setMaximumWidth(260)
 
         bar = QProgressBar()
-        bar.setValue(percentage)
+        bar.setValue(int(percentage))
         bar.setTextVisible(False)
         bar.setFixedHeight(8)
         bar.setStyleSheet("""
@@ -383,82 +368,152 @@ class StudentProfilePanel(QFrame):
             }
         """)
 
-        pct = QLabel(f"{percentage}%")
+        pct = QLabel(f"{int(percentage)}%")
         pct.setObjectName("profileShapPercent")
-        pct.setFixedWidth(36)
-        pct.setAlignment(Qt.AlignmentFlag.AlignRight)
+        pct.setFixedWidth(40)
+        pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         row_layout.addWidget(label)
         row_layout.addWidget(bar, 1)
         row_layout.addWidget(pct)
         return row
 
-    def _create_metric_card(self, value, label, is_risk=False):
-        card = QFrame()
-        card.setObjectName("profileMetricCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
-        card_layout.setSpacing(4)
-
-        value_lbl = QLabel(str(value))
-        value_lbl.setObjectName(
-            "profileMetricValueRisk" if is_risk else "profileMetricValue"
-        )
-
-        label_lbl = QLabel(label)
-        label_lbl.setObjectName("profileMetricLabel")
-
-        card_layout.addWidget(value_lbl)
-        card_layout.addWidget(label_lbl)
-        return card
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
 
     def load_student(self, student):
         """Populate panel fields from a student record dict."""
-        self.name_label.setText(student["name"])
+        self.name_label.setText(student.get("name", "—"))
         self.meta_label.setText(
-            f"{student['id']} · {student['college']} · {student['program']}"
+            f"{student.get('id', '—')}  ·  "
+            f"{student.get('college', '—')}  ·  "
+            f"{student.get('program', '—')}"
         )
-        self.risk_pill.setText(
-            f"●  {student.get('risk_level', 'High')} Risk — {student['score']}%"
-        )
+        score    = student.get("score", 0)
+        category = student.get("category", "")
+        label    = student.get("label", "At Risk")
+        self.risk_pill.setText(f"●  {label} — {score}%")
 
-        self._clear_layout(self.metrics_grid)
-        metrics = [
-            (student.get("gwa", 3.45), "GWA", True),
-            (student.get("absences", 13), "Absences", False),
-            (student.get("failed_subjects", 2), "Failed Subjects", False),
-            (student.get("referrals", 2), "Referrals", False),
-        ]
-        for i, (value, label, is_risk) in enumerate(metrics):
-            card = self._create_metric_card(value, label, is_risk)
-            self.metrics_grid.addWidget(card, i // 2, i % 2)
+        if category == "high_risk":
+            self.risk_pill.setStyleSheet(
+                "background-color: rgba(255,91,91,0.12); "
+                "border: 1px solid rgba(255,91,91,0.25); "
+                "border-radius: 14px; color: #ff6b6b; "
+                "font-size: 12px; font-weight: 600; padding: 6px 14px;"
+            )
+        elif category == "moderate_risk":
+            self.risk_pill.setStyleSheet(
+                "background-color: rgba(245,179,53,0.12); "
+                "border: 1px solid rgba(245,179,53,0.25); "
+                "border-radius: 14px; color: #f5b335; "
+                "font-size: 12px; font-weight: 600; padding: 6px 14px;"
+            )
+        else:
+            self.risk_pill.setStyleSheet(
+                "background-color: rgba(52,211,153,0.12); "
+                "border: 1px solid rgba(52,211,153,0.25); "
+                "border-radius: 14px; color: #34d399; "
+                "font-size: 12px; font-weight: 600; padding: 6px 14px;"
+            )
 
+        # ── SHAP factors ──────────────────────────────────────────────
         self._clear_layout(self.shap_container)
         factors = student.get("shap_factors", DEFAULT_SHAP_FACTORS)
-        for label_text, pct in factors:
+        for entry in factors:
+            if len(entry) == 4:
+                _, human_label, formatted_value, pct = entry
+                label_text = f"{human_label}:  {formatted_value}"
+            elif len(entry) == 2:
+                label_text, pct = entry
+            else:
+                continue
             self.shap_container.addWidget(
                 self._create_shap_row(label_text, pct)
             )
 
+        # ── Background tags ───────────────────────────────────────────
         self._clear_layout(self.tags_layout)
-        tags = student.get("background", DEFAULT_BACKGROUND)
-        for tag in tags:
-            pill = QLabel(tag)
-            pill.setObjectName("profileTagPill")
-            self.tags_layout.addWidget(pill)
+
+        # Build background pills from available pre-enrollment fields
+        def _pill(label: str, value: str) -> str | None:
+            v = str(value).strip()
+            if not v or v.lower() in ("—", "none", "nan", "", "unknown"):
+                return None
+            return f"{label}: {v}"
+
+        tag_sources = [
+            _pill("Strand",     student.get("shs_strand", "")),
+            _pill("HS Type",    student.get("hs_type", "")),
+            _pill("Honors",     student.get("graduation_honors", "")),
+            _pill("Scholarship",student.get("scholarship_type") or
+                                ("Yes" if str(student.get("scholarship_applicant",""))
+                                 .lower() in ("1","yes","y","true","approved","scholar")
+                                 else None)),
+            _pill("Income",     student.get("family_income_bracket") or
+                                student.get("family_income", "")),
+            _pill("Parent Edu", student.get("parent_highest_education") or
+                                student.get("parent_edu", "")),
+            _pill("Religion",   student.get("religion", "")),
+            _pill("Civil",      student.get("civil_status", "")),
+        ]
+
+        added = 0
+        for tag in tag_sources:
+            if tag:
+                pill = QLabel(tag)
+                pill.setObjectName("profileTagPill")
+                self.tags_layout.addWidget(pill)
+                added += 1
+
+        if added == 0:
+            # Fallback to defaults if nothing resolved
+            for tag in DEFAULT_BACKGROUND:
+                pill = QLabel(tag)
+                pill.setObjectName("profileTagPill")
+                self.tags_layout.addWidget(pill)
+
         self.tags_layout.addStretch()
 
+        # ── Recommendations ───────────────────────────────────────────
         self._clear_layout(self.rec_container)
-        recs = student.get("recommendations", DEFAULT_RECOMMENDATIONS)
+
+        # Auto-generate recommendations based on risk category and top factor
+        recs = []
+        if category == "high_risk":
+            recs.append(("⚡", "Immediate referral to academic advisor recommended"))
+            recs.append(("💬", "Schedule guidance counseling session this week"))
+        elif category == "moderate_risk":
+            recs.append(("📋", "Monitor academic performance closely this semester"))
+            recs.append(("💬", "Consider a check-in with the guidance office"))
+
+        # Factor-specific recommendations
+        if factors:
+            top_entry = factors[0]
+            top_feat  = top_entry[0] if len(top_entry) >= 1 else ""
+            if "Financial" in top_feat or "financial" in top_feat:
+                recs.append(("💰", "Refer to scholarship or financial assistance office"))
+            elif "Distance" in top_feat or "distance" in top_feat:
+                recs.append(("🏠", "Explore dormitory or housing assistance options"))
+            elif "Entrance" in top_feat or "HS_GPA" in top_feat:
+                recs.append(("📚", "Enroll in academic bridging or tutorial program"))
+            elif "Strand" in top_feat or "strand" in top_feat:
+                recs.append(("🔄", "Consider academic advising on program alignment"))
+            elif "First_Gen" in top_feat:
+                recs.append(("👨‍👩‍👧", "Connect with first-generation student support services"))
+
+        if not recs:
+            recs = DEFAULT_RECOMMENDATIONS
+
         for icon, text in recs:
             box = QFrame()
             box.setObjectName("profileRecBox")
             box_layout = QHBoxLayout(box)
-            box_layout.setContentsMargins(14, 12, 14, 12)
-            box_layout.setSpacing(10)
+            box_layout.setContentsMargins(16, 12, 16, 12)
+            box_layout.setSpacing(12)
 
             icon_lbl = QLabel(icon)
-            icon_lbl.setFixedWidth(20)
+            icon_lbl.setFixedWidth(22)
 
             text_lbl = QLabel(text)
             text_lbl.setObjectName("profileRecText")
@@ -475,19 +530,18 @@ class StudentProfileDrawer(QWidget):
     Attach to the page container (parent of QScrollArea), not the scrollable page.
     """
 
-    PANEL_WIDTH = 500
+    PANEL_WIDTH   = 720
     ANIM_DURATION = 320
 
     def __init__(self, host: QWidget):
         super().__init__(host)
-        self._host = host
-        self._is_open = False
+        self._host      = host
+        self._is_open   = False
         self._slide_anim = None
 
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.hide()
 
-        # Dimmed backdrop
         self._backdrop = QFrame(self)
         self._backdrop.setObjectName("profileBackdrop")
         self._backdrop.setStyleSheet(
@@ -517,10 +571,7 @@ class StudentProfileDrawer(QWidget):
 
     def _place_panel(self, open_state: bool):
         h = self.height()
-        if open_state:
-            x = self.width() - self.PANEL_WIDTH
-        else:
-            x = self.width()
+        x = self.width() - self.PANEL_WIDTH if open_state else self.width()
         self._panel.setGeometry(QRect(x, 0, self.PANEL_WIDTH, h))
 
     def open_drawer(self, student: dict):
@@ -531,25 +582,23 @@ class StudentProfileDrawer(QWidget):
         self._is_open = True
 
         start = QRect(self.width(), 0, self.PANEL_WIDTH, self.height())
-        end = QRect(
-            self.width() - self.PANEL_WIDTH,
-            0,
-            self.PANEL_WIDTH,
-            self.height(),
+        end   = QRect(
+            self.width() - self.PANEL_WIDTH, 0, self.PANEL_WIDTH, self.height()
         )
         self._run_slide(start, end)
 
     def close_drawer(self):
         if not self._is_open:
             return
-
-        start = self._panel.geometry()
-        end = QRect(self.width(), 0, self.PANEL_WIDTH, self.height())
+        start         = self._panel.geometry()
+        end           = QRect(self.width(), 0, self.PANEL_WIDTH, self.height())
         self._is_open = False
         self._run_slide(start, end, on_finished=self.hide)
 
     def _run_slide(self, start: QRect, end: QRect, on_finished=None):
-        if self._slide_anim and self._slide_anim.state() == QPropertyAnimation.State.Running:
+        if (self._slide_anim
+                and self._slide_anim.state()
+                == QPropertyAnimation.State.Running):
             self._slide_anim.stop()
 
         self._panel.setGeometry(start)

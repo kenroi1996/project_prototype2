@@ -1,17 +1,10 @@
 from PyQt6.QtWidgets import (
-    QWidget,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QHBoxLayout,
-    QFrame,
-    QLineEdit,
-    QFileDialog,
-    QGraphicsOpacityEffect,
-    QProgressBar,
-    QScrollArea,
+    QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QFrame, QLineEdit, QFileDialog, QGraphicsOpacityEffect,
+    QProgressBar, QScrollArea, QGridLayout, QComboBox,
 )
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon
 
 from ui.mixins.prediction_mixin import PredictionMixin
 from ui.components.loading_overlay import LoadingOverlay
@@ -24,10 +17,10 @@ from services.excel_service import (
     dataframe_to_rows,
     rows_to_dataframe,
 )
+from services.system_config import SystemConfig
 
 ACCENT = "#4f8cff"
 
-# Portal display config
 _PORTAL_CONFIG = {
     "mis":       {"label": "MIS",       "full": "Management Information System",  "icon": "🏫", "color": "#4f8cff"},
     "sao":       {"label": "SAO",       "full": "Student Affairs Office",         "icon": "🎓", "color": "#a78bfa"},
@@ -43,7 +36,7 @@ _DATASET_CONFIG = {
 
 
 # =============================================================================
-# FUSED WORKER  (feature engineering → model scoring in one thread)
+# FUSED WORKER
 # =============================================================================
 
 class _FusedPredictionWorker(QThread):
@@ -51,12 +44,15 @@ class _FusedPredictionWorker(QThread):
     finished = pyqtSignal(object)
     error    = pyqtSignal(str)
 
-    def __init__(self, headers: list, rows: list, name: str, school_year: str):
+    def __init__(self, headers: list, rows: list, name: str, school_year: str,
+                 academic_year: str = "2024-2025", semester: int = 1):
         super().__init__(parent=None)
-        self._headers     = headers
-        self._rows        = rows
-        self._name        = name
-        self._school_year = school_year
+        self._headers       = headers
+        self._rows          = rows
+        self._name          = name
+        self._school_year   = school_year
+        self._academic_year = academic_year
+        self._semester      = semester
 
     def run(self):
         try:
@@ -64,7 +60,6 @@ class _FusedPredictionWorker(QThread):
             from services.prediction_engine import PredictionEngine
             from services.data_store import DataStore
 
-            # ── Phase 1: Snapshot raw meta BEFORE pipeline strips columns ─────
             self.progress.emit("Snapshotting student demographics…", 5)
             df = rows_to_dataframe(self._headers, self._rows)
 
@@ -72,8 +67,15 @@ class _FusedPredictionWorker(QThread):
             df_norm = normalize_columns(df.copy())
 
             _SNAPSHOT_COLS = [
-                "first_name", "First_Name", "firstname",
-                "last_name",  "Last_Name",  "lastname",
+                "first_name", "First_Name", "firstname", "FIRSTNAME",
+                "FIRST_NAME", "FIRST NAME", "fname", "FNAME", "F_NAME",
+                "given_name", "Given_Name", "GIVEN_NAME",
+                "last_name",  "Last_Name",  "lastname",  "LASTNAME",
+                "LAST_NAME",  "LAST NAME",  "lname", "LNAME", "L_NAME",
+                "surname", "Surname", "SURNAME", "family_name",
+                "middle_name", "Middle_Name", "MIDDLE_NAME", "mname",
+                "full_name", "Full_Name", "FULL_NAME", "name", "NAME",
+                "student_name", "Student_Name", "STUDENT_NAME",
                 "College", "Final_Avg_GRD", "SecCode", "Year",
                 "Home_Address", "Municipality", "Civil_Status",
                 "Birthdate", "Year_Enrolled", "Family_Income",
@@ -102,7 +104,6 @@ class _FusedPredictionWorker(QThread):
             print(f"[FusedWorker] Meta snapshot: {len(meta_snapshot)} students, "
                   f"{len(next(iter(meta_snapshot.values()), {}))} fields each")
 
-            # ── Phase 2: Feature engineering (10 → 45 %) ─────────────────────
             self.progress.emit("Engineering features…", 10)
             engineered = run_prediction_pipeline(df)
 
@@ -119,7 +120,6 @@ class _FusedPredictionWorker(QThread):
                 school_year=self._school_year,
             )
 
-            # ── Phase 3: Model scoring (45 → 100 %) ──────────────────────────
             def _cb(step: str, pct: int):
                 self.progress.emit(step, 45 + int(pct * 0.55))
 
@@ -128,6 +128,36 @@ class _FusedPredictionWorker(QThread):
                 unified_dataset = store.get_prediction_dataset(),
                 progress_cb     = _cb,
             )
+
+            if result and result.success:
+                try:
+                    from services.activity_logger import ActivityLogger
+                    _conn = store.db_conn
+                    if _conn:
+                        s = result.summary
+                        ActivityLogger.log_predict(
+                            _conn,
+                            dataset_name  = self._name,
+                            school_year   = self._school_year,
+                            total         = s.total,
+                            high_risk     = s.high_risk,
+                            moderate_risk = s.moderate_risk,
+                        )
+                        _conn.commit()
+                except Exception as _e:
+                    print(f"[FusedWorker] Predict log error: {_e}")
+
+                try:
+                    from services.risk_persistence_service import RiskPersistenceService
+                    RiskPersistenceService.save_predictions(
+                        predictions   = result.predictions,
+                        model_id      = "rf",
+                        academic_year = self._academic_year,
+                        semester      = str(self._semester),
+                    )
+                except Exception as _e:
+                    print(f"[FusedWorker] Risk persistence error: {_e}")
+
             self.finished.emit(result)
 
         except Exception as e:
@@ -140,36 +170,32 @@ class _FusedPredictionWorker(QThread):
 
 class PredictionPage(PredictionMixin, QWidget):
     """
-    Prediction page — upload four portal datasets, merge them, then
-    run feature engineering and model scoring in one fused step.
-
-    Workflow (4 steps)
-    ------------------
-    1. Enter Dataset Name + School Year.
-    2. Upload each portal file (MIS, SAO, Guidance, Registrar).
-    3. Merge portals → optionally Clean → confirm merge report.
-    4. Run Pipeline & Predict → results saved to DB automatically.
+    Upload four portal datasets → merge → run feature engineering
+    and model scoring → results saved to DB automatically.
     """
 
     def __init__(self):
         super().__init__()
-
-        # Per-portal state: {key: {"headers": [...], "rows": [...]} | None}
         self._portal_data: dict = {k: None for k in _PORTAL_CONFIG}
-
         self._merged_headers: list | None = None
         self._merged_rows:    list | None = None
-        self._merged          = False
-        self._cleaned         = False
+        self._merged  = False
+        self._cleaned = False
         self._fused_worker: _FusedPredictionWorker | None = None
+        self._available_terms: list = []
 
         self.setup_ui()
-        self._apply_page_styles()
+        self._apply_styles()
         self.init_prediction(
             overlay_message="Running Pipeline & Prediction…",
             overlay_sub="Preparing features",
         )
         self._refresh_button_states()
+        DataStore.get().add_listener(self._on_store_updated)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_model_status()
 
     # ------------------------------------------------------------------
     # UI BUILD
@@ -179,40 +205,191 @@ class PredictionPage(PredictionMixin, QWidget):
         self.setObjectName("page")
         self.overlay = LoadingOverlay(self)
 
-        # Outer scroll area so the page works on smaller screens
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("background: transparent; border: none;")
+        scroll.setObjectName("predScroll")
 
         container = QWidget()
-        container.setStyleSheet("background: transparent;")
+        container.setObjectName("predPageContainer")
         self.main_layout = QVBoxLayout(container)
         self.main_layout.setContentsMargins(30, 30, 30, 30)
         self.main_layout.setSpacing(20)
 
         scroll.setWidget(container)
-
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
 
-        # ── Header ────────────────────────────────────────────────────
         self.main_layout.addWidget(self._build_header())
-
-        # ── Step 1: Dataset details ────────────────────────────────────
-        self.main_layout.addWidget(self._build_details_card())
-
-        # ── Step 2: Portal uploads ─────────────────────────────────────
-        self.main_layout.addWidget(self._build_portals_card())
-
-        # ── Step 3: Merge & Clean ──────────────────────────────────────
+        self.main_layout.addWidget(self._build_model_status_panel())
+        self.main_layout.addLayout(self._build_step_row())
         self.main_layout.addWidget(self._build_merge_card())
-
-        # ── Step 4: Run Pipeline & Predict ────────────────────────────
         self.main_layout.addWidget(self._build_fused_card())
-
         self.main_layout.addStretch()
+
+    def _on_store_updated(self, key: str):
+        if key in ("system_config", "all"):
+            if hasattr(self, "_sem_pill_lbl"):
+                self._sem_pill_lbl.setText(f"{SystemConfig.term_label()}  ▾")
+            if hasattr(self, "_academic_year_combo"):
+                self._academic_year_combo.setCurrentText(SystemConfig.academic_year())
+            if hasattr(self, "_semester_combo"):
+                self._semester_combo.setCurrentIndex(SystemConfig.semester() - 1)
+        if key in ("trained_model", "all"):
+            self._refresh_model_status()
+
+    # ------------------------------------------------------------------
+    # Model Status Panel
+    # ------------------------------------------------------------------
+
+    def _build_model_status_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("predModelStatusPanel")
+
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setSpacing(0)
+
+        left = QHBoxLayout()
+        left.setSpacing(12)
+
+        self._model_status_dot = QLabel("●")
+        self._model_status_dot.setObjectName("predStatusDot")
+
+        status_col = QVBoxLayout()
+        status_col.setSpacing(3)
+        self._model_status_title = QLabel("No Model Trained")
+        self._model_status_title.setObjectName("predStatusTitle")
+        self._model_status_sub = QLabel(
+            "Train a model from the Model Training page before running prediction."
+        )
+        self._model_status_sub.setObjectName("predStatusSub")
+        self._model_status_sub.setWordWrap(True)
+        status_col.addWidget(self._model_status_title)
+        status_col.addWidget(self._model_status_sub)
+
+        left.addWidget(self._model_status_dot)
+        left.addLayout(status_col, 1)
+        layout.addLayout(left, 2)
+
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.VLine)
+        div.setFixedWidth(1)
+        div.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        layout.addSpacing(20)
+        layout.addWidget(div)
+        layout.addSpacing(20)
+
+        self._metric_chips_layout = QHBoxLayout()
+        self._metric_chips_layout.setSpacing(12)
+        layout.addLayout(self._metric_chips_layout, 3)
+
+        self._refresh_model_status()
+        return panel
+
+    def _refresh_model_status(self):
+        store = DataStore.get()
+        model = store.trained_model
+
+        while self._metric_chips_layout.count():
+            item = self._metric_chips_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not model or not store.model_ready:
+            self._model_status_dot.setStyleSheet(
+                "color: #ff5b5b; font-size: 11px; background: transparent;"
+            )
+            self._model_status_title.setText("No Model Trained")
+            self._model_status_sub.setText(
+                "Train a model from the Model Training page before running prediction."
+            )
+            self._model_status_title.setStyleSheet(
+                "color: rgba(255,255,255,0.75); font-size: 14px; "
+                "font-weight: 700; background: transparent;"
+            )
+            self._metric_chips_layout.addWidget(
+                self._make_chip("Prediction Unavailable", "—", "#ff5b5b")
+            )
+            self._metric_chips_layout.addStretch()
+            return
+
+        self._model_status_dot.setStyleSheet(
+            "color: #34d399; font-size: 11px; background: transparent;"
+        )
+        self._model_status_title.setText("✓  Model Active — Ready for Prediction")
+        self._model_status_title.setStyleSheet(
+            "color: #34d399; font-size: 14px; font-weight: 700; background: transparent;"
+        )
+
+        meta      = model.get("metadata", {}) or {}
+        model_id  = model.get("model_id", "rf")
+        recall    = meta.get("recall")
+        f1        = meta.get("f1_score")
+        precision = meta.get("precision")
+        pr_auc    = meta.get("pr_auc")
+        threshold = (model.get("decision_threshold")
+                     or meta.get("decision_threshold")
+                     or meta.get("threshold"))
+        train_sz  = meta.get("train_size")
+        timestamp = meta.get("timestamp")
+
+        ts_str = ""
+        if timestamp:
+            try:
+                from datetime import datetime as _dt
+                ts = _dt.fromisoformat(str(timestamp))
+                ts_str = f"  ·  Trained {ts.strftime('%b %d, %Y  %H:%M')}"
+            except Exception:
+                ts_str = f"  ·  {timestamp}"
+        self._model_status_sub.setText(
+            f"Random Forest  ·  ID: {model_id}{ts_str}"
+        )
+        self._model_status_sub.setStyleSheet(
+            "color: rgba(255,255,255,0.45); font-size: 12px; background: transparent;"
+        )
+
+        def _fmt_pct(v):
+            return f"{v*100:.1f}%" if v is not None else "—"
+        def _fmt_f(v, decimals=3):
+            return f"{v:.{decimals}f}" if v is not None else "—"
+
+        chips = [
+            ("Recall",    _fmt_pct(recall),    "#34d399"),
+            ("Precision", _fmt_pct(precision), "#4f8cff"),
+            ("F1 Score",  _fmt_f(f1),          "#a78bfa"),
+            ("PR-AUC",    _fmt_f(pr_auc),      "#f5b335"),
+            ("Threshold", _fmt_f(threshold, 2),"#8b949e"),
+        ]
+        if train_sz:
+            chips.append(("Train Size", f"{int(train_sz):,}", "#8b949e"))
+
+        for label, value, color in chips:
+            self._metric_chips_layout.addWidget(self._make_chip(label, value, color))
+        self._metric_chips_layout.addStretch()
+
+    def _make_chip(self, label: str, value: str, color: str) -> QFrame:
+        chip = QFrame()
+        chip.setObjectName("predMetricChip")
+        col = QVBoxLayout(chip)
+        col.setContentsMargins(14, 10, 14, 10)
+        col.setSpacing(3)
+
+        val_lbl = QLabel(value)
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        val_lbl.setStyleSheet(
+            f"color: {color}; font-size: 15px; font-weight: 800; background: transparent;"
+        )
+        key_lbl = QLabel(label)
+        key_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        key_lbl.setStyleSheet(
+            "color: rgba(255,255,255,0.40); font-size: 10px; "
+            "font-weight: 600; letter-spacing: 0.5px; background: transparent;"
+        )
+        col.addWidget(val_lbl)
+        col.addWidget(key_lbl)
+        return chip
 
     # ------------------------------------------------------------------
     # Header
@@ -220,254 +397,275 @@ class PredictionPage(PredictionMixin, QWidget):
 
     def _build_header(self) -> QFrame:
         container = QFrame()
-        container.setObjectName("fixedHeaderContainer")
+        container.setObjectName("predHeaderCard")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(0)
+        layout.setContentsMargins(24, 20, 24, 20)
 
         row = QHBoxLayout()
-        row.setSpacing(15)
+        row.setSpacing(20)
 
         text_col = QVBoxLayout()
         text_col.setSpacing(5)
-        header = QLabel("PREDICTION")
-        header.setObjectName("header")
-        subheader = QLabel(
-            "Upload portal datasets, merge, and score incoming first-year students"
+        title = QLabel("PREDICTION CENTER")
+        title.setObjectName("header")
+        sub = QLabel(
+            "Upload incoming student datasets, merge portals, "
+            "and score each student with the trained risk model"
         )
-        subheader.setObjectName("subHeader")
-        text_col.addWidget(header)
-        text_col.addWidget(subheader)
-        row.addLayout(text_col)
-        row.addStretch()
+        sub.setObjectName("subHeader")
+        text_col.addWidget(title)
+        text_col.addWidget(sub)
+        row.addLayout(text_col, 1)
 
-        # Model status pill
-        model_card = QFrame()
-        model_card.setObjectName("predictionModelCard")
-        pill_layout = QHBoxLayout(model_card)
-        pill_layout.setContentsMargins(20, 15, 20, 15)
-        model_status = QLabel("● Model Active")
-        model_status.setObjectName("predictionModelStatus")
-        opacity_effect = QGraphicsOpacityEffect(model_status)
-        model_status.setGraphicsEffect(opacity_effect)
-        self._status_anim = QPropertyAnimation(opacity_effect, b"opacity")
-        self._status_anim.setDuration(1200)
-        self._status_anim.setStartValue(1.0)
-        self._status_anim.setKeyValueAt(0.5, 0.3)
-        self._status_anim.setEndValue(1.0)
-        self._status_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        self._status_anim.setLoopCount(-1)
-        self._status_anim.start()
-        pill_layout.addWidget(model_status)
-        row.addWidget(model_card)
+        pill = QFrame()
+        pill.setObjectName("predModelPill")
+        pill_row = QHBoxLayout(pill)
+        pill_row.setContentsMargins(20, 12, 20, 12)
+        pill_row.setSpacing(12)
+
+        dot = QLabel("●")
+        dot.setObjectName("predModelDot")
+        opacity = QGraphicsOpacityEffect(dot)
+        dot.setGraphicsEffect(opacity)
+        anim = QPropertyAnimation(opacity, b"opacity")
+        anim.setDuration(1200)
+        anim.setStartValue(1.0)
+        anim.setKeyValueAt(0.5, 0.3)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.setLoopCount(-1)
+        anim.start()
+        self._status_anim = anim
+
+        status_lbl = QLabel("Model Active")
+        status_lbl.setObjectName("predModelStatus")
+        self._sem_pill_lbl = QLabel(f"{SystemConfig.term_label()}  ▾")
+        self._sem_pill_lbl.setObjectName("predSemesterPill")
+        self._sem_pill_lbl.setObjectName("predSemesterPill")
+
+        pill_row.addWidget(dot)
+        pill_row.addWidget(status_lbl)
+        pill_row.addSpacing(8)
+        pill_row.addWidget(self._sem_pill_lbl)
+        row.addWidget(pill)
 
         layout.addLayout(row)
         return container
 
     # ------------------------------------------------------------------
-    # Step 1 — Dataset details
+    # Steps
     # ------------------------------------------------------------------
+
+    def _build_step_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(20)
+        row.addWidget(self._build_details_card(), 1)
+        row.addWidget(self._build_portals_card(), 2)
+        return row
 
     def _build_details_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("predictionCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(14)
-
-        layout.addWidget(self._card_title("STEP 1 · DATASET DETAILS"))
-        hint = QLabel("Enter the dataset name and school year before uploading.")
-        hint.setObjectName("predictionHint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        row = QHBoxLayout()
-        row.setSpacing(18)
-
-        name_col = QVBoxLayout()
-        name_col.setSpacing(6)
-        name_col.addWidget(self._input_label("Dataset Name"))
-        self._name_input = QLineEdit()
-        self._name_input.setObjectName("predictionInput")
-        self._name_input.setPlaceholderText("e.g. Incoming First-Year Cohort 2025")
-        self._name_input.textChanged.connect(self._refresh_button_states)
-        name_col.addWidget(self._name_input)
-
-        year_col = QVBoxLayout()
-        year_col.setSpacing(6)
-        year_col.addWidget(self._input_label("School Year"))
-        self._year_input = QLineEdit()
-        self._year_input.setObjectName("predictionInput")
-        self._year_input.setPlaceholderText("e.g. 2025–2026")
-        self._year_input.textChanged.connect(self._refresh_button_states)
-        year_col.addWidget(self._year_input)
-
-        row.addLayout(name_col, 1)
-        row.addLayout(year_col, 1)
-        layout.addLayout(row)
-        return card
-
-    # ------------------------------------------------------------------
-    # Step 2 — Portal upload cards
-    # ------------------------------------------------------------------
-
-    def _build_portals_card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("predictionCard")
+        card.setObjectName("predCardDetails")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
 
-        layout.addWidget(self._card_title("STEP 2 · UPLOAD PORTAL DATASETS"))
+        layout.addWidget(self._step_label("01", "Dataset Details"))
+
+        hint = QLabel(
+            "Name this cohort, select the academic term, then upload portal files."
+        )
+        hint.setObjectName("predHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        layout.addWidget(self._input_label("Dataset Name"))
+        self._name_input = QLineEdit()
+        self._name_input.setObjectName("predInput")
+        self._name_input.setPlaceholderText("e.g. Incoming First-Year Cohort 2025")
+        self._name_input.textChanged.connect(self._refresh_button_states)
+        layout.addWidget(self._name_input)
+
+        term_row = QHBoxLayout()
+        term_row.setSpacing(10)
+
+        ay_col = QVBoxLayout()
+        ay_col.setSpacing(6)
+        ay_col.addWidget(self._input_label("Academic Year"))
+        self._academic_year_combo = QComboBox()
+        self._academic_year_combo.setObjectName("predTermCombo")
+        for ay in ["2022-2023", "2023-2024", "2024-2025", "2025-2026", "2026-2027"]:
+            self._academic_year_combo.addItem(ay)
+        self._academic_year_combo.setCurrentText(SystemConfig.academic_year())
+        ay_col.addWidget(self._academic_year_combo)
+
+        sem_col = QVBoxLayout()
+        sem_col.setSpacing(6)
+        sem_col.addWidget(self._input_label("Semester"))
+        self._semester_combo = QComboBox()
+        self._semester_combo.setObjectName("predTermCombo")
+        self._semester_combo.addItem("1st Semester", userData=1)
+        self._semester_combo.addItem("2nd Semester", userData=2)
+        self._semester_combo.setCurrentIndex(SystemConfig.semester() - 1)
+        sem_col.addWidget(self._semester_combo)
+
+        term_row.addLayout(ay_col, 2)
+        term_row.addLayout(sem_col, 1)
+        layout.addLayout(term_row)
+
+        self._term_preview = QLabel()
+        self._term_preview.setObjectName("predTermPreview")
+        self._update_term_preview()
+        self._academic_year_combo.currentTextChanged.connect(
+            lambda _: self._update_term_preview())
+        self._semester_combo.currentIndexChanged.connect(
+            lambda _: self._update_term_preview())
+        layout.addWidget(self._term_preview)
+
+        layout.addStretch()
+        return card
+
+    def _update_term_preview(self):
+        ay  = self._academic_year_combo.currentText()
+        sem = self._semester_combo.currentText()
+        self._term_preview.setText(f"Term: {ay} — {sem}")
+
+    def _get_selected_term(self) -> tuple[str, int]:
+        ay  = self._academic_year_combo.currentText()
+        sem = self._semester_combo.currentData() or 1
+        return ay, int(sem)
+
+    def _build_portals_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("predCardPortals")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+
+        layout.addWidget(self._step_label("02", "Upload Portal Datasets"))
+
         hint = QLabel(
             "Upload the incoming student export from each office. "
             "All four are required before merging."
         )
-        hint.setObjectName("predictionHint")
+        hint.setObjectName("predHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # 2×2 grid of portal cards
         self._portal_cards: dict = {}
-        top_row = QHBoxLayout()
-        top_row.setSpacing(14)
-        bot_row = QHBoxLayout()
-        bot_row.setSpacing(14)
+        grid = QGridLayout()
+        grid.setSpacing(12)
 
-        keys = list(_PORTAL_CONFIG.keys())
-        for i, key in enumerate(keys):
-            pcard = self._build_portal_upload_card(key)
+        for i, key in enumerate(list(_PORTAL_CONFIG.keys())):
+            pcard = self._build_portal_tile(key)
             self._portal_cards[key] = pcard
-            (top_row if i < 2 else bot_row).addWidget(pcard, 1)
+            grid.addWidget(pcard, i // 2, i % 2)
 
-        layout.addLayout(top_row)
-        layout.addLayout(bot_row)
+        layout.addLayout(grid)
         return card
 
-    def _build_portal_upload_card(self, key: str) -> QFrame:
-        cfg = _PORTAL_CONFIG[key]
+    def _build_portal_tile(self, key: str) -> QFrame:
+        cfg   = _PORTAL_CONFIG[key]
         color = cfg["color"]
 
-        card = QFrame()
-        card.setObjectName(f"portalCard_{key}")
-        card.setStyleSheet(f"""
-            QFrame#portalCard_{key} {{
-                background-color: rgba(0,0,0,0.18);
-                border: 1px solid rgba(255,255,255,0.07);
-                border-radius: 12px;
-            }}
-        """)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
+        tile = QFrame()
+        tile.setObjectName("predPortalTile")
+        layout = QVBoxLayout(tile)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
 
-        # Header row: icon + label + status dot
-        hrow = QHBoxLayout()
+        top = QHBoxLayout()
+        top.setSpacing(10)
+
         icon_lbl = QLabel(cfg["icon"])
-        icon_lbl.setStyleSheet("font-size: 20px; background: transparent;")
-        hrow.addWidget(icon_lbl)
+        icon_lbl.setStyleSheet("font-size: 18px; background: transparent;")
+        top.addWidget(icon_lbl)
 
-        title_col = QVBoxLayout()
-        title_col.setSpacing(1)
+        name_col = QVBoxLayout()
+        name_col.setSpacing(1)
         name_lbl = QLabel(cfg["label"])
         name_lbl.setStyleSheet(
             f"color: {color}; font-size: 13px; font-weight: 700; background: transparent;"
         )
         full_lbl = QLabel(cfg["full"])
         full_lbl.setStyleSheet(
-            "color: rgba(255,255,255,0.4); font-size: 10px; background: transparent;"
+            "color: rgba(255,255,255,0.35); font-size: 10px; background: transparent;"
         )
-        title_col.addWidget(name_lbl)
-        title_col.addWidget(full_lbl)
-        hrow.addLayout(title_col, 1)
+        name_col.addWidget(name_lbl)
+        name_col.addWidget(full_lbl)
+        top.addLayout(name_col, 1)
 
-        # Status dot
-        status_dot = QLabel("●")
-        status_dot.setObjectName(f"portalDot_{key}")
-        status_dot.setStyleSheet(
-            "color: rgba(255,255,255,0.2); font-size: 10px; background: transparent;"
+        dot = QLabel("●")
+        dot.setObjectName(f"portalDot_{key}")
+        dot.setStyleSheet(
+            "color: rgba(255,255,255,0.18); font-size: 9px; background: transparent;"
         )
-        hrow.addWidget(status_dot)
-        layout.addLayout(hrow)
+        top.addWidget(dot)
+        layout.addLayout(top)
 
-        # Status label
         status_lbl = QLabel("No file uploaded")
         status_lbl.setObjectName(f"portalStatus_{key}")
         status_lbl.setWordWrap(True)
         status_lbl.setStyleSheet(
-            "color: rgba(255,255,255,0.35); font-size: 11px; background: transparent;"
+            "color: rgba(255,255,255,0.3); font-size: 11px; background: transparent;"
         )
         layout.addWidget(status_lbl)
 
-        # Browse button
-        browse_btn = QPushButton("Browse File")
-        browse_btn.setObjectName(f"portalBrowseBtn_{key}")
-        browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        browse_btn.setFixedHeight(32)
-        browse_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent;
-                border: 1px solid {color}66;
-                border-radius: 6px;
-                color: {color};
-                font-size: 11px;
-                font-weight: 600;
-                padding: 0 14px;
-            }}
-            QPushButton:hover {{
-                background-color: {color}18;
-            }}
-        """)
-        browse_btn.clicked.connect(lambda _, k=key: self._browse_portal(k))
-        layout.addWidget(browse_btn)
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(0)
 
-        return card
+        btn = QPushButton("  Browse File")
+        btn.setObjectName("predPortalBtn")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(30)
+        btn.setFixedWidth(120)
+        btn.clicked.connect(lambda _, k=key: self._browse_portal(k))
+        btn_row.addWidget(btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
 
-    # ------------------------------------------------------------------
-    # Step 3 — Merge & Clean
-    # ------------------------------------------------------------------
+        return tile
 
     def _build_merge_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("predictionCard")
+        card.setObjectName("predCardMerge")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        layout.addWidget(self._card_title("STEP 3 · MERGE & CLEAN"))
+        layout.addWidget(self._step_label("03", "Merge & Clean"))
 
         self._merge_hint = QLabel("Upload all four portal datasets to enable merging.")
-        self._merge_hint.setObjectName("predictionHint")
+        self._merge_hint.setObjectName("predHint")
         self._merge_hint.setWordWrap(True)
         layout.addWidget(self._merge_hint)
 
-        # Merge report area (hidden until merge runs)
         self._merge_report_lbl = QLabel("")
-        self._merge_report_lbl.setObjectName("predictionHint")
+        self._merge_report_lbl.setObjectName("predSuccess")
         self._merge_report_lbl.setWordWrap(True)
         self._merge_report_lbl.hide()
         layout.addWidget(self._merge_report_lbl)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(12)
+        btn_row.setSpacing(10)
 
         self._merge_btn = QPushButton("⚙  Merge Portals")
-        self._merge_btn.setObjectName("predictionPipelineBtn")
+        self._merge_btn.setObjectName("predPrimaryBtn")
         self._merge_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._merge_btn.setFixedHeight(38)
-        self._merge_btn.setFixedWidth(160)
+        self._merge_btn.setFixedHeight(36)
         self._merge_btn.clicked.connect(self._run_merge)
 
         self._view_merged_btn = QPushButton("👁  View Merged")
-        self._view_merged_btn.setObjectName("predictionSecondaryBtn")
+        self._view_merged_btn.setObjectName("predSecondaryBtn")
         self._view_merged_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._view_merged_btn.setFixedHeight(38)
+        self._view_merged_btn.setFixedHeight(36)
         self._view_merged_btn.clicked.connect(self._view_merged)
 
         self._clean_btn = QPushButton("🧹  Clean Data")
-        self._clean_btn.setObjectName("predictionSecondaryBtn")
+        self._clean_btn.setObjectName("predSecondaryBtn")
         self._clean_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._clean_btn.setFixedHeight(38)
+        self._clean_btn.setFixedHeight(36)
         self._clean_btn.clicked.connect(self._clean_data)
 
         btn_row.addWidget(self._merge_btn)
@@ -477,77 +675,82 @@ class PredictionPage(PredictionMixin, QWidget):
         layout.addLayout(btn_row)
         return card
 
-    # ------------------------------------------------------------------
-    # Step 4 — Run Pipeline & Predict
-    # ------------------------------------------------------------------
-
     def _build_fused_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("predictionCard")
+        card.setObjectName("predCardPredict")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        layout.addWidget(self._card_title("STEP 4 · RUN PIPELINE & PREDICT"))
+        top_row = QHBoxLayout()
+        top_row.setSpacing(20)
 
-        header_row = QHBoxLayout()
-        text_col = QVBoxLayout()
-        text_col.setSpacing(4)
-
+        label_col = QVBoxLayout()
+        label_col.setSpacing(6)
+        label_col.addWidget(self._step_label("04", "Run Pipeline & Predict"))
         self._fused_hint = QLabel("Merge the portal datasets to enable prediction.")
-        self._fused_hint.setObjectName("predictionHint")
+        self._fused_hint.setObjectName("predHint")
         self._fused_hint.setWordWrap(True)
-        text_col.addWidget(self._fused_hint)
+        label_col.addWidget(self._fused_hint)
 
         self._fused_btn = QPushButton("⚡  Run Pipeline & Predict")
-        self._fused_btn.setObjectName("predictionPredictBtn")
+        self._fused_btn.setObjectName("predRunBtn")
         self._fused_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._fused_btn.setFixedWidth(210)
+        self._fused_btn.setFixedWidth(220)
         self._fused_btn.setFixedHeight(42)
         self._fused_btn.clicked.connect(self._on_fused_clicked)
 
-        header_row.addLayout(text_col, 1)
-        header_row.addWidget(self._fused_btn)
-        layout.addLayout(header_row)
+        top_row.addLayout(label_col, 1)
+        top_row.addWidget(self._fused_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(top_row)
 
         self._progress_bar = QProgressBar()
         self._progress_bar.setValue(0)
         self._progress_bar.setTextVisible(False)
         self._progress_bar.setFixedHeight(6)
-        self._progress_bar.setStyleSheet("""
-            QProgressBar {
-                background-color: rgba(255,255,255,0.08);
-                border-radius: 3px; border: none;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4f8cff, stop:1 #34d399);
-                border-radius: 3px;
-            }
-        """)
-        self._progress_bar.hide()
+        self._progress_bar.setObjectName("predProgressBar")
+        layout.addWidget(self._progress_bar)
 
         self._progress_label = QLabel("")
-        self._progress_label.setObjectName("predictionHint")
-        self._progress_label.hide()
-
-        layout.addWidget(self._progress_bar)
+        self._progress_label.setObjectName("predHint")
         layout.addWidget(self._progress_label)
+
         return card
 
     # ------------------------------------------------------------------
     # UI helpers
     # ------------------------------------------------------------------
 
-    def _card_title(self, text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setObjectName("predictionCardTitle")
-        return lbl
+    def _step_label(self, number: str, title: str) -> QWidget:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.setContentsMargins(0, 0, 0, 0)
+
+        num = QLabel(number)
+        num.setObjectName("predStepNumber")
+        num.setFixedWidth(28)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(16)
+        sep.setStyleSheet("background: rgba(255,255,255,0.18); border: none;")
+
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName("predStepTitle")
+
+        row.addWidget(num)
+        row.addWidget(sep)
+        row.addWidget(title_lbl)
+        row.addStretch()
+
+        host = QWidget()
+        host.setLayout(row)
+        return host
 
     def _input_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setObjectName("predictionInputLabel")
+        lbl.setObjectName("predInputLabel")
         return lbl
 
     # ------------------------------------------------------------------
@@ -557,13 +760,9 @@ class PredictionPage(PredictionMixin, QWidget):
     def _all_portals_uploaded(self) -> bool:
         return all(v is not None for v in self._portal_data.values())
 
-    def _inputs_filled(self) -> bool:
-        return (bool(self._name_input.text().strip())
-                and bool(self._year_input.text().strip()))
-
     def _refresh_button_states(self):
-        all_up  = self._all_portals_uploaded()
-        merged  = self._merged and self._merged_rows is not None
+        all_up = self._all_portals_uploaded()
+        merged = self._merged and self._merged_rows is not None
 
         self._merge_btn.setEnabled(all_up)
         self._view_merged_btn.setEnabled(merged)
@@ -573,9 +772,7 @@ class PredictionPage(PredictionMixin, QWidget):
         if not all_up:
             missing = [_PORTAL_CONFIG[k]["label"]
                        for k, v in self._portal_data.items() if v is None]
-            self._merge_hint.setText(
-                f"Still needed: {', '.join(missing)}"
-            )
+            self._merge_hint.setText(f"Still needed: {', '.join(missing)}")
         elif not merged:
             self._merge_hint.setText(
                 "All portals ready — click Merge Portals to unify the datasets."
@@ -596,35 +793,34 @@ class PredictionPage(PredictionMixin, QWidget):
                 "and results saved to the database."
             )
         else:
-            self._fused_hint.setText(
-                "Merge the portal datasets to enable prediction."
-            )
+            self._fused_hint.setText("Merge the portal datasets to enable prediction.")
 
     def _update_portal_card_ui(self, key: str):
-        """Refresh the status dot + label for a single portal card."""
         cfg   = _PORTAL_CONFIG[key]
         color = cfg["color"]
         data  = self._portal_data[key]
+        tile  = self._portal_cards[key]
 
-        dot   = self._portal_cards[key].findChild(QLabel, f"portalDot_{key}")
-        lbl   = self._portal_cards[key].findChild(QLabel, f"portalStatus_{key}")
+        dot = tile.findChild(QLabel, f"portalDot_{key}")
+        lbl = tile.findChild(QLabel, f"portalStatus_{key}")
 
         if data is None:
-            if dot: dot.setStyleSheet(
-                "color: rgba(255,255,255,0.2); font-size: 10px; background: transparent;"
-            )
+            if dot:
+                dot.setStyleSheet(
+                    "color: rgba(255,255,255,0.18); font-size: 9px; background: transparent;"
+                )
             if lbl:
                 lbl.setText("No file uploaded")
                 lbl.setStyleSheet(
-                    "color: rgba(255,255,255,0.35); font-size: 11px; background: transparent;"
+                    "color: rgba(255,255,255,0.3); font-size: 11px; background: transparent;"
                 )
         else:
-            if dot: dot.setStyleSheet(
-                f"color: {color}; font-size: 10px; background: transparent;"
-            )
+            if dot:
+                dot.setStyleSheet(
+                    f"color: {color}; font-size: 9px; background: transparent;"
+                )
             if lbl:
-                rc = data["row_count"]
-                lbl.setText(f"✓  {rc:,} rows · {len(data['headers'])} columns")
+                lbl.setText(f"✓  {data['row_count']:,} rows · {len(data['headers'])} columns")
                 lbl.setStyleSheet(
                     f"color: {color}; font-size: 11px; background: transparent;"
                 )
@@ -634,65 +830,46 @@ class PredictionPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _browse_portal(self, key: str):
-        cfg = _PORTAL_CONFIG[key]
+        cfg  = _PORTAL_CONFIG[key]
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            f"Select {cfg['full']} dataset",
-            "",
+            self, f"Select {cfg['full']} dataset", "",
             "Data Files (*.xlsx *.xls *.csv);;All Files (*)",
         )
         if not path:
             return
-
         try:
             df = read_excel_file(path)
         except Exception as e:
-            show_error(
-                self, "Upload Failed",
-                f"Could not read the {cfg['label']} file.",
-                str(e),
-            )
+            show_error(self, "Upload Failed",
+                       f"Could not read the {cfg['label']} file.", str(e))
             return
 
         headers, rows = dataframe_to_rows(df)
         if not headers or not rows:
-            show_warning(
-                self, "Empty File",
-                f"The {cfg['label']} file contains no usable rows.",
-            )
+            show_warning(self, "Empty File",
+                         f"The {cfg['label']} file contains no usable rows.")
             return
 
-        # Reject files that are clearly training outputs
         wrong = self._detect_engineered_columns(headers)
         if wrong:
-            show_error(
-                self, "Wrong File Type",
-                f"The {cfg['label']} file contains processed feature columns.",
-                f"Unexpected columns: {', '.join(wrong[:5])}"
-                + (" and more…" if len(wrong) > 5 else ""),
-            )
+            show_error(self, "Wrong File Type",
+                       f"The {cfg['label']} file contains processed feature columns.",
+                       f"Unexpected columns: {', '.join(wrong[:5])}"
+                       + (" and more…" if len(wrong) > 5 else ""))
             return
 
-        self._portal_data[key] = {
-            "headers":   headers,
-            "rows":      rows,
-            "row_count": len(rows),
-        }
-
-        # Reset merge state whenever any portal changes
-        self._merged         = False
-        self._cleaned        = False
+        self._portal_data[key] = {"headers": headers, "rows": rows, "row_count": len(rows)}
+        self._merged  = False
+        self._cleaned = False
         self._merged_headers = None
         self._merged_rows    = None
         self._merge_report_lbl.hide()
-
         self._update_portal_card_ui(key)
         self._refresh_button_states()
 
         DataStore.get().add_activity(
             f"{cfg['label']} dataset uploaded — {len(rows):,} rows",
-            icon=cfg["icon"],
-            color=cfg["color"],
+            icon=cfg["icon"], color=cfg["color"],
         )
 
     # ------------------------------------------------------------------
@@ -702,62 +879,61 @@ class PredictionPage(PredictionMixin, QWidget):
     def _run_merge(self):
         if not self._all_portals_uploaded():
             return
-
         from services.merge_engine import MergeEngine
 
-        # Build portals dict in the format MergeEngine expects
-        portals = {
-            k: {"headers": v["headers"], "rows": v["rows"]}
-            for k, v in self._portal_data.items()
-        }
-
+        portals = {k: {"headers": v["headers"], "rows": v["rows"]}
+                   for k, v in self._portal_data.items()}
         result = MergeEngine.merge(portals)
 
         if not result.success:
-            show_error(
-                self,
-                "Merge Failed",
-                "The portal datasets could not be merged.",
-                "\n".join(result.report.errors),
-            )
+            show_error(self, "Merge Failed",
+                       "The portal datasets could not be merged.",
+                       "\n".join(result.report.errors))
             return
 
         self._merged_headers = result.headers
         self._merged_rows    = result.rows
-        self._merged         = True
-        self._cleaned        = False
+        self._merged  = True
+        self._cleaned = False
 
         r = result.report
         report_text = (
-            f"✓  Merged  ·  {r.total_merged:,} students  ·  "
-            f"{len(result.headers)} unified columns  ·  "
-            f"Coverage: {r.coverage_pct:.0f}%"
+            f"✓  {r.total_merged:,} students  ·  {len(result.headers)} columns  ·  "
+            f"Coverage {r.coverage_pct:.0f}%"
         )
         if any(r.unmatched.values()):
-            unmatched_parts = [
-                f"{_PORTAL_CONFIG[k]['label']}: {v:,} unmatched"
-                for k, v in r.unmatched.items() if v
-            ]
-            report_text += f"  ·  {',  '.join(unmatched_parts)}"
+            parts = [f"{_PORTAL_CONFIG[k]['label']}: {v:,} unmatched"
+                     for k, v in r.unmatched.items() if v]
+            report_text += f"  ·  {',  '.join(parts)}"
 
         self._merge_report_lbl.setText(report_text)
-        self._merge_report_lbl.setStyleSheet(
-            "color: #34d399; font-size: 12px; background: transparent;"
-        )
         self._merge_report_lbl.show()
 
-        name        = self._name_input.text().strip()
-        school_year = self._year_input.text().strip()
         DataStore.get().add_activity(
-            f"Portals merged for prediction — \"{name}\" ({school_year}), "
-            f"{r.total_merged:,} students",
-            icon="⚙",
-            color=ACCENT,
+            f"Portals merged — {r.total_merged:,} students  ·  "
+            f"\"{self._name_input.text().strip()}\" "
+            f"({self._academic_year_combo.currentText()})",
+            icon="⚙", color=ACCENT,
         )
+
+        try:
+            from services.activity_logger import ActivityLogger
+            _conn = DataStore.get().db_conn
+            if _conn:
+                ActivityLogger.log_merge(
+                    _conn,
+                    total_merged = r.total_merged,
+                    coverage_pct = float(r.coverage_pct),
+                    dataset_name = self._name_input.text().strip(),
+                )
+                _conn.commit()
+        except Exception as _e:
+            print(f"[PredictionPage] Merge log error: {_e}")
+
         self._refresh_button_states()
 
     # ------------------------------------------------------------------
-    # View / Clean merged dataset
+    # View / Clean
     # ------------------------------------------------------------------
 
     def _view_merged(self):
@@ -775,34 +951,55 @@ class PredictionPage(PredictionMixin, QWidget):
     def _clean_data(self):
         if not self._merged or not self._merged_rows:
             return
-
         clean = CleanDataWindow(
-            self._merged_headers,
-            self._merged_rows,
-            _DATASET_CONFIG,
-            parent=self,
+            self._merged_headers, self._merged_rows, _DATASET_CONFIG, parent=self,
         )
         if not clean.exec():
             return
-
         self._merged_headers = list(clean.cleaned_headers)
         self._merged_rows    = [list(r) for r in clean.cleaned_rows]
         self._cleaned        = True
-
         self._merge_report_lbl.setText(
             f"✓  Merged & cleaned  ·  {len(self._merged_rows):,} rows  ·  "
             f"{len(self._merged_headers)} columns — ready to predict"
         )
-        self._merge_report_lbl.setStyleSheet(
-            "color: #34d399; font-size: 12px; background: transparent;"
-        )
-
         DataStore.get().add_activity(
             f"Merged dataset cleaned — {len(self._merged_rows):,} rows",
-            icon="🧹",
-            color="#34d399",
+            icon="🧹", color="#34d399",
         )
         self._refresh_button_states()
+
+    # ------------------------------------------------------------------
+    # Duplicate term check
+    # ------------------------------------------------------------------
+
+    def _check_existing_prediction(self, academic_year: str, semester: int) -> int:
+        """
+        Return the count of rows already saved in fact_student_academic_risk
+        for the given (academic_year, semester).
+        Returns 0 if the DB is unavailable or the term has no records.
+        """
+        conn = DataStore.get().db_conn
+        if not conn:
+            return 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM   public.fact_student_academic_risk fsr
+                    JOIN   public.dim_academic_term t
+                           ON t.term_key = fsr.term_key
+                    WHERE  t.academic_year = %s
+                      AND  t.semester      = %s
+                    """,
+                    (academic_year, semester),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as exc:
+            print(f"[PredictionPage] Term existence check failed: {exc}")
+            return 0   # fail open — don't block the user on a DB error
 
     # ------------------------------------------------------------------
     # Fused Run Pipeline & Predict
@@ -812,23 +1009,16 @@ class PredictionPage(PredictionMixin, QWidget):
         if not self._merged or not self._merged_rows:
             return
 
-        # Validate required fields before launching worker
         name        = self._name_input.text().strip()
-        school_year = self._year_input.text().strip()
+        school_year = self._academic_year_combo.currentText()
         if not name or not school_year:
-            show_warning(
-                self,
-                "Missing Details",
-                "Please fill in the Dataset Name and School Year (Step 1) "
-                "before running prediction.",
-            )
-            # Scroll to top so user sees Step 1
+            show_warning(self, "Missing Details",
+                         "Fill in the Dataset Name and School Year (Step 01) "
+                         "before running prediction.")
             self._name_input.setFocus()
             return
 
         store = DataStore.get()
-
-        # Ensure model is loaded
         if not store.trained_model:
             from services.model_registry import ModelRegistry
             pkg = ModelRegistry.load_latest_model()
@@ -842,14 +1032,32 @@ class PredictionPage(PredictionMixin, QWidget):
                 }
                 store.model_ready = True
             else:
-                show_warning(
-                    self,
-                    "No Trained Model",
-                    "No trained model was found.",
-                    "Complete Model Training first, then return here to run prediction.",
-                )
+                show_warning(self, "No Trained Model",
+                             "No trained model was found.",
+                             "Complete Model Training first, then return here.")
                 return
 
+        # ── Duplicate term check ──────────────────────────────────────
+        # Query the DB before showing the confirmation dialog.
+        # If this (academic_year, semester) already has saved predictions,
+        # warn the user and require explicit confirmation to overwrite.
+        academic_year, semester = self._get_selected_term()
+        existing_count = self._check_existing_prediction(academic_year, semester)
+        if existing_count > 0:
+            sem_label = "1st" if semester == 1 else "2nd"
+            overwrite_dlg = ConfirmationDialog(
+                "Prediction Already Exists",
+                f"{academic_year} — {sem_label} Semester already has "
+                f"{existing_count:,} saved prediction records.",
+                detail="Running again will overwrite the existing results for "
+                       "this term. Do you want to continue?",
+                confirm_label="Overwrite",
+                parent=self,
+            )
+            if not overwrite_dlg.exec():
+                return
+
+        # ── Normal confirmation ───────────────────────────────────────
         dialog = ConfirmationDialog(
             "Run Pipeline & Predict",
             f"Score {len(self._merged_rows):,} students in \"{name}\" ({school_year})?",
@@ -862,26 +1070,28 @@ class PredictionPage(PredictionMixin, QWidget):
 
         self._fused_btn.setEnabled(False)
         self._progress_bar.setValue(0)
-        self._progress_bar.show()
         self._progress_label.setText("Starting…")
-        self._progress_label.show()
         self.overlay.set_message("Running Pipeline & Prediction…", "Engineering features")
         self.overlay.show()
 
         self._fused_worker = _FusedPredictionWorker(
-            headers     = self._merged_headers,
-            rows        = self._merged_rows,
-            name        = name,
-            school_year = school_year,
+            headers       = self._merged_headers,
+            rows          = self._merged_rows,
+            name          = name,
+            school_year   = school_year,
+            academic_year = academic_year,
+            semester      = semester,
         )
         self._fused_worker.progress.connect(self._on_fused_progress)
         self._fused_worker.finished.connect(self._on_fused_finished)
         self._fused_worker.error.connect(self._on_fused_error)
         self._fused_worker.finished.connect(
-            self._fused_worker.deleteLater, Qt.ConnectionType.QueuedConnection
+            self._fused_worker.deleteLater,
+            Qt.ConnectionType.QueuedConnection,
         )
         self._fused_worker.error.connect(
-            self._fused_worker.deleteLater, Qt.ConnectionType.QueuedConnection
+            self._fused_worker.deleteLater,
+            Qt.ConnectionType.QueuedConnection,
         )
         self._fused_worker.start()
 
@@ -892,24 +1102,19 @@ class PredictionPage(PredictionMixin, QWidget):
 
     def _on_fused_finished(self, result):
         self._progress_bar.setValue(100)
-        self._fused_worker = None
-        self._on_prediction_complete(result)
-        self._progress_bar.hide()
-        self._progress_label.hide()
+        self._progress_label.setText("Done ✅")
         self._fused_btn.setEnabled(True)
+        self._on_prediction_complete(result)
+        self._fused_worker = None
 
     def _on_fused_error(self, error_msg: str):
         self.overlay.hide()
-        self._progress_bar.hide()
-        self._progress_label.hide()
+        self._progress_bar.setValue(0)
+        self._progress_label.setText("")
         self._fused_btn.setEnabled(True)
         self._fused_worker = None
-        show_error(
-            self,
-            "Pipeline & Prediction Failed",
-            "The operation could not complete.",
-            error_msg,
-        )
+        show_error(self, "Pipeline & Prediction Failed",
+                   "The operation could not complete.", error_msg)
 
     # ------------------------------------------------------------------
     # PredictionMixin hook
@@ -920,19 +1125,19 @@ class PredictionPage(PredictionMixin, QWidget):
             return
         s    = result.summary
         name = self._name_input.text().strip()
-        yr   = self._year_input.text().strip()
+        yr   = self._academic_year_combo.currentText()
         self._fused_hint.setText(
             f"✓  Scored {s.total:,} students  ·  {s.high_risk:,} high-risk  ·  "
             f"\"{name}\" ({yr})  ·  Saved to database."
         )
 
     # ------------------------------------------------------------------
-    # Validation helper
+    # Validation
     # ------------------------------------------------------------------
 
     @staticmethod
     def _detect_engineered_columns(headers: list) -> list[str]:
-        _ENGINEERED_MARKERS = {
+        _MARKERS = {
             "risk_label", "Entrance_Exam_Tier", "HS_Performance_Tier",
             "Strand_Program_Match", "Financial_Stress", "First_Gen_Student",
             "Has_Scholarship", "Gap_Years", "Private_HS", "Has_HS_Honors",
@@ -940,79 +1145,11 @@ class PredictionPage(PredictionMixin, QWidget):
             "Program_Risk_Index", "Municipality_Risk_Index",
             "GPA_Tier", "Has_College_Grade", "Year_Level",
         }
-        return sorted(_ENGINEERED_MARKERS & {h.strip() for h in headers})
+        return sorted(_MARKERS & {h.strip() for h in headers})
 
-    # ------------------------------------------------------------------
-    # Styles
-    # ------------------------------------------------------------------
+    def _apply_styles(self):
+        pass  # Styles defined in theme.qss
 
-    def _apply_page_styles(self):
-        self.setStyleSheet(f"""
-            #predictionModelCard {{
-                background-color: rgba(0,0,0,0.2);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 12px;
-            }}
-            #predictionModelStatus {{
-                color: #2ecc71; font-weight: bold; font-size: 12px;
-            }}
-            #predictionCard {{
-                background-color: rgba(0,0,0,0.22);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 14px;
-            }}
-            #predictionCardTitle {{
-                color: rgba(255,255,255,0.45);
-                font-size: 11px; font-weight: bold; letter-spacing: 1px;
-            }}
-            #predictionHint {{
-                color: rgba(255,255,255,0.5); font-size: 12px;
-            }}
-            #predictionInputLabel {{
-                color: rgba(255,255,255,0.75);
-                font-size: 12px; font-weight: 600;
-            }}
-            #predictionInput {{
-                background-color: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 8px; color: white;
-                font-size: 13px; padding: 9px 12px;
-            }}
-            #predictionInput:focus {{ border: 1px solid {ACCENT}; }}
-            #predictionSecondaryBtn {{
-                background-color: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.14);
-                border-radius: 8px; color: rgba(255,255,255,0.85);
-                font-size: 12px; font-weight: 600; padding: 0 18px;
-            }}
-            #predictionSecondaryBtn:hover {{
-                background-color: rgba(255,255,255,0.12);
-            }}
-            #predictionSecondaryBtn:disabled {{
-                background-color: rgba(255,255,255,0.03);
-                color: rgba(255,255,255,0.3);
-                border-color: rgba(255,255,255,0.06);
-            }}
-            #predictionPredictBtn {{
-                background-color: #2ecc71; border: none;
-                border-radius: 8px; color: white;
-                font-size: 13px; font-weight: 700; padding: 0 20px;
-            }}
-            #predictionPredictBtn:hover {{ background-color: #29b765; }}
-            #predictionPredictBtn:disabled {{
-                background-color: rgba(255,255,255,0.08);
-                color: rgba(255,255,255,0.35);
-            }}
-            #predictionPipelineBtn {{
-                background-color: {ACCENT}; border: none;
-                border-radius: 8px; color: white;
-                font-size: 12px; font-weight: 700; padding: 0 20px;
-            }}
-            #predictionPipelineBtn:hover {{
-                background-color: rgba(79,140,255,0.85);
-            }}
-            #predictionPipelineBtn:disabled {{
-                background-color: rgba(255,255,255,0.08);
-                color: rgba(255,255,255,0.35);
-            }}
-        """)
+    def closeEvent(self, event):
+        DataStore.get().remove_listener(self._on_store_updated)
+        super().closeEvent(event)

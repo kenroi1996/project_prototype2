@@ -1,14 +1,6 @@
 from PyQt6.QtWidgets import (
-    QWidget,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QHBoxLayout,
-    QFrame,
-    QLineEdit,
-    QComboBox,
-    QProgressBar,
-    QGraphicsOpacityEffect,
+    QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QFrame, QLineEdit, QComboBox, QProgressBar, QGraphicsOpacityEffect,
     QGridLayout,
 )
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
@@ -18,14 +10,13 @@ from .student_profile_drawer import StudentProfileDrawer
 from ui.components.loading_overlay import LoadingOverlay
 from ui.mixins.prediction_mixin import PredictionMixin
 from services.data_store import DataStore
+from services.system_config import SystemConfig
 
 
 TABLE_COLUMNS = [
     ("STUDENT ID",     1),
     ("NAME",           2),
     ("COLLEGE",        1),
-    ("GWA",            1),
-    ("ABSENCES",       1),
     ("RISK SCORE",     2),
     ("RISK LEVEL",     1),
     ("PRIMARY FACTOR", 2),
@@ -107,9 +98,6 @@ class StudentCohortPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _go_to_prediction_page(self):
-        """Navigate to the Prediction page instead of triggering prediction
-        directly from here — which would use already-engineered data and
-        produce 0 or 100 risk scores."""
         from PyQt6.QtWidgets import QStackedWidget
         widget = self.parent()
         while widget is not None:
@@ -122,8 +110,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
             widget = widget.parent()
         from ui.dialogs.confirmation_dialog import show_info
         show_info(
-            self,
-            "Go to Prediction",
+            self, "Go to Prediction",
             "Navigate to the Prediction page to upload portal datasets "
             "and run prediction.",
             "Use the sidebar or navigation to switch pages.",
@@ -280,7 +267,6 @@ class StudentCohortPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _build_empty_state(self) -> QWidget:
-        """Placeholder shown when no prediction results are available."""
         host = QWidget()
         layout = QVBoxLayout(host)
         layout.setContentsMargins(0, 60, 0, 60)
@@ -305,8 +291,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setWordWrap(True)
         sub.setStyleSheet(
-            "color: rgba(255,255,255,0.35); font-size: 12px; "
-            "background: transparent;"
+            "color: rgba(255,255,255,0.35); font-size: 12px; background: transparent;"
         )
 
         go_btn = QPushButton("⚡  Go to Prediction")
@@ -315,8 +300,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         go_btn.setStyleSheet("""
             QPushButton {
-                background-color: #2ecc71;
-                border: none; border-radius: 8px;
+                background-color: #2ecc71; border: none; border-radius: 8px;
                 color: white; font-size: 13px; font-weight: 700;
             }
             QPushButton:hover { background-color: #29b765; }
@@ -360,7 +344,6 @@ class StudentCohortPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _populate_table(self, students):
-        """Rebuild the cohort table rows from a list of student dicts."""
         while self.rows_layout.count():
             item   = self.rows_layout.takeAt(0)
             widget = item.widget()
@@ -382,19 +365,15 @@ class StudentCohortPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _prediction_to_student(self, pred: dict) -> dict:
-        """Map a PredictionEngine record to the cohort table/drawer schema."""
         category = pred.get("category", "low_risk")
-
         try:
             gwa = float(pred.get("gwa") or 0)
         except (TypeError, ValueError):
             gwa = 0.0
-
         try:
             absences = int(float(pred.get("absences") or 0))
         except (TypeError, ValueError):
             absences = 0
-
         return {
             "name":         pred.get("name", "—"),
             "id":           str(pred.get("student_id", "—")),
@@ -410,32 +389,34 @@ class StudentCohortPage(PredictionMixin, QWidget):
         }
 
     def _on_store_updated(self, key: str):
+        if key in ("system_config", "all"):
+            self._refresh_term_labels()
         if key in ("predictions", "all"):
             result = DataStore.get().predictions
             if result and result.success:
                 self._apply_predictions(result)
 
+    def _refresh_term_labels(self):
+        if hasattr(self, "_ay_sub_lbl"):
+            self._ay_sub_lbl.setText(f"Academic Year {SystemConfig.academic_year()}")
+        if hasattr(self, "_sem_pill_lbl"):
+            self._sem_pill_lbl.setText(f"{SystemConfig.term_label()}  ▾")
+
     def _apply_predictions(self, result):
-        """Rebuild the cohort table from real prediction results."""
         if not result or not result.success:
             return
-
         students = [self._prediction_to_student(p) for p in result.predictions]
         self._populate_table(students)
-
         total    = len(students)
         high     = sum(1 for s in students if s["risk_level"] == "High")
         moderate = sum(1 for s in students if s["risk_level"] == "Moderate")
-
         self.explorer_meta.setText(
             f"{total:,} students scored  ·  "
             f"{high:,} high-risk  ·  {moderate:,} moderate  ·  "
             f"Click a student to view full profile"
         )
-
         if self._profile_drawer is not None and self._profile_drawer._is_open:
             self._profile_drawer.close_drawer()
-
         self._apply_filters()
 
     # ------------------------------------------------------------------
@@ -463,11 +444,11 @@ class StudentCohortPage(PredictionMixin, QWidget):
         header = QLabel("Student Cohort")
         header.setObjectName("header")
 
-        subheader = QLabel("Academic Year 2024–2025")
-        subheader.setObjectName("subHeader")
+        self._ay_sub_lbl = QLabel(f"Academic Year {SystemConfig.academic_year()}")
+        self._ay_sub_lbl.setObjectName("subHeader")
 
         header_text_layout.addWidget(header)
-        header_text_layout.addWidget(subheader)
+        header_text_layout.addWidget(self._ay_sub_lbl)
         header_layout.addLayout(header_text_layout)
         header_layout.addStretch()
 
@@ -490,21 +471,22 @@ class StudentCohortPage(PredictionMixin, QWidget):
         status_animation.setLoopCount(-1)
         status_animation.start()
 
-        semester_pill = QLabel("1st Semester 2024–25  ▾")
-        semester_pill.setObjectName("cohortSemesterPill")
+        self._sem_pill_lbl = QLabel(f"{SystemConfig.term_label()}  ▾")
+        self._sem_pill_lbl.setObjectName("cohortSemesterPill")
 
-        # "Go to Prediction →" instead of "Run Prediction"
-        # Triggering prediction directly from here used store.get_prediction_dataset()
-        # which returns already-engineered data → 0 or 100 risk scores.
         run_button = QPushButton("Go to Prediction →")
         run_button.setObjectName("runButton")
         run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         run_button.setIcon(QIcon("assets/icons/play.svg"))
         run_button.clicked.connect(self._go_to_prediction_page)
         run_button.setFixedWidth(155)
+        # Hide for counselors
+        from services.auth_service import AuthService
+        if (AuthService.current_role() or "").strip().lower() == "counselor":
+            run_button.hide()
 
         model_layout.addWidget(model_status)
-        model_layout.addWidget(semester_pill)
+        model_layout.addWidget(self._sem_pill_lbl)
         model_layout.addWidget(run_button)
         model_card.setLayout(model_layout)
         header_layout.addWidget(model_card)
@@ -583,7 +565,6 @@ class StudentCohortPage(PredictionMixin, QWidget):
         self.rows_layout = QVBoxLayout()
         self.rows_layout.setSpacing(0)
 
-        # Start with the empty state — no mock data
         self._populate_table([])
 
         rows_host = QWidget()

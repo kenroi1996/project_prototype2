@@ -1,26 +1,20 @@
+import gzip
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
+
+# Path for persisting the raw merged dataset between app restarts.
+# Stored as gzip-compressed JSON so it loads fast and takes minimal disk space.
+_RAW_CACHE_PATH = Path("outputs/_raw_merged_cache.json.gz")
 
 
 # =============================================================================
 # Thread-safe notification relay
 # =============================================================================
-# DataStore._notify() can be called from any thread (e.g. TrainingWorker).
-# Listeners are UI callbacks that touch QWidgets and must run on the main
-# thread. _NotifyRelay is a QObject whose signal is always delivered via a
-# Qt QueuedConnection, which guarantees the slot executes on the main thread
-# regardless of which thread emitted it.
-#
-# Import is deferred to avoid pulling PyQt6 into pure-logic test contexts —
-# _NotifyRelay is constructed lazily on first use.
-# =============================================================================
 
 class _NotifyRelay:
-    """
-    Thin wrapper around a pyqtSignal so DataStore can fire listener callbacks
-    on the main thread even when _notify() is called from a worker thread.
-    """
     _instance = None
 
     @classmethod
@@ -30,17 +24,14 @@ class _NotifyRelay:
         return cls._instance
 
     def __init__(self):
-        # Build the QObject subclass dynamically so that importing data_store
-        # in a non-Qt context (unit tests, CLI scripts) doesn't crash.
         from PyQt6.QtCore import QObject, pyqtSignal
 
         class _Relay(QObject):
-            notify = pyqtSignal(str)   # carries the changed key
+            notify = pyqtSignal(str)
 
         self._relay = _Relay()
 
     def connect(self, slot):
-        """Connect a listener slot — always delivered on the main thread."""
         from PyQt6.QtCore import Qt
         self._relay.notify.connect(slot, Qt.ConnectionType.QueuedConnection)
 
@@ -51,7 +42,6 @@ class _NotifyRelay:
             pass
 
     def emit(self, key: str):
-        """Emit from any thread; Qt delivers it on the main thread."""
         self._relay.notify.emit(key)
 
 
@@ -63,6 +53,28 @@ class DataStore:
     """
     Central singleton that holds cleaned datasets from all four portals.
     Access anywhere in the app via DataStore.get().
+
+    DATASET SLOTS
+    -------------
+    raw_merged_dataset   : raw output from MergeEngine — headers + rows that
+                           still contain Final_Avg_GRD and all original columns.
+                           Used as the sole input to TrainingEngine so retraining
+                           always starts from unmodified data regardless of how
+                           many pipeline or prediction runs have happened since
+                           the last merge.
+
+                           Persisted to disk (_RAW_CACHE_PATH) immediately after
+                           each merge so it survives app restarts — retraining
+                           works correctly without forcing a re-merge every session.
+
+                           NEVER overwritten by the pipeline or prediction flow.
+                           Only replaced by a new merge run or clear_all().
+
+    unified_dataset      : current "active" dataset used by the pipeline and
+                           prediction engine.  After a merge this equals the raw
+                           merged data.  After a prediction run it may hold the
+                           incoming student dataset.
+                           Training NEVER reads from this slot.
     """
 
     _instance = None
@@ -74,7 +86,6 @@ class DataStore:
         return cls._instance
 
     def __init__(self):
-        # Each value: None or {"headers": list, "rows": list, "timestamp": str, "row_count": int}
         self.portals: dict = {
             "mis":       None,
             "sao":       None,
@@ -82,8 +93,11 @@ class DataStore:
             "registrar": None,
         }
 
-        self._original_unified_dataset = None
-        self.unified_dataset     = None
+        # ── Two separate dataset slots ─────────────────────────────────────────
+        self.raw_merged_dataset          = None   # raw merge output — training source
+        self._original_unified_dataset   = None   # kept for prediction engine back-compat
+        self.unified_dataset             = None   # engineered / active dataset
+
         self.trained_model       = None
         self.model_ready         = False
         self.predictions         = None
@@ -92,21 +106,96 @@ class DataStore:
         self.prediction_dataset_name = None
         self.prediction_school_year  = None
 
-        # Raw meta snapshot: dict keyed on student_id → meta dict.
-        # Populated by _FusedPredictionWorker BEFORE feature engineering strips
-        # the raw columns (College, Home_Address, Birthdate, etc.).
-        # PredictionEngine merges this back into student_meta after _prepare()
-        # so the persistence layer has full demographic data to write.
         self.raw_meta_snapshot: dict = {}
 
         self.activities: list  = []
-        self._max_activities   = 50
+        self._max_activities   = 20
 
-        # Listener list is kept for add/remove API compatibility, but
-        # actual delivery now goes through _NotifyRelay (see _notify).
         self._listeners: list = []
 
+        # ── DB connection (set once after login) ──────────────────────────────
+        self.db_conn = None
+
         self._load_persisted_model()
+        self._load_raw_merged_cache()   # restore raw dataset from disk if available
+
+    # ------------------------------------------------------------------
+    # DB connection management
+    # ------------------------------------------------------------------
+
+    def set_db_conn(self, conn) -> None:
+        self.db_conn = conn
+        print("[DataStore] DB connection registered.")
+        self._load_activities_from_db()
+
+    def _load_activities_from_db(self) -> None:
+        if not self.db_conn:
+            return
+        try:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT log_timestamp, user_name, action,
+                           entity_type, description, status
+                    FROM   public.activity_log
+                    ORDER  BY log_timestamp DESC
+                    LIMIT  %s
+                    """,
+                    (self._max_activities,),
+                )
+                rows = cur.fetchall()
+
+            rows = list(reversed(rows))
+
+            _ACTION_ICON = {
+                "LOGIN":        "🔐",
+                "LOGOUT":       "🚪",
+                "LOGIN_FAILED": "⛔",
+                "UPLOAD":       "📂",
+                "MERGE":        "🔀",
+                "TRAIN":        "🧠",
+                "PREDICT":      "⚡",
+                "VIEW":         "👁",
+                "EXPORT":       "💾",
+            }
+            _ACTION_COLOR = {
+                "LOGIN":        "#34d399",
+                "LOGOUT":       "#8b949e",
+                "LOGIN_FAILED": "#ff5b5b",
+                "UPLOAD":       "#4f8cff",
+                "MERGE":        "#4f8cff",
+                "TRAIN":        "#a78bfa",
+                "PREDICT":      "#34d399",
+                "VIEW":         "#f5b335",
+                "EXPORT":       "#34d399",
+            }
+
+            self.activities = []
+            for ts, user_name, action, entity_type, description, status in rows:
+                action_upper = (action or "").upper()
+                time_str = (
+                    ts.strftime("%b %d · %H:%M") if hasattr(ts, "strftime")
+                    else str(ts)[:16]
+                )
+                msg = description or f"{action_upper} — {entity_type}"
+                if user_name:
+                    msg = f"{msg}  ·  {user_name}"
+
+                self.activities.append({
+                    "message": msg,
+                    "icon":    _ACTION_ICON.get(action_upper, "•"),
+                    "color":   _ACTION_COLOR.get(action_upper, "#4f8cff"),
+                    "time":    time_str,
+                })
+
+            print(f"[DataStore] Loaded {len(self.activities)} activity entries from DB.")
+            self._notify("activity")
+
+        except Exception as exc:
+            print(f"[DataStore] Could not load activities from DB: {exc}")
+
+    def get_db_conn(self):
+        return self.db_conn
 
     # ------------------------------------------------------------------
     # Portal data management
@@ -132,7 +221,99 @@ class DataStore:
             self.portals[key] = None
             self._notify(key)
 
+    # ------------------------------------------------------------------
+    # Raw merged dataset — training source, persisted across restarts
+    # ------------------------------------------------------------------
+
+    def set_raw_merged_dataset(self, data: dict) -> None:
+        """
+        Store the raw MergeEngine output (headers + rows, still containing
+        Final_Avg_GRD and all original columns).
+
+        Called once from DataMergePipelinePage._on_merge_finished().
+        Immediately persisted to disk so retraining works correctly after an
+        app restart without requiring a re-merge.
+
+        This slot is ONLY replaced by a new merge run or clear_all() —
+        never by the pipeline or prediction flow.
+        """
+        self.raw_merged_dataset = data
+        print(
+            f"[DataStore] raw_merged_dataset stored: "
+            f"{len(data.get('rows', [])):,} rows × "
+            f"{len(data.get('headers', []))} columns"
+        )
+
+        # Persist to disk so it survives app restarts
+        try:
+            _RAW_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(_RAW_CACHE_PATH, "wt", encoding="utf-8") as f:
+                json.dump(data, f)
+            print(f"[DataStore] raw_merged_dataset cached to {_RAW_CACHE_PATH}")
+        except Exception as e:
+            print(f"[DataStore] WARNING: could not cache raw_merged_dataset to disk: {e}")
+
+        self._notify("raw_merged_dataset")
+
+    def _load_raw_merged_cache(self) -> None:
+        """
+        Restore the raw merged dataset from disk on startup.
+        Called once from __init__() after _load_persisted_model().
+        Silent if the cache file does not exist (first run or after clear_all).
+        """
+        if not _RAW_CACHE_PATH.exists():
+            return
+        try:
+            with gzip.open(_RAW_CACHE_PATH, "rt", encoding="utf-8") as f:
+                data = json.load(f)
+            self.raw_merged_dataset = data
+            print(
+                f"[DataStore] raw_merged_dataset restored from disk cache: "
+                f"{len(data.get('rows', [])):,} rows × "
+                f"{len(data.get('headers', []))} columns | "
+                f"Final_Avg_GRD present: {'Final_Avg_GRD' in data.get('headers', [])}"
+            )
+        except Exception as e:
+            print(f"[DataStore] WARNING: could not restore raw_merged_dataset from cache: {e}")
+
+    def get_raw_merged_dataset(self, warn: bool = True) -> dict | None:
+        """
+        Return the raw merged dataset for training.
+
+        Parameters
+        ----------
+        warn : bool
+            If True (default), print a warning when falling back to
+            unified_dataset.  Pass warn=False from UI readiness checks
+            that call this on every DataStore event — those don't need
+            the warning and would spam the console.
+        """
+        if self.raw_merged_dataset is not None:
+            return self.raw_merged_dataset
+
+        # Fallback: unified_dataset may still be raw (e.g. merge was run
+        # but pipeline was never run in this session AND cache is missing).
+        if self.unified_dataset is not None:
+            if warn:
+                print(
+                    "[DataStore] WARNING: raw_merged_dataset is None — "
+                    "falling back to unified_dataset for training. "
+                    "If training fails with 'risk_label missing', re-run "
+                    "the Data Merge to restore the raw dataset."
+                )
+            return self.unified_dataset
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Unified (active) dataset — pipeline and prediction engine only
+    # ------------------------------------------------------------------
+
     def set_unified_dataset(self, data) -> None:
+        """
+        Set the active dataset used by the pipeline and prediction engine.
+        Training NEVER reads from this slot — use get_raw_merged_dataset().
+        """
         self.unified_dataset = data
         if self._original_unified_dataset is None and data is not None:
             self._original_unified_dataset = data
@@ -147,11 +328,6 @@ class DataStore:
         self._notify("unified_dataset")
 
     def set_raw_meta_snapshot(self, snapshot: dict) -> None:
-        """
-        Store a {student_id: meta_dict} snapshot captured from the raw dataset
-        before feature engineering strips demographic columns.
-        Called by _FusedPredictionWorker; read by PredictionEngine._prepare().
-        """
         self.raw_meta_snapshot = snapshot
 
     def clear_unified_dataset(self):
@@ -162,11 +338,19 @@ class DataStore:
     def clear_all(self):
         for key in self.portals:
             self.portals[key] = None
-        self.unified_dataset = None
+        self.raw_merged_dataset        = None
+        self.unified_dataset           = None
         self._original_unified_dataset = None
-        self.raw_meta_snapshot = {}
-        self.model_ready     = False
-        self.last_prediction_run = None
+        self.raw_meta_snapshot         = {}
+        self.model_ready               = False
+        self.last_prediction_run       = None
+        # Delete the disk cache so the next merge starts fresh
+        try:
+            if _RAW_CACHE_PATH.exists():
+                _RAW_CACHE_PATH.unlink()
+                print("[DataStore] raw_merged_dataset disk cache cleared.")
+        except Exception as e:
+            print(f"[DataStore] WARNING: could not delete raw_merged_dataset cache: {e}")
         self._notify("all")
 
     def get_prediction_dataset(self) -> dict:
@@ -188,14 +372,40 @@ class DataStore:
 
     def add_activity(self, message: str, icon: str = "•",
                      color: str = "#4f8cff") -> None:
-        self.activities.append({
+        entry = {
             "message": message,
             "icon":    icon,
             "color":   color,
             "time":    datetime.now().strftime("%b %d · %H:%M"),
-        })
+        }
+        self.activities.append(entry)
         if len(self.activities) > self._max_activities:
             self.activities = self.activities[-self._max_activities:]
+
+        if self.db_conn:
+            try:
+                from services.activity_logger import ActivityLogger
+                _ICON_ACTION = {
+                    "🔐": ("LOGIN",   "SESSION"),
+                    "🚪": ("LOGOUT",  "SESSION"),
+                    "📂": ("UPLOAD",  "DATASET"),
+                    "🔀": ("MERGE",   "DATASET"),
+                    "🧠": ("TRAIN",   "MODEL"),
+                    "⚡": ("PREDICT", "DATASET"),
+                    "👁": ("VIEW",    "STUDENT"),
+                    "💾": ("EXPORT",  "DATASET"),
+                }
+                action, entity_type = _ICON_ACTION.get(icon, ("ACTIVITY", "SYSTEM"))
+                ActivityLogger.log(
+                    self.db_conn,
+                    action      = action,
+                    entity_type = entity_type,
+                    description = message,
+                )
+                self.db_conn.commit()
+            except Exception as _exc:
+                print(f"[DataStore] add_activity DB write error: {_exc}")
+
         self._notify("activity")
 
     def clear_activities(self) -> None:
@@ -220,16 +430,8 @@ class DataStore:
     # ------------------------------------------------------------------
 
     def add_listener(self, callback):
-        """
-        Register a callback to be invoked when any DataStore key changes.
-
-        The callback receives a single str argument (the changed key) and is
-        ALWAYS invoked on the Qt main thread, even if the change originated
-        in a worker thread — so it is safe to call QWidget methods inside it.
-        """
         if callback not in self._listeners:
             self._listeners.append(callback)
-            # Wire through the thread-safe relay
             _NotifyRelay.get().connect(callback)
 
     def remove_listener(self, callback):
@@ -238,19 +440,9 @@ class DataStore:
             _NotifyRelay.get().disconnect(callback)
 
     def _notify(self, key: str):
-        """
-        Post a change notification.
-
-        Safe to call from any thread. Delivery to all listeners is
-        marshalled to the main thread via _NotifyRelay's QueuedConnection,
-        so listeners can safely touch QWidgets without triggering
-        'QObject::setParent: Cannot set parent, new parent is in a
-        different thread' warnings.
-        """
         try:
             _NotifyRelay.get().emit(key)
         except Exception:
-            # Fallback for non-Qt contexts (unit tests, CLI) — call directly.
             for cb in list(self._listeners):
                 try:
                     cb(key)
@@ -258,11 +450,10 @@ class DataStore:
                     pass
 
     # ------------------------------------------------------------------
-    # Model & Unified Dataset
+    # Model management
     # ------------------------------------------------------------------
 
     def set_trained_model(self, model_service):
-        """Store trained ML model in PredictionEngine-compatible format."""
         if isinstance(model_service, dict):
             self.trained_model = model_service
         else:
@@ -273,9 +464,6 @@ class DataStore:
                 "training_history": dict(getattr(model_service, "training_history", {}) or {}),
                 "target_col":       "risk_label",
                 "is_mock":          False,
-                # Fitted DataPipeline — carries LabelEncoders + StandardScaler
-                # so PredictionEngine can apply the same transformations used
-                # during training before calling model.predict_proba()
                 "preprocessor":     getattr(model_service, "preprocessor", None),
             }
         self.model_ready = True
@@ -294,10 +482,6 @@ class DataStore:
             **(self.trained_model.get("training_history", {})),
             **(metadata or {}),
         }
-
-        # Pass the preprocessor (fitted DataPipeline with LabelEncoders + Scaler)
-        # so it is included in the pickle package and survives disk/DB saves.
-        # Without this, loaded models have no preprocessor and produce 0/100 scores.
         preprocessor = self.trained_model.get("preprocessor")
 
         return ModelRegistry.save_model(
@@ -401,4 +585,12 @@ class DataStore:
             f"\n  All ready: {self.all_portals_ready()}  "
             f"({self.ready_count()}/4)"
         )
+        raw = self.raw_merged_dataset
+        if raw:
+            lines.append(
+                f"  raw_merged_dataset: "
+                f"{len(raw.get('rows', [])):,} rows × "
+                f"{len(raw.get('headers', []))} columns"
+                f" (cache: {'exists' if _RAW_CACHE_PATH.exists() else 'missing'})"
+            )
         return "\n".join(lines)
