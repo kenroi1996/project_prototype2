@@ -23,6 +23,10 @@ STUDENT_ID_ALIASES: dict[str, list[str]] = {
 
 UNIFIED_FEATURE_MAP: dict[str, list[str]] = {
     "Student_ID":                ["ID_NO", "KEYID", "SYSTEMCODE", "student_id", "STUDENT_ID"],
+        # ── Name columns — MIS portal typically provides these ────────────
+    "First_Name":               ["FIRSTNAME", "FIRST_NAME", "first_name", "fname", "FNAME", "GIVEN_NAME", "given_name"],
+    "Last_Name":                 ["LASTNAME", "LAST_NAME", "last_name", "lname","LNAME", "SURNAME", "surname"],
+    "Full_Name":                 ["FULL_NAME", "full_name", "STUDENT_NAME","student_name", "NAME", "name"],
     "Program":                   ["PROGRAM", "program_code", "PROGRAM_CODE"],
     "College":                   ["COLLEGE", "college"],
     "SecCode":                   ["SECCODE", "SEC_CODE"],

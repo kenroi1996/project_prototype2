@@ -50,7 +50,9 @@ from .pages.data_merge_pipeline import DataMergePipelinePage
 from .pages.prediction_page import PredictionPage
 from .pages.prediction_history_page import PredictionHistoryPage   # ← NEW
 from .pages.settings_page import SettingsPage                      # ← NEW
-from services.activity_logger import ActivityLogger
+#from services.activity_logger import ActivityLogger
+from .pages.analytics_page import AnalyticsPage
+
 
 
 # ── Page index registry ───────────────────────────────────────────────────────
@@ -58,17 +60,18 @@ from services.activity_logger import ActivityLogger
 # Add new pages here first, then reference _PAGE_IDX below.
 _PAGE_IDX = {
     "Dashboard":            0,
-    "Risk Alerts":          1,
-    "Student Cohort":       2,
-    "Model Training":       3,
-    "Data Merge & Pipeline":4,
-    "MIS Portal":           5,
-    "SAO Portal":           6,
-    "Guidance Portal":      7,
-    "Registrar Portal":     8,
-    "Prediction":           9,
-    "Prediction History":   10,   # ← NEW
-    "Settings":             11,   # ← NEW (admin only)
+    "Data Analytics":       1,
+    "Risk Alerts":          2,
+    "Student Cohort":       3,
+    "Model Training":       4,
+    "Data Merge & Pipeline":5,
+    "MIS Portal":           6,
+    "SAO Portal":           7,
+    "Guidance Portal":      8,
+    "Registrar Portal":     9,
+    "Prediction":           10,
+    "Prediction History":   11, # ← NEW
+    "Settings":             12  # ← NEW (admin only)
 }
 
 
@@ -220,6 +223,7 @@ class DashboardWindow(AnimatedBackground):
 
         for text, icon, key in [
             ("Dashboard",     "assets/icons/dashboard.svg",       "Dashboard"),
+            ("Data Analytics","assets/icons/analytics.png",       "Data Analytics"),
             ("Risk Alerts",   "assets/icons/risk-alerts.svg",     "Risk Alerts"),
             ("Student Cohort","assets/icons/student-cohorts.svg", "Student Cohort"),
         ]:
@@ -348,8 +352,14 @@ class DashboardWindow(AnimatedBackground):
         )
         content_area_layout.addWidget(self.stacked_widget)
 
+        # ── Set DB connection FIRST so pages can use it immediately ─────
+        if self._db_conn:
+            from services.data_store import DataStore
+            DataStore.get().set_db_conn(self._db_conn)
+
         # ── Instantiate pages ─────────────────────────────────────────
         self.dashboard_page          = DashboardPage()
+        self._analytics_page         = AnalyticsPage()
         self.risk_alerts_page        = RiskAlertsPage()
         self.student_cohort_page     = StudentCohortPage()
         self.model_training_page     = ModelTrainingPage()
@@ -374,6 +384,7 @@ class DashboardWindow(AnimatedBackground):
         # directly into a plain scroll area via create_scrollable_page.
         pages_in_order = [
             (self.dashboard_page,          _PAGE_IDX["Dashboard"]),
+            (self._analytics_page,         _PAGE_IDX["Data Analytics"]),
             (self.risk_alerts_page,        _PAGE_IDX["Risk Alerts"]),
             (self.student_cohort_page,     _PAGE_IDX["Student Cohort"]),
             (self.model_training_page,     _PAGE_IDX["Model Training"]),
@@ -394,11 +405,6 @@ class DashboardWindow(AnimatedBackground):
             scrollable = self.create_scrollable_page(page_widget)
             self.stacked_widget.addWidget(scrollable)
 
-        # ── Set DataStore DB connection ───────────────────────────────
-        if self._db_conn:
-            from services.data_store import DataStore
-            DataStore.get().set_db_conn(self._db_conn)
-
         # ── Default page ──────────────────────────────────────────────
         self.stacked_widget.setCurrentIndex(_PAGE_IDX["Dashboard"])
         self.nav_buttons["Dashboard"].setChecked(True)
@@ -415,6 +421,26 @@ class DashboardWindow(AnimatedBackground):
         lbl = QLabel(text)
         lbl.setObjectName("sectionLabel")
         return lbl
+
+    def closeEvent(self, event):
+        """Clean up page listeners and workers before window is destroyed."""
+        try:
+            from services.data_store import DataStore
+            store = DataStore.get()
+            for attr in ("dashboard_page", "risk_alerts_page",
+                         "student_cohort_page", "prediction_history_page",
+                         "settings_page"):
+                page = getattr(self, attr, None)
+                if page and hasattr(page, "_on_store_updated"):
+                    store.remove_listener(page._on_store_updated)
+                if page and hasattr(page, "closeEvent"):
+                    try:
+                        page.closeEvent(event)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _on_logout(self):
         from PyQt6.QtWidgets import QMessageBox

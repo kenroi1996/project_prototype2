@@ -1,11 +1,26 @@
+import os
 import sys
+
+# ── MUST be first — before any other import ──────────────────────────────────
+# On Windows + Python 3.8+, setting PATH alone is not enough for DLL loading.
+# os.add_dll_directory() registers the Qt6/bin folder with the Windows DLL
+# loader so QtWebEngineWidgets.dll and its dependencies are found at import time.
+if sys.platform == "win32":
+    try:
+        import PyQt6 as _p
+        _qt_bin = os.path.join(os.path.dirname(_p.__file__), "Qt6", "bin")
+        if os.path.isdir(_qt_bin):
+            os.environ["PATH"] = _qt_bin + os.pathsep + os.environ.get("PATH", "")
+            os.add_dll_directory(_qt_bin)
+            print(f"[main] Qt6 DLL directory registered: {_qt_bin}")
+    except Exception as _e:
+        print(f"[main] Qt6 PATH fix failed: {_e}")
+
 from pathlib import Path
-
 from PyQt6.QtWidgets import QApplication
-
 from ui.pages.login_dialog import LoginDialog
 
-ROOT = Path(__file__).resolve().parent
+ROOT        = Path(__file__).resolve().parent
 STYLES_PATH = ROOT / "assets" / "styles" / "theme.qss"
 
 
@@ -25,11 +40,8 @@ if __name__ == "__main__":
     from services.data_store import DataStore
     from services.system_config import SystemConfig
     DataStore.get().set_db_conn(dialog.db_conn)
-    # Load system config so all pages read live values from the DB
     SystemConfig.load(dialog.db_conn)
 
-    # _launch_for_role handles post-login checks (force pw change + security setup)
-    # for ALL login paths (initial login and re-login after sign out)
     from ui.counselor_window import _launch_for_role
     _launch_for_role(dialog.db_conn)
     sys.exit(app.exec())

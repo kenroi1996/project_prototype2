@@ -1,1091 +1,912 @@
 """
-Counselor Portal — Interventions Page
-=======================================
-AI-powered intervention advisor using local Ollama (offline).
+ui/pages/interventions_page.py
+================================
+Counselor Portal — AI Intervention Advisor (UI only).
+
+All backend logic (Ollama workers, DB workers, prompt strings) lives in:
+  services/interventions_service.py
 
 Layout
 ------
-  ┌─ Term + student selector ──────────────────────────────────────┐
-  │  AY [combo] Sem [combo] [Load]  ── Student [search/combo]     │
-  └────────────────────────────────────────────────────────────────┘
-  ┌─ Left: Student profile ──────┐  ┌─ Right: AI Recommendations ─┐
-  │  Name, score, factors        │  │  Per-student cards  OR       │
-  │  Background tags             │  │  Cohort summary cards        │
-  └──────────────────────────────┘  └────────────────────────────┘
-  [Analyze Selected Student]   [Cohort Summary — All / Filtered]
+  ┌─ Term selector ──────────────────────────────────────────────────┐
+  │  AY [combo]  Sem [combo]  [Load High-Risk Students]  N loaded   │
+  └──────────────────────────────────────────────────────────────────┘
+  [🤖 Analyze All]  [✕ Cancel]  [📊 Cohort Summary]
+  [📄 Export]  [📋 Logs]
+  ════ Progress bar (visible during batch) ════
+  ┌─ Results scroll ─────────────────────────────────────────────────┐
+  │  Collapsible card per student, appended live as AI completes     │
+  └──────────────────────────────────────────────────────────────────┘
+
+Change log
+----------
+  - Added _ProgramSelectorDialog: multi-select program filter shown
+    before AI analysis starts. Counselor picks which programs to
+    analyze instead of always processing all high-risk students.
 """
 from __future__ import annotations
 import json
-import re
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QComboBox, QLineEdit, QScrollArea, QStackedWidget,
-    QSizePolicy, QTextEdit, QProgressBar, QDialog,
+    QSizePolicy, QProgressBar, QDialog, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QMessageBox, QSpacerItem,
+    QMessageBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QDate
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont
 
+from services.interventions_service import (
+    OllamaWorker, BatchWorker, SaveWorker,
+    TermLoader, StudentLoader,
+    InterventionRecordLoader, InterventionReportWorker,
+    LogLoader, LogDeleter, BatchLogDeleter,
+    parse_json_response, build_cohort_prompt,
+    SYSTEM_COHORT, _safe_cleanup,
+)
 from services.data_store    import DataStore
 from services.system_config import SystemConfig
 
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
-
-_SYSTEM_PER_STUDENT = """You are a JSON API. Output only raw JSON. No explanation, no prose, no markdown.
-Given a student risk profile, return a JSON array of 3 intervention objects.
-Each object has these exact keys: type, action, rationale, timeline, priority.
-type values: Academic Support, Financial Aid, Counseling, Program Guidance, Peer Support
-timeline values: Immediate, Within 2 weeks, This semester
-Start your response with [ and end with ]"""
-
-_USER_PER_STUDENT = """Student: {name} | {program} | {college}
-Risk: {score}% {risk_label} | Top factor: {factors}
-Exam: {exam_score} | HS GPA: {hs_gpa}
-
-["""
-
-_SYSTEM_COHORT = """You are a JSON API. Output only raw JSON. No explanation, no prose, no markdown.
-Given cohort risk data, return a JSON array of 3 systemic issue objects.
-Each object has these exact keys: issue, affected_count, description, recommended_action, priority.
-Start your response with [ and end with ]"""
-
-_USER_COHORT = """Cohort: {term} | At-risk: {total} (High={high}, Moderate={moderate})
-Top factors: {factors_summary}
-By college: {college_summary}
-
-["""
-
-
-# ── Ollama worker ─────────────────────────────────────────────────────────────
-
-class _OllamaWorker(QThread):
-    finished = pyqtSignal(str)    # raw JSON string
-    error    = pyqtSignal(str)
-
-    def __init__(self, system: str, user: str):
-        super().__init__()
-        self._system = system
-        self._user   = user
-
-    def run(self):
-        try:
-            import requests
-            url   = SystemConfig.ollama_url().rstrip("/")
-            model = SystemConfig.ollama_model()
-
-            # Prefill the model response with "[" — forces JSON array output.
-            # The model will continue from "[" rather than reasoning in prose.
-            prefilled_prompt = (
-                f"<|im_start|>system\n{self._system}<|im_end|>\n"
-                f"<|im_start|>user\n{self._user}<|im_end|>\n"
-                f"<|im_start|>assistant\n["
-            )
-            payload = {
-                "model":  model,
-                "prompt": prefilled_prompt,
-                "stream": True,
-                "raw":    True,   # bypass Ollama's template so prefill works
-                "options": {
-                    "temperature": 0.2,
-                    "top_p":       0.9,
-                    "num_predict": 4096,
-                    "num_ctx":     4096,
-                    "stop":        ["<|im_end|>"],
-                },
-            }
-            resp = requests.post(
-                f"{url}/api/generate",
-                json=payload,
-                stream=True,
-                timeout=(10, None),  # 10s to connect, unlimited read
-            )
-            if resp.status_code != 200:
-                self.error.emit(
-                    f"Ollama returned HTTP {resp.status_code}: {resp.text[:200]}"
-                )
-                return
-
-            # Collect streamed tokens
-            raw = ""
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line)
-                    raw  += chunk.get("response", "")
-                    if chunk.get("done"):
-                        break
-                except Exception:
-                    continue
-
-            # Strip <think>…</think> blocks (qwen3 chain-of-thought)
-            raw  = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            # Strip markdown fences
-            raw  = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-            # We prefilled "[" — prepend it back so parsing works
-            if not raw.strip().startswith("["):
-                raw = "[" + raw
-            self.finished.emit(raw)
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ── DB save worker ────────────────────────────────────────────────────────────
-
-class _SaveWorker(QThread):
-    finished = pyqtSignal()
-    error    = pyqtSignal(str)
-
-    def __init__(self, record: dict):
-        super().__init__()
-        self._record = record
-
-    def run(self):
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No database connection.")
-            return
-        try:
-            from services.auth_service import AuthService
-            user = AuthService.current_user() or {}
-            counselor_id = user.get("user_id")
-
-            r = self._record
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.interventions
-                        (student_id, counselor_id, academic_year, semester,
-                         mode, risk_score, risk_label, risk_factors,
-                         recommendations, logged_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb, NOW())
-                """, (
-                    r.get("student_id"),
-                    counselor_id,
-                    r.get("academic_year"),
-                    r.get("semester"),
-                    r.get("mode", "per_student"),
-                    r.get("risk_score"),
-                    r.get("risk_label"),
-                    r.get("risk_factors"),
-                    json.dumps(r.get("recommendations", [])),
-                ))
-            conn.commit()
-            self.finished.emit()
-        except Exception as e:
-            try:
-                DataStore.get().db_conn.rollback()
-            except Exception:
-                pass
-            self.error.emit(str(e))
-
-
-# ── Intervention record loader ────────────────────────────────────────────────
-
-class _InterventionRecordLoader(QThread):
-    """Load all intervention records for a given term from DB."""
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-
-    def __init__(self, academic_year: str, semester: int):
-        super().__init__()
-        self._ay  = academic_year
-        self._sem = semester
-
-    def run(self):
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No database connection.")
-            return
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT
-                        intervention_id, student_id, counselor_id,
-                        academic_year, semester, mode,
-                        risk_score, risk_label, risk_factors,
-                        recommendations, notes, logged_at
-                    FROM public.interventions
-                    WHERE academic_year = %s AND semester = %s
-                    ORDER BY logged_at ASC
-                """, (self._ay, self._sem))
-                cols = [d[0] for d in cur.description]
-                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-            self.finished.emit(rows)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class _InterventionReportWorker(QThread):
-    """Generate intervention PDF off the main thread."""
-    finished = pyqtSignal(str)   # saved file path
-    error    = pyqtSignal(str)
-
-    def __init__(self, records, term_label, academic_year, semester, save_path):
-        super().__init__()
-        self._records       = records
-        self._term_label    = term_label
-        self._academic_year = academic_year
-        self._semester      = semester
-        self._save_path     = save_path
-
-    def run(self):
-        try:
-            from services.report_generator import InterventionReportGenerator
-            from services.system_config    import SystemConfig
-            gen = InterventionReportGenerator(
-                records       = self._records,
-                term_label    = self._term_label,
-                academic_year = self._academic_year,
-                semester      = self._semester,
-                institution   = SystemConfig.institution(),
-            )
-            buf = gen.build_bytes()
-            with open(self._save_path, "wb") as f:
-                f.write(buf.getvalue())
-            self.finished.emit(self._save_path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ── Term/student loader ───────────────────────────────────────────────────────
-
-class _TermLoader(QThread):
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-
-    def run(self):
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No DB connection.")
-            return
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT DISTINCT t.academic_year, t.semester
-                    FROM   public.fact_student_academic_risk fsr
-                    JOIN   public.dim_academic_term t ON t.term_key = fsr.term_key
-                    ORDER  BY t.academic_year DESC, t.semester DESC
-                """)
-                self.finished.emit(cur.fetchall())
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class _StudentLoader(QThread):
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-
-    _SQL = """
-        SELECT
-            ds.student_id,
-            TRIM(COALESCE(ds.first_name,'') || ' ' ||
-                 COALESCE(ds.last_name,''))             AS full_name,
-            COALESCE(dp.program_name,'Unknown')         AS program,
-            COALESCE(dp.college,'—')                    AS college,
-            COALESCE(rl.risk_label,'Low')               AS risk_label,
-            fsr.predicted_risk_score,
-            fsr.entrance_exam_score,
-            fsr.high_school_gpa,
-            fsr.primary_factor
-        FROM  public.fact_student_academic_risk fsr
-        JOIN  public.dim_academic_term t
-              ON t.term_key       = fsr.term_key
-        JOIN  public.dim_student ds
-              ON ds.student_key   = fsr.student_key
-        LEFT JOIN public.dim_program dp
-              ON dp.program_key   = fsr.program_key
-        LEFT JOIN public.dim_risk_level rl
-              ON rl.risk_level_id = fsr.risk_level_id
-        WHERE t.academic_year = %s AND t.semester = %s
-          AND rl.risk_label IN ('High','Medium')
-        ORDER BY fsr.predicted_risk_score DESC NULLS LAST
-    """
-
-    def __init__(self, ay: str, sem: int):
-        super().__init__()
-        self._ay, self._sem = ay, sem
-
-    def run(self):
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No DB connection.")
-            return
-        try:
-            with conn.cursor() as cur:
-                cur.execute(self._SQL, (self._ay, self._sem))
-                cols = [d[0] for d in cur.description]
-                self.finished.emit(
-                    [dict(zip(cols, r)) for r in cur.fetchall()])
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ── Helper widgets ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Colour helper
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _risk_color(label: str) -> str:
     lc = label.lower()
-    if "high" in lc:               return "#ff5b5b"
-    if "medium" in lc or "mod" in lc: return "#f5b335"
+    if "high" in lc:                   return "#ff5b5b"
+    if "medium" in lc or "mod" in lc:  return "#f5b335"
     return "#34d399"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Reusable stripe-style row widgets
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _rec_card(rec: dict, idx: int) -> QWidget:
-    """
-    Clean recommendation row — no box, just a left accent stripe
-    with generous whitespace between entries.
-    """
-    _p = rec.get("priority", idx + 1)
-    priority = (
-        1 if str(_p).lower() in ("high", "1") else
-        2 if str(_p).lower() in ("medium", "moderate", "2") else
-        3 if str(_p).lower() in ("low", "3") else
-        int(_p) if str(_p).isdigit() else idx + 1
-    )
-    rtype    = rec.get("type",     "—")
-    action   = rec.get("action",   "—")
-    rat      = rec.get("rationale","—")
-    timeline = rec.get("timeline", "—")
+    rtype    = rec.get("type",      "—")
+    action   = rec.get("action",    "—")
+    rat      = rec.get("rationale", "—")
+    timeline = rec.get("timeline",  "—")
+    color = {
+        "Academic Support": "#4f8cff", "Financial Aid": "#f5b335",
+        "Counseling": "#a78bfa", "Program Guidance": "#34d399",
+        "Peer Support": "#f59e0b",
+    }.get(rtype, "#8b949e")
 
-    type_colors = {
-        "Academic Support": "#4f8cff",
-        "Financial Aid":    "#f5b335",
-        "Counseling":       "#a78bfa",
-        "Program Guidance": "#34d399",
-        "Peer Support":     "#f59e0b",
-    }
-    color = type_colors.get(rtype, "#8b949e")
-
-    # Outer: horizontal — accent bar | content
     outer = QWidget()
-    outer.setStyleSheet("background: transparent;")
+    outer.setStyleSheet("background:transparent;")
     row = QHBoxLayout(outer)
     row.setContentsMargins(0, 6, 0, 6)
     row.setSpacing(0)
-
-    # Left accent stripe (4 px wide, full height)
     stripe = QFrame()
     stripe.setFixedWidth(4)
-    stripe.setStyleSheet(
-        f"background:{color}; border-radius:2px; margin-right:0px;")
+    stripe.setStyleSheet(f"background:{color}; border-radius:2px;")
     row.addWidget(stripe)
-
-    # Content area
-    content_w = QWidget()
-    content_w.setStyleSheet("background:transparent;")
-    cl = QVBoxLayout(content_w)
+    cw = QWidget()
+    cw.setStyleSheet("background:transparent;")
+    cl = QVBoxLayout(cw)
     cl.setContentsMargins(18, 2, 8, 2)
     cl.setSpacing(5)
-
-    # Type tag + timeline on same row
     meta = QHBoxLayout()
     meta.setSpacing(10)
-    type_lbl = QLabel(rtype.upper())
-    type_lbl.setStyleSheet(
+    tl = QLabel(rtype.upper())
+    tl.setStyleSheet(
         f"color:{color}; font-size:11px; font-weight:700; "
-        "letter-spacing:0.6px; background:transparent;"
-    )
-    tl_lbl = QLabel(f"⏱  {timeline}")
-    tl_lbl.setStyleSheet(
-        "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"
-    )
-    meta.addWidget(type_lbl)
-    meta.addWidget(tl_lbl)
-    meta.addStretch()
+        "letter-spacing:0.6px; background:transparent;")
+    tll = QLabel(f"⏱  {timeline}")
+    tll.setStyleSheet(
+        "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;")
+    meta.addWidget(tl); meta.addWidget(tll); meta.addStretch()
     cl.addLayout(meta)
-
-    # Action — primary text
-    action_lbl = QLabel(action)
-    action_lbl.setWordWrap(True)
-    action_lbl.setStyleSheet(
-        "color:#e8eaf0; font-size:14px; font-weight:600; "
-        "line-height:1.5; background:transparent;"
-    )
-    cl.addWidget(action_lbl)
-
-    # Rationale — secondary text
-    rat_lbl = QLabel(rat)
-    rat_lbl.setWordWrap(True)
-    rat_lbl.setStyleSheet(
-        "color:rgba(255,255,255,0.50); font-size:12px; "
-        "line-height:1.5; background:transparent;"
-    )
-    cl.addWidget(rat_lbl)
-    row.addWidget(content_w, 1)
+    al = QLabel(action)
+    al.setWordWrap(True)
+    al.setStyleSheet(
+        "color:#e8eaf0; font-size:13px; font-weight:600; background:transparent;")
+    cl.addWidget(al)
+    rl = QLabel(rat)
+    rl.setWordWrap(True)
+    rl.setStyleSheet(
+        "color:rgba(255,255,255,0.50); font-size:12px; background:transparent;")
+    cl.addWidget(rl)
+    row.addWidget(cw, 1)
     return outer
 
 
-def _cohort_card(issue: dict, idx: int) -> QFrame:
-    """Single cohort-level issue card."""
-    _p = issue.get("priority", idx + 1)
-    priority = (
-        1 if str(_p).lower() in ("high", "1") else
-        2 if str(_p).lower() in ("medium", "moderate", "2") else
-        3 if str(_p).lower() in ("low", "3") else
-        int(_p) if str(_p).isdigit() else idx + 1
-    )
-    title    = issue.get("issue",              "—")
-    count    = issue.get("affected_count",      0)
-    desc     = issue.get("description",         "—")
-    action   = issue.get("recommended_action",  "—")
-
-    colors = ["#ff5b5b", "#f5b335", "#4f8cff", "#34d399", "#a78bfa"]
-    color  = colors[min(idx, len(colors) - 1)]
-
-    card = QFrame()
-    card.setStyleSheet(f"""
-        QFrame {{
-            background: rgba(255,255,255,0.03);
-            border: 1px solid {color}44;
-            border-left: 3px solid {color};
-            border-radius: 10px;
-            margin-bottom: 8px;
-        }}
-    """)
-    lo = QVBoxLayout(card)
-    lo.setContentsMargins(16, 14, 16, 14)
-    lo.setSpacing(6)
-
-    hdr = QHBoxLayout()
-    issue_lbl = QLabel(f"#{priority}  {title}")
-    issue_lbl.setStyleSheet(
-        f"color:{color}; font-size:14px; font-weight:700; background:transparent;"
-    )
-    count_lbl = QLabel(f"{count:,} students affected")
-    count_lbl.setStyleSheet(
-        "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"
-    )
-    hdr.addWidget(issue_lbl)
-    hdr.addStretch()
-    hdr.addWidget(count_lbl)
-    lo.addLayout(hdr)
-
-    desc_lbl = QLabel(desc)
-    desc_lbl.setWordWrap(True)
-    desc_lbl.setStyleSheet(
-        "color:rgba(255,255,255,0.55); font-size:12px; background:transparent;"
-    )
-    lo.addWidget(desc_lbl)
-
-    act_lbl = QLabel(f"→  {action}")
-    act_lbl.setWordWrap(True)
-    act_lbl.setStyleSheet(
-        "color:#e8eaf0; font-size:13px; font-weight:600; background:transparent;"
-    )
-    lo.addWidget(act_lbl)
-    return card
-
-
 def _cohort_row(issue: dict, idx: int) -> QWidget:
-    """
-    Clean cohort issue row — same stripe-based layout as _rec_card.
-    """
-    _p = issue.get("priority", idx + 1)
-    priority = (
-        1 if str(_p).lower() in ("high", "1") else
-        2 if str(_p).lower() in ("medium", "moderate", "2") else
-        3 if str(_p).lower() in ("low", "3") else
-        int(_p) if str(_p).isdigit() else idx + 1
-    )
     title  = issue.get("issue",             "—")
     count  = issue.get("affected_count",     0)
     desc   = issue.get("description",        "—")
     action = issue.get("recommended_action", "—")
-
-    stripe_colors = ["#ff5b5b", "#f5b335", "#4f8cff", "#34d399", "#a78bfa"]
-    color = stripe_colors[min(idx, len(stripe_colors) - 1)]
+    color  = ["#ff5b5b","#f5b335","#4f8cff","#34d399","#a78bfa"][min(idx, 4)]
 
     outer = QWidget()
     outer.setStyleSheet("background:transparent;")
     row = QHBoxLayout(outer)
     row.setContentsMargins(0, 8, 0, 8)
     row.setSpacing(0)
-
     stripe = QFrame()
     stripe.setFixedWidth(4)
     stripe.setStyleSheet(f"background:{color}; border-radius:2px;")
     row.addWidget(stripe)
-
-    content_w = QWidget()
-    content_w.setStyleSheet("background:transparent;")
-    cl = QVBoxLayout(content_w)
+    cw = QWidget()
+    cw.setStyleSheet("background:transparent;")
+    cl = QVBoxLayout(cw)
     cl.setContentsMargins(18, 2, 8, 2)
     cl.setSpacing(5)
-
-    # Title + count
     meta = QHBoxLayout()
-    title_lbl = QLabel(title)
-    title_lbl.setStyleSheet(
-        f"color:{color}; font-size:14px; font-weight:700; background:transparent;"
-    )
-    count_lbl = QLabel(
-        f"{int(count):,} students" if str(count).isdigit() else str(count))
-    count_lbl.setStyleSheet(
-        "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"
-    )
-    meta.addWidget(title_lbl)
-    meta.addStretch()
-    meta.addWidget(count_lbl)
+    tl = QLabel(title)
+    tl.setStyleSheet(
+        f"color:{color}; font-size:14px; font-weight:700; background:transparent;")
+    cl_ = QLabel(f"{int(count):,} students" if str(count).isdigit() else str(count))
+    cl_.setStyleSheet(
+        "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;")
+    meta.addWidget(tl); meta.addStretch(); meta.addWidget(cl_)
     cl.addLayout(meta)
-
-    # Description
-    desc_lbl = QLabel(desc)
-    desc_lbl.setWordWrap(True)
-    desc_lbl.setStyleSheet(
-        "color:rgba(255,255,255,0.50); font-size:12px; background:transparent;"
-    )
-    cl.addWidget(desc_lbl)
-
-    # Action
-    act_lbl = QLabel(action)
-    act_lbl.setWordWrap(True)
-    act_lbl.setStyleSheet(
-        "color:#e8eaf0; font-size:13px; font-weight:600; background:transparent;"
-    )
-    cl.addWidget(act_lbl)
-    row.addWidget(content_w, 1)
+    dl = QLabel(desc)
+    dl.setWordWrap(True)
+    dl.setStyleSheet(
+        "color:rgba(255,255,255,0.50); font-size:12px; background:transparent;")
+    cl.addWidget(dl)
+    al = QLabel(action)
+    al.setWordWrap(True)
+    al.setStyleSheet(
+        "color:#e8eaf0; font-size:13px; font-weight:600; background:transparent;")
+    cl.addWidget(al)
+    row.addWidget(cw, 1)
     return outer
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Program Selector Dialog  (NEW)
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ── Intervention detail dialog ────────────────────────────────────────────────
-
-class _InterventionDetailDialog(QDialog):
+class _ProgramSelectorDialog(QDialog):
     """
-    Shows full AI recommendations for a single intervention record.
-    Frameless, draggable, closable with ✕ button.
+    Multi-select program filter shown before AI analysis starts.
+
+    The counselor picks which programs to include — only students
+    from the selected programs are passed to BatchWorker.
+
+    Returns selected_programs() as a list[str] after accept().
     """
 
-    def __init__(self, row: dict, recs: list, parent=None):
+    def __init__(self, students: list[dict], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Intervention Details")
         self.setModal(True)
-        self.resize(640, 560)
         self.setWindowFlags(
-            Qt.WindowType.Dialog |
-            Qt.WindowType.FramelessWindowHint
-        )
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self._row  = row
-        self._recs = recs
-        self._drag_pos = None
+
+        # Collect unique programs and their at-risk student counts
+        self._program_counts: dict[str, int] = {}
+        for s in students:
+            prog = str(s.get("program") or "Unknown").strip() or "Unknown"
+            self._program_counts[prog] = self._program_counts.get(prog, 0) + 1
+
+        self._checkboxes: dict[str, QCheckBox] = {}
+        self._total_students = len(students)
+
         self._build_ui()
         self._apply_styles()
+        self._update_summary()
 
-    # ── Drag support ──────────────────────────────────────────────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = (
-                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            )
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if (self._drag_pos is not None
-                and event.buttons() & Qt.MouseButton.LeftButton):
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
-    # ── UI ────────────────────────────────────────────────────────────────────
+    # ── Build ─────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # Size dialog to fit content — taller when many programs
+        n = len(self._program_counts)
+        h = min(120 + n * 44 + 120, 620)
+        self.setFixedSize(500, h)
+
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setContentsMargins(16, 16, 16, 16)
 
         card = QFrame()
-        card.setObjectName("detailCard")
+        card.setObjectName("progSelCard")
         outer.addWidget(card)
 
         root = QVBoxLayout(card)
-        root.setContentsMargins(28, 22, 28, 24)
+        root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(0)
 
-        # ── Header ─────────────────────────────────────────────────────
-        hdr = QHBoxLayout()
-        hdr.setSpacing(0)
+        # ── Header ────────────────────────────────────────────────────
+        hdr_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(4)
 
-        info_col = QVBoxLayout()
-        info_col.setSpacing(4)
+        title = QLabel("Select Programs to Analyze")
+        title.setStyleSheet(
+            "color:#e8eaf0; font-size:15px; font-weight:bold; background:transparent;")
 
-        mode    = self._row.get("mode", "per_student")
-        sid     = self._row.get("student_id")
-        name    = (str(self._row.get("student_name") or "").strip()
-                   or str(sid or "—"))
-        ay      = self._row.get("academic_year", "—")
-        sem_n   = self._row.get("semester")
-        sem_s   = "1st Semester" if sem_n == 1 else "2nd Semester" if sem_n == 2 else ""
-        term    = f"{sem_s}  AY {ay}" if sem_s else ay
-        risk_l  = str(self._row.get("risk_label") or "—")
-        score   = self._row.get("risk_score")
-        logged  = self._row.get("logged_at")
-        logged_s = (logged.strftime("%B %d, %Y  %H:%M")
-                    if hasattr(logged, "strftime") else str(logged or "")[:16])
-
-        if mode == "cohort":
-            headline = QLabel("Cohort Systemic Issues")
-            headline.setObjectName("detailHeadline")
-            sub_text = f"{term}  ·  {risk_l}"
-        else:
-            headline = QLabel(name)
-            headline.setObjectName("detailHeadline")
-            sub_text = f"ID {sid}  ·  {term}"
-            if score:
-                risk_color = (
-                    "#ff5b5b" if "high"   in risk_l.lower() else
-                    "#f5b335" if "medium" in risk_l.lower() else "#34d399"
-                )
-                score_lbl = QLabel(
-                    f"● {risk_l}  {float(score):.1f}% risk")
-                score_lbl.setStyleSheet(
-                    f"color:{risk_color}; font-size:12px; "
-                    "font-weight:600; background:transparent;"
-                )
-                info_col.addWidget(score_lbl)
-
-        headline.setWordWrap(True)
-        info_col.insertWidget(0, headline)
-
-        sub = QLabel(sub_text)
-        sub.setStyleSheet(
-            "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"
+        sub = QLabel(
+            "Choose which programs the AI should generate\n"
+            "intervention plans for."
         )
-        info_col.addWidget(sub)
+        sub.setStyleSheet(
+            "color:rgba(255,255,255,0.40); font-size:11px; background:transparent;")
 
-        if logged_s:
-            date_lbl = QLabel(f"Generated  {logged_s}")
-            date_lbl.setStyleSheet(
-                "color:rgba(255,255,255,0.25); font-size:10px; background:transparent;"
-            )
-            info_col.addWidget(date_lbl)
-
-        hdr.addLayout(info_col, 1)
+        title_col.addWidget(title)
+        title_col.addWidget(sub)
+        hdr_row.addLayout(title_col, 1)
 
         close_btn = QPushButton("✕")
-        close_btn.setObjectName("detailCloseBtn")
+        close_btn.setObjectName("progSelCloseBtn")
         close_btn.setFixedSize(28, 28)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setToolTip("Close")
         close_btn.clicked.connect(self.reject)
-        hdr.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+        hdr_row.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
 
-        root.addLayout(hdr)
-        root.addSpacing(14)
+        root.addLayout(hdr_row)
+        root.addSpacing(16)
 
-        # ── Divider ────────────────────────────────────────────────────
+        # ── Divider ───────────────────────────────────────────────────
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
-        div.setStyleSheet("color:rgba(255,255,255,0.07);")
+        div.setStyleSheet("color:rgba(255,255,255,0.08);")
         root.addWidget(div)
-        root.addSpacing(12)
+        root.addSpacing(14)
 
-        # ── Recommendations scroll ─────────────────────────────────────
+        # ── Select all / none row ─────────────────────────────────────
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
+        sel_all = QPushButton("Select All")
+        sel_all.setObjectName("progSelCtrlBtn")
+        sel_all.setFixedHeight(26)
+        sel_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        sel_all.clicked.connect(self._select_all)
+
+        sel_none = QPushButton("Clear All")
+        sel_none.setObjectName("progSelCtrlBtn")
+        sel_none.setFixedHeight(26)
+        sel_none.setCursor(Qt.CursorShape.PointingHandCursor)
+        sel_none.clicked.connect(self._select_none)
+
+        self._summary_lbl = QLabel("")
+        self._summary_lbl.setStyleSheet(
+            "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;")
+
+        ctrl_row.addWidget(sel_all)
+        ctrl_row.addWidget(sel_none)
+        ctrl_row.addStretch()
+        ctrl_row.addWidget(self._summary_lbl)
+        root.addLayout(ctrl_row)
+        root.addSpacing(10)
+
+        # ── Scrollable program list ───────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            "QScrollArea { background:transparent; border:none; }"
-        )
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
 
-        host = QWidget()
-        host.setStyleSheet("background:transparent;")
-        host_lo = QVBoxLayout(host)
-        host_lo.setContentsMargins(0, 0, 8, 0)
-        host_lo.setSpacing(4)
+        list_host = QWidget()
+        list_host.setStyleSheet("background:transparent;")
+        list_lo = QVBoxLayout(list_host)
+        list_lo.setContentsMargins(0, 0, 8, 0)
+        list_lo.setSpacing(4)
 
-        if not self._recs:
-            empty = QLabel("No recommendation data available for this record.")
-            empty.setStyleSheet(
-                "color:rgba(255,255,255,0.30); font-size:12px; background:transparent;"
-            )
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            host_lo.addWidget(empty)
-        else:
-            for i, rec in enumerate(self._recs):
-                if mode == "cohort":
-                    host_lo.addWidget(_cohort_row(rec, i))
-                else:
-                    host_lo.addWidget(_rec_card(rec, i))
-                if i < len(self._recs) - 1:
-                    sep = QFrame()
-                    sep.setFrameShape(QFrame.Shape.HLine)
-                    sep.setStyleSheet("color:rgba(255,255,255,0.06);")
-                    host_lo.addWidget(sep)
+        # Sort by student count descending so highest-risk programs appear first
+        for prog, count in sorted(
+            self._program_counts.items(),
+            key=lambda x: x[1], reverse=True
+        ):
+            row_w = QWidget()
+            row_w.setObjectName("progSelRow")
+            row_w.setStyleSheet("""
+                QWidget#progSelRow {
+                    background: rgba(255,255,255,0.03);
+                    border: 1px solid rgba(255,255,255,0.07);
+                    border-radius: 8px;
+                }
+                QWidget#progSelRow:hover {
+                    background: rgba(255,255,255,0.06);
+                    border-color: rgba(79,140,255,0.25);
+                }
+            """)
+            row_lo = QHBoxLayout(row_w)
+            row_lo.setContentsMargins(14, 10, 14, 10)
+            row_lo.setSpacing(12)
 
-        host_lo.addStretch()
-        scroll.setWidget(host)
+            cb = QCheckBox()
+            cb.setChecked(True)   # default: all selected
+            cb.setFixedSize(18, 18)
+            cb.toggled.connect(self._update_summary)
+            cb.setStyleSheet("""
+                QCheckBox::indicator {
+                    width: 16px; height: 16px;
+                    border: 2px solid rgba(255,255,255,0.20);
+                    border-radius: 4px;
+                    background: rgba(255,255,255,0.05);
+                }
+                QCheckBox::indicator:checked {
+                    background: #4f8cff;
+                    border-color: #4f8cff;
+                }
+                QCheckBox::indicator:hover {
+                    border-color: rgba(79,140,255,0.60);
+                }
+            """)
+            self._checkboxes[prog] = cb
+
+            # Make whole row clickable by forwarding click to checkbox
+            row_w.mousePressEvent = lambda e, c=cb: c.setChecked(not c.isChecked())
+
+            prog_lbl = QLabel(prog)
+            prog_lbl.setStyleSheet(
+                "color:#e8eaf0; font-size:12px; font-weight:600; background:transparent;")
+
+            count_pill = QLabel(f"{count} student{'s' if count != 1 else ''}")
+            count_pill.setStyleSheet(
+                "color:#ff5b5b; font-size:10px; font-weight:600; "
+                "background:rgba(255,91,91,0.12); "
+                "border:1px solid rgba(255,91,91,0.25); "
+                "border-radius:6px; padding:2px 8px;")
+
+            row_lo.addWidget(cb)
+            row_lo.addWidget(prog_lbl, 1)
+            row_lo.addWidget(count_pill)
+            list_lo.addWidget(row_w)
+
+        list_lo.addStretch()
+        scroll.setWidget(list_host)
         root.addWidget(scroll, 1)
+        root.addSpacing(16)
 
-        root.addSpacing(12)
+        # ── Divider ───────────────────────────────────────────────────
+        div2 = QFrame()
+        div2.setFrameShape(QFrame.Shape.HLine)
+        div2.setStyleSheet("color:rgba(255,255,255,0.08);")
+        root.addWidget(div2)
+        root.addSpacing(14)
 
-        # ── Close button at bottom ─────────────────────────────────────
+        # ── Footer buttons ────────────────────────────────────────────
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("progSelCancelBtn")
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+
+        self._start_btn = QPushButton("🤖  Start Analysis")
+        self._start_btn.setObjectName("progSelStartBtn")
+        self._start_btn.setFixedHeight(36)
+        self._start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._start_btn.clicked.connect(self._on_start)
+
+        btn_row.addWidget(cancel_btn)
         btn_row.addStretch()
-        close_bottom = QPushButton("Close")
-        close_bottom.setObjectName("detailCloseBottomBtn")
-        close_bottom.setFixedHeight(34)
-        close_bottom.setMinimumWidth(100)
-        close_bottom.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_bottom.clicked.connect(self.reject)
-        btn_row.addWidget(close_bottom)
+        btn_row.addWidget(self._start_btn)
         root.addLayout(btn_row)
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _select_all(self):
+        for cb in self._checkboxes.values():
+            cb.setChecked(True)
+
+    def _select_none(self):
+        for cb in self._checkboxes.values():
+            cb.setChecked(False)
+
+    def _update_summary(self):
+        selected_progs = self.selected_programs()
+        student_count  = sum(
+            self._program_counts[p] for p in selected_progs
+        )
+        prog_count = len(selected_progs)
+
+        if prog_count == 0:
+            self._summary_lbl.setText("Nothing selected")
+            self._start_btn.setEnabled(False)
+        else:
+            self._summary_lbl.setText(
+                f"{prog_count} program{'s' if prog_count != 1 else ''}  ·  "
+                f"{student_count} student{'s' if student_count != 1 else ''}"
+            )
+            self._start_btn.setEnabled(True)
+
+    def _on_start(self):
+        if self.selected_programs():
+            self.accept()
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def selected_programs(self) -> list[str]:
+        """Return list of program names whose checkbox is checked."""
+        return [prog for prog, cb in self._checkboxes.items() if cb.isChecked()]
+
+    # ── Styles ────────────────────────────────────────────────────────
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            _InterventionDetailDialog { background: transparent; }
-            #detailCard {
+            #progSelCard {
                 background: #13172a;
                 border: 1px solid rgba(255,255,255,0.10);
                 border-radius: 16px;
             }
-            #detailHeadline {
-                color: #e8eaf0;
-                font-size: 16px;
-                font-weight: bold;
-                background: transparent;
-            }
-            #detailCloseBtn {
+            QPushButton#progSelCloseBtn {
                 background: rgba(255,255,255,0.05);
                 border: 1px solid rgba(255,255,255,0.10);
                 border-radius: 7px;
                 color: rgba(255,255,255,0.35);
                 font-size: 13px; font-weight: bold;
             }
-            #detailCloseBtn:hover {
+            QPushButton#progSelCloseBtn:hover {
                 background: rgba(255,91,91,0.15);
                 border-color: rgba(255,91,91,0.35);
                 color: #ff5b5b;
             }
-            #detailCloseBottomBtn {
-                background: rgba(255,255,255,0.06);
+            QPushButton#progSelCtrlBtn {
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 6px;
+                color: rgba(255,255,255,0.55);
+                font-size: 11px; padding: 0 12px;
+            }
+            QPushButton#progSelCtrlBtn:hover {
+                background: rgba(255,255,255,0.10);
+                color: rgba(255,255,255,0.85);
+            }
+            QPushButton#progSelCancelBtn {
+                background: rgba(255,255,255,0.05);
                 border: 1px solid rgba(255,255,255,0.12);
                 border-radius: 8px;
-                color: rgba(255,255,255,0.70);
-                font-size: 12px; font-weight: 600;
-                padding: 0 20px;
+                color: rgba(255,255,255,0.60);
+                font-size: 12px; font-weight: 600; padding: 0 20px;
             }
-            #detailCloseBottomBtn:hover {
-                background: rgba(255,255,255,0.12);
-                color: #e8eaf0;
+            QPushButton#progSelCancelBtn:hover {
+                background: rgba(255,255,255,0.10);
             }
-            QScrollBar:vertical { background:transparent; width:8px; }
-            QScrollBar::handle:vertical {
-                background:rgba(255,255,255,0.12);
-                border-radius:4px; min-height:30px;
+            QPushButton#progSelStartBtn {
+                background: #4f8cff;
+                border: none; border-radius: 8px;
+                color: white; font-size: 12px;
+                font-weight: 700; padding: 0 24px;
             }
-            QScrollBar::handle:vertical:hover { background:rgba(255,255,255,0.22); }
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical { height:0; }
+            QPushButton#progSelStartBtn:hover {
+                background: rgba(79,140,255,0.85);
+            }
+            QPushButton#progSelStartBtn:disabled {
+                background: rgba(255,255,255,0.06);
+                color: rgba(255,255,255,0.25);
+            }
         """)
 
-# ── Intervention log workers ───────────────────────────────────────────────────
 
-class _LogLoader(QThread):
-    """Load all intervention log records with optional filters."""
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
+# ══════════════════════════════════════════════════════════════════════════════
+# Collapsible student result card
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, filters: dict):
-        super().__init__()
-        self._filters = filters
+class _StudentResultCard(QFrame):
+    def __init__(self, student: dict, recs: list, skipped: bool = False, parent=None):
+        super().__init__(parent)
+        self._student  = student
+        self._recs     = recs
+        self._skipped  = skipped
+        self._expanded = False
+        self._build()
 
-    def run(self):
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No database connection.")
-            return
-        try:
-            f = self._filters
-            clauses = []
-            params  = []
+    def _build(self):
+        self.setObjectName("studentResultCard")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-            if f.get("academic_year"):
-                clauses.append("i.academic_year = %s")
-                params.append(f["academic_year"])
-            if f.get("semester"):
-                clauses.append("i.semester = %s")
-                params.append(int(f["semester"]))
-            if f.get("mode"):
-                clauses.append("i.mode = %s")
-                params.append(f["mode"])
-            if f.get("student_id"):
-                clauses.append("i.student_id ILIKE %s")
-                params.append(f"%{f['student_id']}%")
-            if f.get("student_name"):
-                name_q = f"%{f['student_name']}%"
-                clauses.append(
-                    "(TRIM(COALESCE(ds.first_name,'') || ' ' || "
-                    "COALESCE(ds.last_name,'')) ILIKE %s)"
-                )
-                params.append(name_q)
-            if f.get("date_from"):
-                clauses.append("i.logged_at >= %s")
-                params.append(f["date_from"])
-            if f.get("date_to"):
-                clauses.append("i.logged_at <= %s")
-                params.append(f["date_to"] + " 23:59:59")
+        hdr = QFrame()
+        hdr.setObjectName("studentResultHdr")
+        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        hdr_lo = QHBoxLayout(hdr)
+        hdr_lo.setContentsMargins(16, 12, 16, 12)
+        hdr_lo.setSpacing(12)
 
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        s         = self._student
+        score_raw = s.get("predicted_risk_score") or 0
+        score     = round(float(score_raw) * 100, 1)
+        color     = _risk_color(s.get("risk_label", "High"))
 
-            sql = f"""
-                SELECT
-                    i.intervention_id,
-                    i.student_id,
-                    TRIM(COALESCE(ds.first_name,'') || ' ' ||
-                         COALESCE(ds.last_name,''))         AS student_name,
-                    i.academic_year,
-                    i.semester,
-                    i.mode,
-                    i.risk_score,
-                    i.risk_label,
-                    i.risk_factors,
-                    jsonb_array_length(
-                        COALESCE(i.recommendations,'[]'::jsonb)
-                    )                                       AS rec_count,
-                    i.logged_at
-                FROM public.interventions i
-                LEFT JOIN public.dim_student ds
-                       ON ds.student_id = i.student_id
-                {where}
-                ORDER BY i.logged_at DESC
-            """
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                cols = [d[0] for d in cur.description]
-                self.finished.emit(
-                    [dict(zip(cols, r)) for r in cur.fetchall()])
-        except Exception as e:
-            self.error.emit(str(e))
+        dot = QLabel("●")
+        dot.setFixedWidth(14)
+        dot.setStyleSheet(f"color:{color}; font-size:11px; background:transparent;")
+        name_lbl = QLabel(s.get("full_name", "—"))
+        name_lbl.setStyleSheet(
+            "color:#e8eaf0; font-size:13px; font-weight:600; background:transparent;")
+        meta_lbl = QLabel(f"{s.get('program','—')}  ·  {s.get('college','—')}")
+        meta_lbl.setStyleSheet(
+            "color:rgba(255,255,255,0.38); font-size:11px; background:transparent;")
+        score_lbl = QLabel(f"{score:.1f}%")
+        score_lbl.setStyleSheet(
+            f"color:{color}; font-size:13px; font-weight:700; background:transparent;")
+        score_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        rc = len(self._recs)
+
+        if self._skipped:
+            pill = QLabel("✓ Already analyzed")
+            pill.setStyleSheet(
+                "color:rgba(52,211,153,0.60); font-size:10px; font-weight:600; "
+                "background:rgba(52,211,153,0.08); "
+                "border:1px solid rgba(52,211,153,0.20); "
+                "border-radius:8px; padding:2px 10px;")
+        elif rc:
+            pill = QLabel(f"{rc} recommendations")
+            pill.setStyleSheet(
+                "color:#4f8cff; font-size:10px; font-weight:600; "
+                "background:rgba(79,140,255,0.15); "
+                "border:1px solid rgba(79,140,255,0.30); "
+                "border-radius:8px; padding:2px 10px;")
+        else:
+            pill = QLabel("No recommendations")
+            pill.setStyleSheet(
+                "color:rgba(255,255,255,0.30); font-size:10px; font-weight:600; "
+                "background:rgba(255,255,255,0.04); "
+                "border:1px solid rgba(255,255,255,0.10); "
+                "border-radius:8px; padding:2px 10px;")
+
+        self._arrow = QLabel("▶")
+        self._arrow.setStyleSheet(
+            "color:rgba(255,255,255,0.25); font-size:10px; background:transparent;")
+
+        for w in [dot, name_lbl, meta_lbl]:
+            hdr_lo.addWidget(w)
+        hdr_lo.addStretch()
+        for w in [score_lbl, pill, self._arrow]:
+            hdr_lo.addWidget(w)
+        root.addWidget(hdr)
+
+        self._body = QFrame()
+        self._body.setObjectName("studentResultBody")
+        self._body.setVisible(False)
+        body_lo = QVBoxLayout(self._body)
+        body_lo.setContentsMargins(20, 8, 20, 14)
+        body_lo.setSpacing(0)
+
+        if not self._recs:
+            empty = QLabel("AI could not generate recommendations for this student.")
+            empty.setStyleSheet(
+                "color:rgba(255,255,255,0.30); font-size:12px; background:transparent;")
+            body_lo.addWidget(empty)
+        else:
+            if self._skipped:
+                note = QLabel("Previously saved recommendations — Ollama was not called again.")
+                note.setStyleSheet(
+                    "color:rgba(52,211,153,0.50); font-size:11px; "
+                    "background:transparent; padding-bottom:6px;")
+                body_lo.addWidget(note)
+            for i, rec in enumerate(self._recs):
+                body_lo.addWidget(_rec_card(rec, i))
+                if i < len(self._recs) - 1:
+                    sep = QFrame()
+                    sep.setFrameShape(QFrame.Shape.HLine)
+                    sep.setStyleSheet("color:rgba(255,255,255,0.06);")
+                    body_lo.addWidget(sep)
+
+        root.addWidget(self._body)
+        hdr.mousePressEvent = lambda _: self._toggle()
+        self._update_style()
+
+    def _toggle(self):
+        self._expanded = not self._expanded
+        self._body.setVisible(self._expanded)
+        self._arrow.setText("▼" if self._expanded else "▶")
+        self._update_style()
+
+    def _update_style(self):
+        a = "0.12" if self._expanded else "0.07"
+        self.setStyleSheet(f"""
+            QFrame#studentResultCard {{
+                background:rgba(255,255,255,0.02);
+                border:1px solid rgba(255,255,255,{a});
+                border-radius:10px; margin-bottom:6px;
+            }}
+            QFrame#studentResultHdr:hover {{
+                background:rgba(255,255,255,0.03); border-radius:10px;
+            }}
+            QFrame#studentResultBody {{
+                background:transparent; border:none;
+                border-top:1px solid rgba(255,255,255,0.06);
+            }}
+        """)
 
 
-class _LogDeleter(QThread):
-    """Delete a single intervention log record by ID."""
-    finished = pyqtSignal(int)   # deleted intervention_id
-    error    = pyqtSignal(str)
+# ══════════════════════════════════════════════════════════════════════════════
+# Detail dialog
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, intervention_id: int):
-        super().__init__()
-        self._id = intervention_id
+class _InterventionDetailDialog(QDialog):
+    def __init__(self, row: dict, recs: list, parent=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.resize(640, 560)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._row = row; self._recs = recs; self._drag_pos = None
+        self._build_ui(); self._apply_styles()
 
-    def run(self):
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No database connection.")
-            return
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM public.interventions WHERE intervention_id = %s",
-                    (self._id,)
-                )
-            conn.commit()
-            self.finished.emit(self._id)
-        except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            self.error.emit(str(e))
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and e.buttons() & Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None; super().mouseReleaseEvent(e)
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        card = QFrame(); card.setObjectName("detailCard"); outer.addWidget(card)
+        root = QVBoxLayout(card)
+        root.setContentsMargins(28, 22, 28, 24); root.setSpacing(0)
+
+        hdr = QHBoxLayout(); ic = QVBoxLayout(); ic.setSpacing(4)
+        mode   = self._row.get("mode", "per_student")
+        sid    = self._row.get("student_id")
+        name   = str(self._row.get("student_name") or "").strip() or str(sid or "—")
+        ay     = self._row.get("academic_year", "—")
+        sem_n  = self._row.get("semester")
+        sem_s  = "1st Semester" if sem_n == 1 else "2nd Semester" if sem_n == 2 else ""
+        term   = f"{sem_s}  AY {ay}" if sem_s else ay
+        risk_l = str(self._row.get("risk_label") or "—")
+        score  = self._row.get("risk_score")
+        logged = self._row.get("logged_at")
+        ls     = (logged.strftime("%B %d, %Y  %H:%M")
+                  if hasattr(logged, "strftime") else str(logged or "")[:16])
+
+        hl = QLabel("Cohort Systemic Issues" if mode == "cohort" else name)
+        hl.setObjectName("detailHeadline"); hl.setWordWrap(True)
+        if mode != "cohort" and score:
+            rc = ("#ff5b5b" if "high" in risk_l.lower() else
+                  "#f5b335" if "medium" in risk_l.lower() else "#34d399")
+            sl = QLabel(f"● {risk_l}  {float(score):.1f}% risk")
+            sl.setStyleSheet(
+                f"color:{rc}; font-size:12px; font-weight:600; background:transparent;")
+            ic.addWidget(sl)
+        ic.insertWidget(0, hl)
+        for text, style in [
+            (f"ID {sid}  ·  {term}",
+             "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"),
+            (f"Generated  {ls}" if ls else "",
+             "color:rgba(255,255,255,0.25); font-size:10px; background:transparent;"),
+        ]:
+            if text:
+                lbl = QLabel(text); lbl.setStyleSheet(style); ic.addWidget(lbl)
+        hdr.addLayout(ic, 1)
+        cb = QPushButton("✕"); cb.setObjectName("detailCloseBtn")
+        cb.setFixedSize(28, 28); cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb.clicked.connect(self.reject)
+        hdr.addWidget(cb, 0, Qt.AlignmentFlag.AlignTop)
+        root.addLayout(hdr); root.addSpacing(14)
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet("color:rgba(255,255,255,0.07);"); root.addWidget(div)
+        root.addSpacing(12)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+        host = QWidget(); host.setStyleSheet("background:transparent;")
+        hl2 = QVBoxLayout(host); hl2.setContentsMargins(0, 0, 8, 0); hl2.setSpacing(4)
+        if not self._recs:
+            el = QLabel("No recommendation data available.")
+            el.setStyleSheet(
+                "color:rgba(255,255,255,0.30); font-size:12px; background:transparent;")
+            el.setAlignment(Qt.AlignmentFlag.AlignCenter); hl2.addWidget(el)
+        else:
+            for i, rec in enumerate(self._recs):
+                hl2.addWidget(_cohort_row(rec, i) if mode == "cohort"
+                              else _rec_card(rec, i))
+                if i < len(self._recs) - 1:
+                    sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+                    sep.setStyleSheet("color:rgba(255,255,255,0.06);"); hl2.addWidget(sep)
+        hl2.addStretch(); scroll.setWidget(host); root.addWidget(scroll, 1)
+        root.addSpacing(12)
+        br = QHBoxLayout(); br.addStretch()
+        cl = QPushButton("Close"); cl.setObjectName("detailCloseBottomBtn")
+        cl.setFixedHeight(34); cl.setMinimumWidth(100)
+        cl.setCursor(Qt.CursorShape.PointingHandCursor); cl.clicked.connect(self.reject)
+        br.addWidget(cl); root.addLayout(br)
+
+    def _apply_styles(self):
+        self.setStyleSheet("""
+            #detailCard { background:#13172a;
+                border:1px solid rgba(255,255,255,0.10); border-radius:16px; }
+            #detailHeadline { color:#e8eaf0; font-size:16px; font-weight:bold;
+                background:transparent; }
+            #detailCloseBtn { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.10); border-radius:7px;
+                color:rgba(255,255,255,0.35); font-size:13px; font-weight:bold; }
+            #detailCloseBtn:hover { background:rgba(255,91,91,0.15);
+                border-color:rgba(255,91,91,0.35); color:#ff5b5b; }
+            #detailCloseBottomBtn { background:rgba(255,255,255,0.06);
+                border:1px solid rgba(255,255,255,0.12); border-radius:8px;
+                color:rgba(255,255,255,0.70); font-size:12px; font-weight:600;
+                padding:0 20px; }
+            #detailCloseBottomBtn:hover { background:rgba(255,255,255,0.12);
+                color:#e8eaf0; }
+        """)
 
 
-# ── Intervention log dialog ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Log dialog
+# ══════════════════════════════════════════════════════════════════════════════
 
 class InterventionLogDialog(QDialog):
-    """
-    Full-featured intervention log viewer with search, filter,
-    pagination and per-row delete.
-    """
+    """Full-featured log viewer with search, filter, pagination,
+    checkbox multi-select, and batch delete."""
+
     PAGE_SIZE = 20
+    _COL_CHK  = 0
+    _COL_ID   = 1
+    _COL_SID  = 2
+    _COL_NAME = 3
+    _COL_TERM = 4
+    _COL_TYPE = 5
+    _COL_RISK = 6
+    _COL_RECS = 7
+    _COL_LOG  = 8
+    _COL_VIEW = 9
+    _COL_DEL  = 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Intervention Logs")
-        self.setModal(True)
-        self.resize(1100, 680)
+        self.setModal(True); self.resize(1200, 700)
         self.setWindowFlags(
-            Qt.WindowType.Dialog |
-            Qt.WindowType.FramelessWindowHint
-        )
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        self._all_rows:  list[dict] = []
-        self._page:      int        = 0
-        self._loader:    _LogLoader  | None = None
-        self._deleter:   _LogDeleter | None = None
+        self._all_rows:       list[dict]        = []
+        self._page            = 0
+        self._loader:         LogLoader         | None = None
+        self._deleter:        LogDeleter        | None = None
+        self._batch_deleter:  BatchLogDeleter   | None = None
+        self._drag_pos        = None
 
-        self._drag_pos = None
         self._build_ui()
         self._apply_styles()
         self._load()
 
-    # ── Dragging ───────────────────────────────────────────────────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = (
-                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            )
-        super().mousePressEvent(event)
+                e.globalPosition().toPoint() - self.frameGeometry().topLeft())
+        super().mousePressEvent(e)
 
-    def mouseMoveEvent(self, event):
-        if (self._drag_pos is not None
-                and event.buttons() & Qt.MouseButton.LeftButton):
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-        super().mouseMoveEvent(event)
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and e.buttons() & Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(e)
 
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
-    # ── UI ─────────────────────────────────────────────────────────────────────
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None; super().mouseReleaseEvent(e)
 
     def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 16, 16, 16)
-
-        card = QFrame()
-        card.setObjectName("logCard")
-        outer.addWidget(card)
-
+        outer = QVBoxLayout(self); outer.setContentsMargins(16, 16, 16, 16)
+        card = QFrame(); card.setObjectName("logCard"); outer.addWidget(card)
         root = QVBoxLayout(card)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(14)
+        root.setContentsMargins(24, 20, 24, 20); root.setSpacing(14)
 
-        # ── Header ──────────────────────────────────────────────────────
-        hdr = QHBoxLayout()
-        title = QLabel("Intervention Logs")
-        title.setStyleSheet(
-            "color:#e8eaf0; font-size:16px; font-weight:bold; background:transparent;")
-        sub = QLabel("All AI-generated intervention records")
-        sub.setStyleSheet(
-            "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;")
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        title_col.addWidget(title)
-        title_col.addWidget(sub)
-        hdr.addLayout(title_col)
-        hdr.addStretch()
+        hdr = QHBoxLayout(); tc = QVBoxLayout(); tc.setSpacing(2)
+        for text, style in [
+            ("Intervention Logs",
+             "color:#e8eaf0; font-size:16px; font-weight:bold; background:transparent;"),
+            ("All AI-generated intervention records",
+             "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"),
+        ]:
+            lbl = QLabel(text); lbl.setStyleSheet(style); tc.addWidget(lbl)
+        hdr.addLayout(tc); hdr.addStretch()
+        xb = QPushButton("✕"); xb.setObjectName("logCloseBtn")
+        xb.setFixedSize(28, 28); xb.setCursor(Qt.CursorShape.PointingHandCursor)
+        xb.clicked.connect(self.reject)
+        hdr.addWidget(xb); root.addLayout(hdr)
 
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("logCloseBtn")
-        close_btn.setFixedSize(28, 28)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.clicked.connect(self.reject)
-        hdr.addWidget(close_btn)
-        root.addLayout(hdr)
-
-        # ── Search + filter row 1 ────────────────────────────────────────
-        f1 = QHBoxLayout()
-        f1.setSpacing(10)
-
-        self._sid_search = QLineEdit()
-        self._sid_search.setObjectName("logSearch")
-        self._sid_search.setPlaceholderText("🔍  Student ID")
-        self._sid_search.setFixedWidth(150)
-        self._sid_search.textChanged.connect(self._on_filter_changed)
-
-        self._name_search = QLineEdit()
-        self._name_search.setObjectName("logSearch")
-        self._name_search.setPlaceholderText("🔍  Student Name")
-        self._name_search.setFixedWidth(200)
-        self._name_search.textChanged.connect(self._on_filter_changed)
-
-        self._ay_filter = QComboBox()
-        self._ay_filter.setObjectName("logCombo")
-        self._ay_filter.addItem("All Terms")
-        self._ay_filter.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ay_filter.currentIndexChanged.connect(self._on_filter_changed)
-
-        self._sem_filter = QComboBox()
-        self._sem_filter.setObjectName("logCombo")
-        self._sem_filter.addItems(["All Semesters", "1st Semester", "2nd Semester"])
-        self._sem_filter.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._sem_filter.currentIndexChanged.connect(self._on_filter_changed)
-
-        self._mode_filter = QComboBox()
-        self._mode_filter.setObjectName("logCombo")
-        self._mode_filter.addItems(["All Types", "per_student", "cohort"])
-        self._mode_filter.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._mode_filter.currentIndexChanged.connect(self._on_filter_changed)
-
-        self._date_from = QLineEdit()
-        self._date_from.setObjectName("logSearch")
-        self._date_from.setPlaceholderText("From (YYYY-MM-DD)")
-        self._date_from.setFixedWidth(148)
-        self._date_from.textChanged.connect(self._on_filter_changed)
-
-        self._date_to = QLineEdit()
-        self._date_to.setObjectName("logSearch")
-        self._date_to.setPlaceholderText("To (YYYY-MM-DD)")
-        self._date_to.setFixedWidth(148)
-        self._date_to.textChanged.connect(self._on_filter_changed)
-
-        clear_btn = QPushButton("✕  Clear")
-        clear_btn.setObjectName("logClearBtn")
-        clear_btn.setFixedHeight(32)
-        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_btn.clicked.connect(self._clear_filters)
-
-        for w in [self._sid_search, self._name_search,
-                  self._ay_filter, self._sem_filter, self._mode_filter,
-                  self._date_from, self._date_to, clear_btn]:
+        f1 = QHBoxLayout(); f1.setSpacing(10)
+        self._sid_search  = self._inp("🔍  Student ID",    150)
+        self._name_search = self._inp("🔍  Student Name",  200)
+        self._ay_filter   = self._cb(["All Terms"])
+        self._sem_filter  = self._cb(["All Semesters","1st Semester","2nd Semester"])
+        self._mode_filter = self._cb(["All Types","per_student","cohort"])
+        self._date_from   = self._inp("From (YYYY-MM-DD)", 148)
+        self._date_to     = self._inp("To (YYYY-MM-DD)",   148)
+        clr = QPushButton("✕  Clear"); clr.setObjectName("logClearBtn")
+        clr.setFixedHeight(32); clr.setCursor(Qt.CursorShape.PointingHandCursor)
+        clr.clicked.connect(self._clear_filters)
+        for w in [self._sid_search, self._name_search, self._ay_filter,
+                  self._sem_filter, self._mode_filter, self._date_from,
+                  self._date_to, clr]:
             f1.addWidget(w)
         f1.addStretch()
+        self._count_lbl = QLabel(""); self._count_lbl.setObjectName("logCount")
+        f1.addWidget(self._count_lbl); root.addLayout(f1)
+        for w in (self._sid_search, self._name_search,
+                  self._date_from, self._date_to):
+            w.textChanged.connect(self._on_filter_changed)
+        for c in (self._ay_filter, self._sem_filter, self._mode_filter):
+            c.currentIndexChanged.connect(self._on_filter_changed)
 
-        self._count_lbl = QLabel("")
-        self._count_lbl.setObjectName("logCount")
-        f1.addWidget(self._count_lbl)
-        root.addLayout(f1)
+        self._batch_bar_frame = QFrame()
+        self._batch_bar_frame.setObjectName("logBatchBar")
+        self._batch_bar_frame.setVisible(False)
+        bb = QHBoxLayout(self._batch_bar_frame)
+        bb.setContentsMargins(12, 8, 12, 8); bb.setSpacing(10)
 
-        # ── Table ────────────────────────────────────────────────────────
-        self._table = QTableWidget()
-        self._table.setObjectName("logTable")
-        self._table.setColumnCount(10)
+        self._sel_lbl = QLabel("0 selected")
+        self._sel_lbl.setStyleSheet(
+            "color:rgba(255,255,255,0.55); font-size:12px; background:transparent;")
+
+        self._del_selected_btn = QPushButton("🗑  Delete Selected")
+        self._del_selected_btn.setObjectName("logBatchDelBtn")
+        self._del_selected_btn.setFixedHeight(30)
+        self._del_selected_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._del_selected_btn.clicked.connect(self._on_delete_selected)
+
+        self._del_all_btn = QPushButton("🗑  Delete All Filtered")
+        self._del_all_btn.setObjectName("logBatchDelAllBtn")
+        self._del_all_btn.setFixedHeight(30)
+        self._del_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._del_all_btn.clicked.connect(self._on_delete_all_filtered)
+
+        desel_btn = QPushButton("✕  Deselect All")
+        desel_btn.setObjectName("logClearBtn")
+        desel_btn.setFixedHeight(30)
+        desel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        desel_btn.clicked.connect(self._deselect_all)
+
+        bb.addWidget(self._sel_lbl)
+        bb.addWidget(self._del_selected_btn)
+        bb.addWidget(self._del_all_btn)
+        bb.addStretch()
+        bb.addWidget(desel_btn)
+        root.addWidget(self._batch_bar_frame)
+
+        self._table = QTableWidget(); self._table.setObjectName("logTable")
+        self._table.setColumnCount(11)
         self._table.setHorizontalHeaderLabels([
-            "ID", "Student ID", "Name", "Term",
-            "Type", "Risk", "Recommendations", "Logged At",
-            "View", "Delete",
+            "☐", "ID", "Student ID", "Name", "Term",
+            "Type", "Risk", "Recs", "Logged At", "View", "Delete",
         ])
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setHighlightSections(False)
         self._table.setShowGrid(False)
-        self._table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        for col, mode in [
-            (0, QHeaderView.ResizeMode.ResizeToContents),
-            (3, QHeaderView.ResizeMode.ResizeToContents),
-            (4, QHeaderView.ResizeMode.ResizeToContents),
-            (5, QHeaderView.ResizeMode.ResizeToContents),
-            (6, QHeaderView.ResizeMode.ResizeToContents),
-            (7, QHeaderView.ResizeMode.ResizeToContents),
-            (8, QHeaderView.ResizeMode.Fixed),
-            (9, QHeaderView.ResizeMode.Fixed),
+        self._table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for col, m, w in [
+            (self._COL_CHK,  QHeaderView.ResizeMode.Fixed,            32),
+            (self._COL_ID,   QHeaderView.ResizeMode.Fixed,            44),
+            (self._COL_SID,  QHeaderView.ResizeMode.Fixed,            80),
+            (self._COL_NAME, QHeaderView.ResizeMode.Fixed,           160),
+            (self._COL_TERM, QHeaderView.ResizeMode.ResizeToContents, 0),
+            (self._COL_TYPE, QHeaderView.ResizeMode.ResizeToContents, 0),
+            (self._COL_RISK, QHeaderView.ResizeMode.ResizeToContents, 0),
+            (self._COL_RECS, QHeaderView.ResizeMode.ResizeToContents, 0),
+            (self._COL_LOG,  QHeaderView.ResizeMode.ResizeToContents, 0),
+            (self._COL_VIEW, QHeaderView.ResizeMode.Fixed,            56),
+            (self._COL_DEL,  QHeaderView.ResizeMode.Fixed,            56),
         ]:
-            self._table.horizontalHeader().setSectionResizeMode(col, mode)
-        self._table.setColumnWidth(8, 56)
-        self._table.setColumnWidth(9, 56)
+            hh.setSectionResizeMode(col, m)
+            if w:
+                self._table.setColumnWidth(col, w)
+
         root.addWidget(self._table, 1)
 
-        # ── Pagination ───────────────────────────────────────────────────
-        pag = QHBoxLayout()
-        pag.setSpacing(8)
-
+        pag = QHBoxLayout(); pag.setSpacing(8)
         self._prev_btn = QPushButton("‹  Prev")
-        self._prev_btn.setObjectName("logPagBtn")
-        self._prev_btn.setFixedHeight(30)
+        self._prev_btn.setObjectName("logPagBtn"); self._prev_btn.setFixedHeight(30)
         self._prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._prev_btn.clicked.connect(self._prev_page)
         self._prev_btn.setEnabled(False)
@@ -1096,32 +917,75 @@ class InterventionLogDialog(QDialog):
         self._page_lbl.setFixedWidth(110)
 
         self._next_btn = QPushButton("Next  ›")
-        self._next_btn.setObjectName("logPagBtn")
-        self._next_btn.setFixedHeight(30)
+        self._next_btn.setObjectName("logPagBtn"); self._next_btn.setFixedHeight(30)
         self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._next_btn.clicked.connect(self._next_page)
         self._next_btn.setEnabled(False)
 
-        self._status_lbl = QLabel("")
-        self._status_lbl.setObjectName("logCount")
+        self._status_lbl = QLabel(""); self._status_lbl.setObjectName("logCount")
 
-        pag.addWidget(self._prev_btn)
-        pag.addWidget(self._page_lbl)
-        pag.addWidget(self._next_btn)
-        pag.addStretch()
-        pag.addWidget(self._status_lbl)
-        root.addLayout(pag)
+        pag.addWidget(self._prev_btn); pag.addWidget(self._page_lbl)
+        pag.addWidget(self._next_btn); pag.addStretch()
+        pag.addWidget(self._status_lbl); root.addLayout(pag)
 
-    # ── Loading ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _inp(ph: str, w: int) -> QLineEdit:
+        e = QLineEdit(); e.setObjectName("logSearch")
+        e.setPlaceholderText(ph); e.setFixedWidth(w); return e
+
+    @staticmethod
+    def _cb(items: list) -> QComboBox:
+        c = QComboBox(); c.setObjectName("logCombo")
+        c.addItems(items); c.setCursor(Qt.CursorShape.PointingHandCursor); return c
+
+    def _checked_ids(self) -> list[int]:
+        ids = []
+        start = self._page * self.PAGE_SIZE
+        for ri in range(self._table.rowCount()):
+            cb = self._table.cellWidget(ri, self._COL_CHK)
+            if cb and cb.isChecked():
+                row = self._all_rows[start + ri]
+                ids.append(row.get("intervention_id"))
+        return [i for i in ids if i is not None]
+
+    def _update_batch_bar(self):
+        ids = self._checked_ids()
+        n   = len(ids)
+        self._sel_lbl.setText(
+            f"{n} row{'s' if n != 1 else ''} selected on this page")
+        self._batch_bar_frame.setVisible(n > 0)
+        self._del_selected_btn.setEnabled(n > 0)
+
+    def _on_header_clicked(self, col: int):
+        if col != self._COL_CHK:
+            return
+        any_unchecked = False
+        for r in range(self._table.rowCount()):
+            cb = self._table.cellWidget(r, self._COL_CHK)
+            if cb and not cb.isChecked():
+                any_unchecked = True
+                break
+        for r in range(self._table.rowCount()):
+            cb = self._table.cellWidget(r, self._COL_CHK)
+            if cb:
+                cb.setChecked(any_unchecked)
+        self._update_batch_bar()
+
+    def _deselect_all(self):
+        for r in range(self._table.rowCount()):
+            cb = self._table.cellWidget(r, self._COL_CHK)
+            if cb:
+                cb.setChecked(False)
+        self._update_batch_bar()
 
     def _build_filters(self) -> dict:
-        ay  = self._ay_filter.currentText()
-        sem = self._sem_filter.currentIndex()   # 0=All, 1=1st, 2=2nd
+        ay = self._ay_filter.currentText()
+        sem = self._sem_filter.currentIndex()
         mode = self._mode_filter.currentText()
         return {
-            "academic_year": ay  if ay  != "All Terms"     else "",
-            "semester":      sem if sem != 0               else "",
-            "mode":          mode if mode != "All Types"   else "",
+            "academic_year": ay   if ay   != "All Terms"  else "",
+            "semester":      sem  if sem  != 0            else "",
+            "mode":          mode if mode != "All Types"  else "",
             "student_id":    self._sid_search.text().strip(),
             "student_name":  self._name_search.text().strip(),
             "date_from":     self._date_from.text().strip(),
@@ -1130,45 +994,39 @@ class InterventionLogDialog(QDialog):
 
     def _load(self):
         self._status_lbl.setText("Loading…")
-        self._loader = _LogLoader(self._build_filters())
+        self._loader = LogLoader(self._build_filters())
         self._loader.finished.connect(self._on_loaded)
-        self._loader.error.connect(self._on_load_error)
+        self._loader.error.connect(lambda m: (
+            self._status_lbl.setText(f"⚠ {m}"),
+            _safe_cleanup(self._loader),
+        ))
         self._loader.finished.connect(self._loader.deleteLater)
-        self._loader.error.connect(self._loader.deleteLater)
         self._loader.start()
 
     def _on_loaded(self, rows: list):
-        self._all_rows = rows
-        self._page     = 0
-        self._populate_ay_filter(rows)
-        self._render_page()
+        self._all_rows = rows; self._page = 0
+        self._populate_ay_filter(rows); self._render_page()
         self._status_lbl.setText("")
+        self._batch_bar_frame.setVisible(False)
 
-    def _on_load_error(self, msg: str):
-        self._status_lbl.setText(f"⚠ {msg}")
-
-    def _populate_ay_filter(self, rows: list):
-        current = self._ay_filter.currentText()
-        self._ay_filter.blockSignals(True)
-        self._ay_filter.clear()
+    def _populate_ay_filter(self, rows):
+        cur = self._ay_filter.currentText()
+        self._ay_filter.blockSignals(True); self._ay_filter.clear()
         self._ay_filter.addItem("All Terms")
         seen = []
         for r in rows:
             ay = str(r.get("academic_year", ""))
             if ay and ay not in seen:
-                seen.append(ay)
-                self._ay_filter.addItem(ay)
-        idx = self._ay_filter.findText(current)
+                seen.append(ay); self._ay_filter.addItem(ay)
+        idx = self._ay_filter.findText(cur)
         self._ay_filter.setCurrentIndex(idx if idx >= 0 else 0)
         self._ay_filter.blockSignals(False)
 
     def _on_filter_changed(self):
-        """Debounce: reload 400ms after last keystroke."""
-        if not hasattr(self, "_filter_timer"):
-            self._filter_timer = QTimer(self)
-            self._filter_timer.setSingleShot(True)
-            self._filter_timer.timeout.connect(self._load)
-        self._filter_timer.start(400)
+        if not hasattr(self, "_ft"):
+            self._ft = QTimer(self); self._ft.setSingleShot(True)
+            self._ft.timeout.connect(self._load)
+        self._ft.start(400)
 
     def _clear_filters(self):
         for w in (self._sid_search, self._name_search,
@@ -1178,33 +1036,23 @@ class InterventionLogDialog(QDialog):
             c.blockSignals(True); c.setCurrentIndex(0); c.blockSignals(False)
         self._load()
 
-    # ── Pagination ──────────────────────────────────────────────────────────────
-
-    def _total_pages(self) -> int:
+    def _total_pages(self):
         return max(1, (len(self._all_rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
 
     def _prev_page(self):
         if self._page > 0:
-            self._page -= 1
-            self._render_page()
+            self._page -= 1; self._render_page()
 
     def _next_page(self):
         if self._page < self._total_pages() - 1:
-            self._page += 1
-            self._render_page()
-
-    # ── Table render ────────────────────────────────────────────────────────────
+            self._page += 1; self._render_page()
 
     def _render_page(self):
-        start  = self._page * self.PAGE_SIZE
-        end    = start + self.PAGE_SIZE
-        rows   = self._all_rows[start:end]
-        total  = len(self._all_rows)
-        pages  = self._total_pages()
+        start = self._page * self.PAGE_SIZE
+        rows  = self._all_rows[start:start + self.PAGE_SIZE]
+        total = len(self._all_rows); pages = self._total_pages()
 
-        self._count_lbl.setText(
-            f"{total:,} record{'s' if total != 1 else ''}"
-        )
+        self._count_lbl.setText(f"{total:,} record{'s' if total != 1 else ''}")
         self._page_lbl.setText(f"Page {self._page+1} of {pages}")
         self._prev_btn.setEnabled(self._page > 0)
         self._next_btn.setEnabled(self._page < pages - 1)
@@ -1215,1477 +1063,933 @@ class InterventionLogDialog(QDialog):
 
         for ri, row in enumerate(rows):
             iid     = row.get("intervention_id", "")
-            sid     = str(row.get("student_id")  or "—")
+            sid     = str(row.get("student_id") or "—")
             name    = str(row.get("student_name") or "—").strip() or "—"
+            if len(name) > 22:
+                name = name[:20] + "…"
             ay      = str(row.get("academic_year") or "—")
             sem_n   = row.get("semester")
-            sem_s   = ("1st" if sem_n == 1 else "2nd" if sem_n == 2 else "—")
             term    = f"{ay} S{sem_n}" if sem_n else ay
             mode    = str(row.get("mode") or "—")
             risk_l  = str(row.get("risk_label") or "—")
             rec_cnt = row.get("rec_count", 0)
             logged  = row.get("logged_at")
-            logged_s = (logged.strftime("%b %d, %Y %H:%M")
-                        if hasattr(logged, "strftime")
-                        else str(logged or "—")[:16])
-
-            risk_color = QColor(
+            ls      = (logged.strftime("%b %d, %Y %H:%M")
+                       if hasattr(logged, "strftime")
+                       else str(logged or "—")[:16])
+            rc = QColor(
                 "#ff5b5b" if "high" in risk_l.lower() else
                 "#f5b335" if "medium" in risk_l.lower() or "mod" in risk_l.lower()
-                else "#34d399"
-            )
-            mode_label = "Per Student" if mode == "per_student" else "Cohort"
+                else "#34d399")
+            ml = "Per Student" if mode == "per_student" else "Cohort"
 
-            cells = [
-                (str(iid),        None),
-                (sid,             None),
-                (name,            None),
-                (term,            None),
-                (mode_label,      None),
-                (risk_l,          risk_color),
-                (f"{rec_cnt} recs", None),
-                (logged_s,        None),
-            ]
+            cb = QPushButton()
+            cb.setObjectName("logCheckBtn")
+            cb.setCheckable(True)
+            cb.setFixedSize(20, 20)
+            cb.setToolTip("Select row")
+            cb.toggled.connect(lambda _: self._update_batch_bar())
+            self._table.setCellWidget(ri, self._COL_CHK, cb)
 
-            for ci, (text, color) in enumerate(cells):
+            for ci, (text, color) in enumerate([
+                (str(iid), None), (sid, None), (name, None), (term, None),
+                (ml, None), (risk_l, rc), (f"{rec_cnt} recs", None), (ls, None),
+            ], 1):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignVCenter |
-                    Qt.AlignmentFlag.AlignLeft
-                )
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
                 if color:
                     item.setForeground(color)
                     item.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
                 self._table.setItem(ri, ci, item)
 
-            # View button — centered in cell
-            view_btn = QPushButton("👁")
-            view_btn.setObjectName("logViewBtn")
-            view_btn.setFixedSize(36, 26)
-            view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            view_btn.setToolTip(f"View recommendations for intervention #{iid}")
-            view_btn.clicked.connect(
-                lambda _, r=row: self._on_view_clicked(r))
-            view_cell = QWidget()
-            view_cell.setStyleSheet("background:transparent;")
-            view_cell_lo = QHBoxLayout(view_cell)
-            view_cell_lo.setContentsMargins(0, 0, 0, 0)
-            view_cell_lo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            view_cell_lo.addWidget(view_btn)
-            self._table.setCellWidget(ri, 8, view_cell)
-
-            # Delete button — centered in cell
-            del_btn = QPushButton("🗑")
-            del_btn.setObjectName("logDelBtn")
-            del_btn.setFixedSize(36, 26)
-            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            del_btn.setToolTip(f"Delete intervention #{iid}")
-            del_btn.clicked.connect(
-                lambda _, rid=iid: self._on_delete_clicked(rid))
-            del_cell = QWidget()
-            del_cell.setStyleSheet("background:transparent;")
-            del_cell_lo = QHBoxLayout(del_cell)
-            del_cell_lo.setContentsMargins(0, 0, 0, 0)
-            del_cell_lo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            del_cell_lo.addWidget(del_btn)
-            self._table.setCellWidget(ri, 9, del_cell)
+            for col_idx, (obj, lbl, hdl) in enumerate([
+                ("logViewBtn", "👁", lambda _, r=row: self._on_view(r)),
+                ("logDelBtn",  "🗑", lambda _, rid=iid: self._on_del(rid)),
+            ], self._COL_VIEW):
+                btn = QPushButton(lbl); btn.setObjectName(obj)
+                btn.setFixedSize(38, 28)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.clicked.connect(hdl)
+                cell = QWidget(); cell.setStyleSheet("background:transparent;")
+                cl = QHBoxLayout(cell); cl.setContentsMargins(4, 2, 4, 2)
+                cl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cl.addWidget(btn)
+                self._table.setCellWidget(ri, col_idx, cell)
 
         self._table.setUpdatesEnabled(True)
 
-    # ── Delete ──────────────────────────────────────────────────────────────────
+        for r in range(self._table.rowCount()):
+            self._table.setRowHeight(r, 38)
 
-    def _on_view_clicked(self, row: dict):
-        """Load full recommendations for this record and show detail dialog."""
-        iid  = row.get("intervention_id")
-        mode = row.get("mode", "per_student")
-        recs = None
+        self._update_batch_bar()
 
-        # Recommendations may already be in the row if fully loaded
-        if row.get("recommendations") is not None:
-            recs = row["recommendations"]
-
+    def _on_view(self, row: dict):
+        iid = row.get("intervention_id"); recs = row.get("recommendations")
         if recs is None:
-            # Fetch from DB
             conn = DataStore.get().db_conn
             try:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT recommendations FROM public.interventions "
                         "WHERE intervention_id = %s", (iid,))
-                    db_row = cur.fetchone()
-                    recs = db_row[0] if db_row else []
-            except Exception as e:
-                recs = []
-
-        if isinstance(recs, str):
-            try:
-                recs = json.loads(recs)
+                    dr = cur.fetchone(); recs = dr[0] if dr else []
             except Exception:
                 recs = []
+        if isinstance(recs, str):
+            try: recs = json.loads(recs)
+            except Exception: recs = []
+        _InterventionDetailDialog(row, recs or [], self).exec()
 
-        dlg = _InterventionDetailDialog(row, recs or [], self)
-        dlg.exec()
+    def _on_del(self, intervention_id: int):
+        if not self._confirm_delete(
+                "Delete Intervention Log",
+                "Permanently delete this intervention record?",
+                "This cannot be undone."):
+            return
+        self._status_lbl.setText("Deleting…")
+        self._deleter = LogDeleter(intervention_id)
+        self._deleter.finished.connect(lambda iid: self._remove_ids([iid], "record"))
+        self._deleter.error.connect(lambda m: (
+            self._status_lbl.setText(f"⚠ {m[:80]}"),
+            _safe_cleanup(self._deleter),
+        ))
+        self._deleter.finished.connect(self._deleter.deleteLater)
+        self._deleter.start()
 
-    def _on_delete_clicked(self, intervention_id: int):
+    def _on_delete_selected(self):
+        ids = self._checked_ids()
+        if not ids:
+            return
+        if not self._confirm_delete(
+                "Delete Selected",
+                f"Permanently delete {len(ids):,} selected "
+                f"intervention record{'s' if len(ids) != 1 else ''}?",
+                "This cannot be undone."):
+            return
+        self._run_batch_delete(ids)
+
+    def _on_delete_all_filtered(self):
+        total = len(self._all_rows)
+        if not total:
+            return
+        if not self._confirm_delete(
+                "Delete All Filtered Records",
+                f"Permanently delete all {total:,} filtered "
+                f"intervention record{'s' if total != 1 else ''}?",
+                "This will delete every record currently shown — "
+                "across all pages. This cannot be undone."):
+            return
+        ids = [r.get("intervention_id") for r in self._all_rows
+               if r.get("intervention_id") is not None]
+        self._run_batch_delete(ids)
+
+    def _run_batch_delete(self, ids: list[int]):
+        self._status_lbl.setText(f"Deleting {len(ids):,} records…")
+        self._del_selected_btn.setEnabled(False)
+        self._del_all_btn.setEnabled(False)
+        self._batch_deleter = BatchLogDeleter(ids)
+        self._batch_deleter.finished.connect(
+            lambda deleted: self._remove_ids(deleted, "records"))
+        self._batch_deleter.error.connect(lambda m: (
+            self._status_lbl.setText(f"⚠ Delete failed: {m[:80]}"),
+            self._del_selected_btn.setEnabled(True),
+            self._del_all_btn.setEnabled(True),
+            _safe_cleanup(self._batch_deleter),
+        ))
+        self._batch_deleter.finished.connect(self._batch_deleter.deleteLater)
+        self._batch_deleter.start()
+
+    def _remove_ids(self, deleted_ids: list, noun: str):
+        deleted_set = set(deleted_ids)
+        self._all_rows = [r for r in self._all_rows
+                          if r.get("intervention_id") not in deleted_set]
+        if self._page >= self._total_pages():
+            self._page = max(0, self._total_pages() - 1)
+        n = len(deleted_ids)
+        self._status_lbl.setText(f"✓  {n:,} {noun} deleted.")
+        self._del_selected_btn.setEnabled(True)
+        self._del_all_btn.setEnabled(True)
+        self._render_page()
+        QTimer.singleShot(3000, lambda: self._status_lbl.setText(""))
+
+    def _confirm_delete(self, title: str, text: str, info: str) -> bool:
         msg = QMessageBox(self)
-        msg.setWindowTitle("Delete Intervention Log")
-        msg.setText("Permanently delete this intervention record?")
-        msg.setInformativeText(
-            "Warning: This action will permanently delete the selected "
-            "intervention log record. This operation cannot be undone. "
-            "Are you sure you want to continue?"
-        )
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setInformativeText(info)
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setStandardButtons(
-            QMessageBox.StandardButton.Cancel |
-            QMessageBox.StandardButton.Yes
-        )
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes)
         msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
         msg.button(QMessageBox.StandardButton.Yes).setText("Delete")
         msg.setStyleSheet("""
             QMessageBox { background:#13172a; }
-            QMessageBox QLabel {
-                color:#e8eaf0; font-size:13px; background:transparent;
-            }
+            QMessageBox QLabel { color:#e8eaf0; font-size:13px; background:transparent; }
             QMessageBox QPushButton {
                 background:rgba(255,255,255,0.06);
-                border:1px solid rgba(255,255,255,0.14);
-                border-radius:8px; color:rgba(255,255,255,0.80);
-                font-size:12px; font-weight:600;
-                padding:8px 24px; min-width:80px;
-            }
-            QMessageBox QPushButton:hover {
-                background:rgba(255,255,255,0.12);
-            }
+                border:1px solid rgba(255,255,255,0.14); border-radius:8px;
+                color:rgba(255,255,255,0.80); font-size:12px; font-weight:600;
+                padding:8px 24px; min-width:80px; }
+            QMessageBox QPushButton:hover { background:rgba(255,255,255,0.12); }
             QMessageBox QPushButton[text="Delete"] {
                 background:rgba(255,91,91,0.15);
-                border-color:rgba(255,91,91,0.40); color:#ff5b5b;
-            }
+                border-color:rgba(255,91,91,0.40); color:#ff5b5b; }
             QMessageBox QPushButton[text="Delete"]:hover {
-                background:rgba(255,91,91,0.28);
-            }
+                background:rgba(255,91,91,0.28); }
         """)
-
-        if msg.exec() != QMessageBox.StandardButton.Yes:
-            return
-
-        self._status_lbl.setText("Deleting…")
-        self._deleter = _LogDeleter(intervention_id)
-        self._deleter.finished.connect(self._on_deleted)
-        self._deleter.error.connect(self._on_delete_error)
-        self._deleter.finished.connect(self._deleter.deleteLater)
-        self._deleter.error.connect(self._deleter.deleteLater)
-        self._deleter.start()
-
-    def _on_deleted(self, iid: int):
-        self._status_lbl.setText(f"✓  Record #{iid} deleted.")
-        self._all_rows = [
-            r for r in self._all_rows if r.get("intervention_id") != iid]
-        # Adjust page if last row on current page was removed
-        if self._page >= self._total_pages():
-            self._page = max(0, self._total_pages() - 1)
-        self._render_page()
-        QTimer.singleShot(
-            3000, lambda: self._status_lbl.setText(""))
-
-    def _on_delete_error(self, msg: str):
-        self._status_lbl.setText(f"⚠ Delete failed: {msg[:80]}")
-
-    # ── Styles ──────────────────────────────────────────────────────────────────
+        return msg.exec() == QMessageBox.StandardButton.Yes
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            InterventionLogDialog { background: transparent; }
-            #logCard {
-                background:#13172a;
-                border:1px solid rgba(255,255,255,0.10);
-                border-radius:16px;
-            }
-            #logCloseBtn {
-                background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.10);
-                border-radius:7px; color:rgba(255,255,255,0.35);
-                font-size:13px; font-weight:bold;
-            }
-            #logCloseBtn:hover {
-                background:rgba(255,91,91,0.15);
-                border-color:rgba(255,91,91,0.35); color:#ff5b5b;
-            }
-            QLineEdit#logSearch {
-                background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.10);
-                border-radius:8px; color:#e8eaf0;
-                font-size:12px; padding:6px 10px;
-            }
-            QLineEdit#logSearch:focus {
-                border-color:rgba(52,211,153,0.40);
-            }
-            QComboBox#logCombo {
-                background:rgba(255,255,255,0.06);
-                border:1px solid rgba(255,255,255,0.12);
-                border-radius:8px; color:#e8eaf0;
-                font-size:12px; padding:5px 10px; min-height:30px;
-            }
-            QComboBox#logCombo:hover { border-color:rgba(52,211,153,0.35); }
-            QComboBox#logCombo::drop-down { border:none; width:16px; }
-            QComboBox#logCombo QAbstractItemView {
-                background:#1a1f35; color:#e8eaf0;
-                selection-background-color:rgba(52,211,153,0.18);
-            }
-            QPushButton#logClearBtn {
-                background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.10);
-                border-radius:8px; color:rgba(255,255,255,0.50);
-                font-size:11px; padding:0 12px;
-            }
-            QPushButton#logClearBtn:hover {
-                background:rgba(255,255,255,0.10);
-                color:rgba(255,255,255,0.80);
-            }
-            QTableWidget#logTable {
-                background:transparent; border:none;
-                color:rgba(255,255,255,0.85); font-size:12px;
-                alternate-background-color:rgba(255,255,255,0.025);
-                selection-background-color:rgba(79,140,255,0.15);
-                selection-color:white; gridline-color:transparent;
-            }
-            QTableWidget#logTable QHeaderView::section {
-                background:rgba(255,255,255,0.05);
-                color:rgba(255,255,255,0.45);
-                font-size:11px; font-weight:bold; border:none;
-                border-right:1px solid rgba(255,255,255,0.06);
-                padding:8px 10px;
-            }
-            QTableWidget#logTable QHeaderView::section:last {
-                border-right:none;
-            }
-            QPushButton#logViewBtn {
-                background:rgba(79,140,255,0.08);
-                border:1px solid rgba(79,140,255,0.25);
-                border-radius:6px; color:#4f8cff;
-                font-size:13px;
-            }
-            QPushButton#logViewBtn:hover {
-                background:rgba(79,140,255,0.20);
-                border-color:rgba(79,140,255,0.50);
-            }
-            QPushButton#logDelBtn {
+            #logCard { background:#13172a;
+                border:1px solid rgba(255,255,255,0.10); border-radius:16px; }
+            #logCloseBtn { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.10); border-radius:7px;
+                color:rgba(255,255,255,0.35); font-size:13px; font-weight:bold; }
+            #logCloseBtn:hover { background:rgba(255,91,91,0.15);
+                border-color:rgba(255,91,91,0.35); color:#ff5b5b; }
+            #logBatchBar { background:rgba(255,91,91,0.06);
+                border:1px solid rgba(255,91,91,0.18); border-radius:8px; }
+            QPushButton#logBatchDelBtn {
+                background:rgba(255,91,91,0.14);
+                border:1px solid rgba(255,91,91,0.35);
+                border-radius:7px; color:#ff5b5b;
+                font-size:12px; font-weight:600; padding:0 14px; }
+            QPushButton#logBatchDelBtn:hover { background:rgba(255,91,91,0.26); }
+            QPushButton#logBatchDelBtn:disabled {
+                background:rgba(255,255,255,0.04);
+                border-color:rgba(255,255,255,0.08);
+                color:rgba(255,255,255,0.20); }
+            QPushButton#logBatchDelAllBtn {
                 background:rgba(255,91,91,0.08);
                 border:1px solid rgba(255,91,91,0.25);
-                border-radius:6px; color:#ff5b5b;
-                font-size:13px;
-            }
-            QPushButton#logDelBtn:hover {
-                background:rgba(255,91,91,0.20);
-                border-color:rgba(255,91,91,0.50);
-            }
-            QPushButton#logPagBtn {
-                background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.10);
-                border-radius:7px; color:rgba(255,255,255,0.60);
-                font-size:11px; padding:0 14px;
-            }
-            QPushButton#logPagBtn:hover {
-                background:rgba(255,255,255,0.10);
-                color:rgba(255,255,255,0.90);
-            }
-            QPushButton#logPagBtn:disabled {
-                color:rgba(255,255,255,0.20);
-                border-color:rgba(255,255,255,0.06);
-            }
-            #logCount {
-                color:rgba(255,255,255,0.35); font-size:11px;
-                background:transparent;
-            }
-            QScrollBar:vertical { background:transparent; width:8px; }
-            QScrollBar::handle:vertical {
+                border-radius:7px; color:rgba(255,91,91,0.75);
+                font-size:12px; font-weight:600; padding:0 14px; }
+            QPushButton#logBatchDelAllBtn:hover { background:rgba(255,91,91,0.20); }
+            QPushButton#logCheckBtn {
+                background:rgba(255,255,255,0.06);
+                border:1px solid rgba(255,255,255,0.18);
+                border-radius:4px; color:transparent; }
+            QPushButton#logCheckBtn:hover {
                 background:rgba(255,255,255,0.12);
-                border-radius:4px; min-height:30px;
-            }
-            QScrollBar::handle:vertical:hover { background:rgba(255,255,255,0.22); }
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical { height:0; }
+                border-color:rgba(255,91,91,0.40); }
+            QPushButton#logCheckBtn:checked {
+                background:#ff5b5b; border-color:#ff5b5b; color:white; }
+            QLineEdit#logSearch { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.10); border-radius:8px;
+                color:#e8eaf0; font-size:12px; padding:6px 10px; }
+            QLineEdit#logSearch:focus { border-color:rgba(52,211,153,0.40); }
+            QComboBox#logCombo { background:rgba(255,255,255,0.06);
+                border:1px solid rgba(255,255,255,0.12); border-radius:8px;
+                color:#e8eaf0; font-size:12px; padding:5px 10px; min-height:30px; }
+            QComboBox#logCombo:hover { border-color:rgba(52,211,153,0.35); }
+            QComboBox#logCombo::drop-down { border:none; width:16px; }
+            QComboBox#logCombo QAbstractItemView { background:#1a1f35; color:#e8eaf0;
+                selection-background-color:rgba(52,211,153,0.18); }
+            QPushButton#logClearBtn { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.10); border-radius:8px;
+                color:rgba(255,255,255,0.50); font-size:11px; padding:0 12px; }
+            QPushButton#logClearBtn:hover { background:rgba(255,255,255,0.10);
+                color:rgba(255,255,255,0.80); }
+            QTableWidget#logTable { background:transparent; border:none;
+                color:rgba(255,255,255,0.85); font-size:12px;
+                alternate-background-color:rgba(255,255,255,0.025);
+                selection-background-color:transparent;
+                gridline-color:transparent; }
+            QTableWidget#logTable QHeaderView::section {
+                background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.45);
+                font-size:11px; font-weight:bold; border:none;
+                border-right:1px solid rgba(255,255,255,0.06); padding:8px 6px; }
+            QTableWidget#logTable QHeaderView::section:first {
+                color:rgba(255,255,255,0.30); font-size:13px; }
+            QPushButton#logViewBtn { background:rgba(79,140,255,0.08);
+                border:1px solid rgba(79,140,255,0.25);
+                border-radius:6px; color:#4f8cff; font-size:13px; }
+            QPushButton#logViewBtn:hover { background:rgba(79,140,255,0.20);
+                border-color:rgba(79,140,255,0.50); }
+            QPushButton#logDelBtn { background:rgba(255,91,91,0.08);
+                border:1px solid rgba(255,91,91,0.25);
+                border-radius:6px; color:#ff5b5b; font-size:13px; }
+            QPushButton#logDelBtn:hover { background:rgba(255,91,91,0.20);
+                border-color:rgba(255,91,91,0.50); }
+            QPushButton#logPagBtn { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.10); border-radius:7px;
+                color:rgba(255,255,255,0.60); font-size:11px; padding:0 14px; }
+            QPushButton#logPagBtn:hover { background:rgba(255,255,255,0.10);
+                color:rgba(255,255,255,0.90); }
+            QPushButton#logPagBtn:disabled { color:rgba(255,255,255,0.20);
+                border-color:rgba(255,255,255,0.06); }
+            #logCount { color:rgba(255,255,255,0.35); font-size:11px;
+                background:transparent; }
         """)
 
 
-
-# ── Term selection dialog ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Term-select dialog
+# ══════════════════════════════════════════════════════════════════════════════
 
 class _TermSelectDialog(QDialog):
-    """Modal dialog: pick an academic term before exporting the report."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select Academic Term")
-        self.setModal(True)
-        self.setFixedSize(420, 300)
+        self.setModal(True); self.setFixedSize(420, 300)
         self.setWindowFlags(
-            Qt.WindowType.Dialog |
-            Qt.WindowType.FramelessWindowHint
-        )
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._selected: tuple = ()
-        self._build_ui()
-        self._apply_styles()
-        self._load_terms()
+        self._build_ui(); self._apply_styles(); self._load_terms()
 
     def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 16, 16, 16)
-        card = QFrame()
-        card.setObjectName("termSelCard")
-        outer.addWidget(card)
-        lo = QVBoxLayout(card)
-        lo.setContentsMargins(28, 24, 28, 24)
-        lo.setSpacing(12)
-
-        title = QLabel("Export Intervention Report")
-        title.setStyleSheet(
-            "color:#e8eaf0; font-size:15px; font-weight:bold; background:transparent;")
-        sub = QLabel("Select the academic term to include in the report.")
-        sub.setWordWrap(True)
-        sub.setStyleSheet(
-            "color:rgba(255,255,255,0.40); font-size:11px; background:transparent;")
-        lo.addWidget(title)
-        lo.addWidget(sub)
-
-        div = QFrame()
-        div.setFrameShape(QFrame.Shape.HLine)
-        div.setStyleSheet("color:rgba(255,255,255,0.08);")
-        lo.addWidget(div)
-
+        outer = QVBoxLayout(self); outer.setContentsMargins(16,16,16,16)
+        card = QFrame(); card.setObjectName("termSelCard"); outer.addWidget(card)
+        lo = QVBoxLayout(card); lo.setContentsMargins(28,24,28,24); lo.setSpacing(12)
+        for text, style in [
+            ("Export Intervention Report",
+             "color:#e8eaf0; font-size:15px; font-weight:bold; background:transparent;"),
+            ("Select the academic term to include in the report.",
+             "color:rgba(255,255,255,0.40); font-size:11px; background:transparent;")]:
+            lbl = QLabel(text); lbl.setStyleSheet(style); lbl.setWordWrap(True)
+            lo.addWidget(lbl)
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet("color:rgba(255,255,255,0.08);"); lo.addWidget(div)
         lbl = QLabel("Academic Term")
         lbl.setStyleSheet(
             "color:rgba(255,255,255,0.55); font-size:11px; font-weight:600; background:transparent;")
         lo.addWidget(lbl)
-
-        self._term_combo = QComboBox()
-        self._term_combo.setObjectName("termSelCombo")
-        self._term_combo.addItem("Loading…")
-        self._term_combo.setEnabled(False)
+        self._term_combo = QComboBox(); self._term_combo.setObjectName("termSelCombo")
+        self._term_combo.addItem("Loading…"); self._term_combo.setEnabled(False)
         lo.addWidget(self._term_combo)
-
         self._status_lbl = QLabel("")
         self._status_lbl.setStyleSheet(
             "color:rgba(255,255,255,0.35); font-size:10px; background:transparent;")
-        lo.addWidget(self._status_lbl)
-        lo.addStretch()
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("termSelCancelBtn")
-        cancel_btn.setFixedHeight(36)
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn.clicked.connect(self.reject)
-
+        lo.addWidget(self._status_lbl); lo.addStretch()
+        br = QHBoxLayout(); br.setSpacing(10)
+        cb = QPushButton("Cancel"); cb.setObjectName("termSelCancelBtn")
+        cb.setFixedHeight(36); cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb.clicked.connect(self.reject)
         self._confirm_btn = QPushButton("Export  →")
-        self._confirm_btn.setObjectName("termSelConfirmBtn")
-        self._confirm_btn.setFixedHeight(36)
+        self._confirm_btn.setObjectName("termSelConfirmBtn"); self._confirm_btn.setFixedHeight(36)
         self._confirm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._confirm_btn.setEnabled(False)
-        self._confirm_btn.clicked.connect(self._on_confirm)
-
-        btn_row.addWidget(cancel_btn)
-        btn_row.addStretch()
-        btn_row.addWidget(self._confirm_btn)
-        lo.addLayout(btn_row)
+        self._confirm_btn.setEnabled(False); self._confirm_btn.clicked.connect(self._on_confirm)
+        br.addWidget(cb); br.addStretch(); br.addWidget(self._confirm_btn); lo.addLayout(br)
 
     def _load_terms(self):
         conn = DataStore.get().db_conn
         if not conn:
-            self._status_lbl.setText("No database connection.")
-            return
+            self._status_lbl.setText("No database connection."); return
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT DISTINCT academic_year, semester
-                    FROM   public.interventions
-                    ORDER  BY academic_year DESC, semester DESC
-                """)
+                cur.execute("""SELECT DISTINCT academic_year, semester
+                    FROM public.interventions ORDER BY academic_year DESC, semester DESC""")
                 terms = cur.fetchall()
         except Exception as e:
-            self._status_lbl.setText(f"Error: {e}")
-            return
-
+            self._status_lbl.setText(f"Error: {e}"); return
         self._term_combo.clear()
         if not terms:
             self._term_combo.addItem("No records found")
-            self._status_lbl.setText("No intervention records yet. Run analyses first.")
-            return
-
+            self._status_lbl.setText("No intervention records yet."); return
         self._term_combo.addItem("— Select a term —")
         for ay, sem in terms:
-            sem_label = "1st Semester" if sem == 1 else "2nd Semester"
-            self._term_combo.addItem(
-                f"{sem_label}  ·  AY {ay}", userData=(ay, sem))
+            sl = "1st Semester" if sem == 1 else "2nd Semester"
+            self._term_combo.addItem(f"{sl}  ·  AY {ay}", userData=(ay, sem))
         self._term_combo.setEnabled(True)
         self._term_combo.currentIndexChanged.connect(self._on_term_changed)
-        self._status_lbl.setText(f"{len(terms)} term(s) with intervention records.")
+        self._status_lbl.setText(f"{len(terms)} term(s) with records.")
 
-    def _on_term_changed(self, idx: int):
-        data = self._term_combo.itemData(idx, Qt.ItemDataRole.UserRole)
-        self._confirm_btn.setEnabled(data is not None)
+    def _on_term_changed(self, idx):
+        self._confirm_btn.setEnabled(
+            self._term_combo.itemData(idx, Qt.ItemDataRole.UserRole) is not None)
 
     def _on_confirm(self):
-        idx  = self._term_combo.currentIndex()
+        idx = self._term_combo.currentIndex()
         data = self._term_combo.itemData(idx, Qt.ItemDataRole.UserRole)
-        if data:
-            self._selected = data
-            self.accept()
+        if data: self._selected = data; self.accept()
 
     def selected_term(self) -> tuple:
-        if not self._selected:
-            return ("", 0, "")
+        if not self._selected: return ("",0,"")
         ay, sem = self._selected
-        sem_label = "1st Semester" if sem == 1 else "2nd Semester"
-        return (ay, sem, f"{sem_label}  AY {ay}")
+        return (ay, sem, f"{'1st' if sem==1 else '2nd'} Semester  AY {ay}")
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            #termSelCard {
-                background:#13172a;
-                border:1px solid rgba(255,255,255,0.10);
-                border-radius:16px;
-            }
-            QComboBox#termSelCombo {
-                background:rgba(255,255,255,0.06);
-                border:1px solid rgba(255,255,255,0.14);
-                border-radius:8px; color:#e8eaf0;
-                font-size:13px; padding:8px 12px; min-height:36px;
-            }
+            #termSelCard { background:#13172a; border:1px solid rgba(255,255,255,0.10);
+                border-radius:16px; }
+            QComboBox#termSelCombo { background:rgba(255,255,255,0.06);
+                border:1px solid rgba(255,255,255,0.14); border-radius:8px;
+                color:#e8eaf0; font-size:13px; padding:8px 12px; min-height:36px; }
             QComboBox#termSelCombo:hover { border-color:rgba(52,211,153,0.40); }
             QComboBox#termSelCombo::drop-down { border:none; width:18px; }
-            QComboBox#termSelCombo QAbstractItemView {
-                background:#1a1f35; color:#e8eaf0;
-                selection-background-color:rgba(52,211,153,0.18);
-            }
-            QPushButton#termSelCancelBtn {
-                background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.12);
-                border-radius:8px; color:rgba(255,255,255,0.60);
-                font-size:12px; font-weight:600; padding:0 20px;
-            }
+            QComboBox#termSelCombo QAbstractItemView { background:#1a1f35; color:#e8eaf0;
+                selection-background-color:rgba(52,211,153,0.18); }
+            QPushButton#termSelCancelBtn { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.12); border-radius:8px;
+                color:rgba(255,255,255,0.60); font-size:12px; font-weight:600; padding:0 20px; }
             QPushButton#termSelCancelBtn:hover { background:rgba(255,255,255,0.10); }
-            QPushButton#termSelConfirmBtn {
-                background:#34d399; border:none;
-                border-radius:8px; color:#0e1120;
-                font-size:12px; font-weight:700; padding:0 24px;
-            }
+            QPushButton#termSelConfirmBtn { background:#34d399; border:none;
+                border-radius:8px; color:#0e1120; font-size:12px; font-weight:700; padding:0 24px; }
             QPushButton#termSelConfirmBtn:hover { background:rgba(52,211,153,0.85); }
-            QPushButton#termSelConfirmBtn:disabled {
-                background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.25);
-            }
+            QPushButton#termSelConfirmBtn:disabled { background:rgba(255,255,255,0.06);
+                color:rgba(255,255,255,0.25); }
         """)
 
 
-# ── Main page ─────────────────────────────────────────────────────────────────
-
-def _parse_json_response(raw: str) -> list:
-    """Robustly extract a JSON array from whatever the model returns."""
-    if not raw:
-        return []
-    # 1. Direct parse
-    try:
-        result = json.loads(raw)
-        if isinstance(result, list):
-            return result
-    except Exception:
-        pass
-    # 2. Strip think blocks and fences
-    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    cleaned = re.sub(r"```(?:json)?", "", cleaned).replace("```", "").strip()
-    try:
-        result = json.loads(cleaned)
-        if isinstance(result, list):
-            return result
-    except Exception:
-        pass
-    # 3. Extract first [...] block character by character
-    depth = 0
-    start_idx = None
-    for i, ch in enumerate(cleaned):
-        if ch == "[":
-            if start_idx is None:
-                start_idx = i
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0 and start_idx is not None:
-                candidate = cleaned[start_idx:i + 1]
-                try:
-                    result = json.loads(candidate)
-                    if isinstance(result, list):
-                        return result
-                except Exception:
-                    # Fix trailing commas
-                    candidate = re.sub(",\\s*}", "}", candidate)
-                    candidate = re.sub(",\\s*]", "]", candidate)
-                    try:
-                        result = json.loads(candidate)
-                        if isinstance(result, list):
-                            return result
-                    except Exception:
-                        pass
-                break
-    # Last resort: response was truncated mid-stream.
-    # Walk backwards through "}" positions to find maximum complete objects.
-    if start_idx is not None:
-        search_end = len(cleaned)
-        while search_end > start_idx:
-            last_brace = cleaned.rfind("}", start_idx, search_end)
-            if last_brace == -1:
-                break
-            truncated = cleaned[start_idx:last_brace + 1] + "]"
-            try:
-                result = json.loads(truncated)
-                if isinstance(result, list) and result:
-                    print(f"[Interventions] Recovered {len(result)} items from truncated response")
-                    return result
-            except Exception:
-                pass
-            search_end = last_brace  # try one } earlier
-
-    print(f"[Interventions] Could not parse response: {raw[:300]}")
-    return []
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Main page
+# ══════════════════════════════════════════════════════════════════════════════
 
 class InterventionsPage(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._students:     list[dict] = []
-        self._filtered:     list[dict] = []
-        self._current_student: dict | None = None
+        self._students:   list[dict] = []
         self._ay:  str = ""
         self._sem: int = 1
-
-        self._term_loader:    _TermLoader    | None = None
-        self._student_loader: _StudentLoader | None = None
-        self._ollama_worker:  _OllamaWorker  | None = None
-        self._check_worker:   _OllamaWorker             | None = None
-        self._save_worker:    _SaveWorker               | None = None
-        self._record_loader:  _InterventionRecordLoader | None = None
-        self._report_worker:  _InterventionReportWorker | None = None
-
-        self._setup_ui()
-        self._apply_styles()
-        self._load_terms()
-
-    # ── UI ────────────────────────────────────────────────────────────
+        self._term_loader:    TermLoader               | None = None
+        self._student_loader: StudentLoader            | None = None
+        self._batch_worker:   BatchWorker              | None = None
+        self._cohort_worker:  OllamaWorker             | None = None
+        self._check_worker:   OllamaWorker             | None = None
+        self._save_workers:   list[SaveWorker]         = []
+        self._record_loader:  InterventionRecordLoader | None = None
+        self._report_worker:  InterventionReportWorker | None = None
+        self._setup_ui(); self._apply_styles(); self._load_terms()
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(30, 24, 30, 24)
-        root.setSpacing(16)
+        root.setContentsMargins(30, 24, 30, 24); root.setSpacing(16)
 
-        # ── Page header ───────────────────────────────────────────────
-        hdr_row = QHBoxLayout()
-        title_col = QVBoxLayout()
-        title_col.setSpacing(3)
+        hdr_row = QHBoxLayout(); tc = QVBoxLayout(); tc.setSpacing(3)
         title = QLabel("AI Intervention Advisor")
         title.setStyleSheet(
-            "color:#e8eaf0; font-size:18px; font-weight:bold; background:transparent;"
-        )
-        sub = QLabel(
-            "Powered by Ollama · " + SystemConfig.ollama_model() +
-            " · Runs fully offline"
-        )
-        sub.setObjectName("intervSub")
-        title_col.addWidget(title)
-        title_col.addWidget(sub)
-        hdr_row.addLayout(title_col, 1)
-
-        # Ollama status pill
+            "color:#e8eaf0; font-size:18px; font-weight:bold; background:transparent;")
+        sub = QLabel("Powered by Ollama  ·  " + SystemConfig.ollama_model() +
+                     "  ·  Runs fully offline")
+        sub.setObjectName("intervSub"); tc.addWidget(title); tc.addWidget(sub)
+        hdr_row.addLayout(tc, 1)
         self._status_pill = QLabel("⚫  Ollama not checked")
         self._status_pill.setObjectName("intervStatusPill")
-        self._status_pill.setMinimumWidth(200)
+        self._status_pill.setMinimumWidth(220)
         self._status_pill.setSizePolicy(
-            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        hdr_row.addWidget(self._status_pill)
-        root.addLayout(hdr_row)
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        hdr_row.addWidget(self._status_pill); root.addLayout(hdr_row)
 
-        # ── Term + student selector card ──────────────────────────────
-        sel_card = QFrame()
-        sel_card.setObjectName("intervSelCard")
-        sel_lo = QHBoxLayout(sel_card)
-        sel_lo.setContentsMargins(20, 14, 20, 14)
-        sel_lo.setSpacing(14)
-
-        self._ay_combo = QComboBox()
-        self._ay_combo.setObjectName("intervCombo")
-        self._ay_combo.setMinimumWidth(130)
-        self._ay_combo.addItem("Loading…")
-        self._ay_combo.setEnabled(False)
-
-        self._sem_combo = QComboBox()
-        self._sem_combo.setObjectName("intervCombo")
-        self._sem_combo.addItems(["1st Semester", "2nd Semester"])
-
-        self._load_btn = QPushButton("⟳  Load Students")
-        self._load_btn.setObjectName("intervLoadBtn")
-        self._load_btn.setFixedHeight(34)
+        sel = QFrame(); sel.setObjectName("intervSelCard")
+        sl = QHBoxLayout(sel); sl.setContentsMargins(20,14,20,14); sl.setSpacing(14)
+        for lbl_txt in ("AY:", "Sem:"):
+            lbl = QLabel(lbl_txt)
+            lbl.setStyleSheet(
+                "color:rgba(255,255,255,0.40); font-size:11px; background:transparent;")
+            sl.addWidget(lbl)
+            if lbl_txt == "AY:":
+                self._ay_combo = QComboBox(); self._ay_combo.setObjectName("intervCombo")
+                self._ay_combo.setMinimumWidth(130); self._ay_combo.addItem("Loading…")
+                self._ay_combo.setEnabled(False); sl.addWidget(self._ay_combo)
+            else:
+                self._sem_combo = QComboBox(); self._sem_combo.setObjectName("intervCombo")
+                self._sem_combo.addItems(["1st Semester","2nd Semester"])
+                sl.addWidget(self._sem_combo)
+        self._load_btn = QPushButton("⟳  Load High-Risk Students")
+        self._load_btn.setObjectName("intervLoadBtn"); self._load_btn.setFixedHeight(34)
         self._load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._load_btn.setEnabled(False)
-        self._load_btn.clicked.connect(self._on_load_students)
+        self._load_btn.setEnabled(False); self._load_btn.clicked.connect(self._on_load_students)
+        self._student_count = QLabel(""); self._student_count.setObjectName("intervCount")
+        sl.addWidget(self._load_btn); sl.addWidget(self._student_count); sl.addStretch()
+        root.addWidget(sel)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color:rgba(255,255,255,0.10);")
-        sep.setFixedHeight(24)
-
-        # Student search
-        self._student_search = QLineEdit()
-        self._student_search.setObjectName("intervSearch")
-        self._student_search.setPlaceholderText("🔍  Search student by name or ID…")
-        self._student_search.setFixedWidth(260)
-        self._student_search.textChanged.connect(self._filter_students)
-
-        self._student_combo = QComboBox()
-        self._student_combo.setObjectName("intervCombo")
-        self._student_combo.setMinimumWidth(220)
-        self._student_combo.addItem("— No students loaded —")
-        self._student_combo.setEnabled(False)
-        self._student_combo.currentIndexChanged.connect(self._on_student_selected)
-
-        self._student_count = QLabel("")
-        self._student_count.setObjectName("intervCount")
-
-        for w in [
-            QLabel("AY:"), self._ay_combo,
-            QLabel("Sem:"), self._sem_combo,
-            self._load_btn, sep,
-            self._student_search, self._student_combo,
-            self._student_count,
-        ]:
-            if isinstance(w, QLabel):
-                w.setStyleSheet(
-                    "color:rgba(255,255,255,0.40); font-size:11px; background:transparent;")
-            sel_lo.addWidget(w)
-        sel_lo.addStretch()
-        root.addWidget(sel_card)
-
-        # ── Action buttons ────────────────────────────────────────────
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(12)
-
-        self._analyze_btn = QPushButton("🤖  Analyze Selected Student")
-        self._analyze_btn.setObjectName("intervAnalyzeBtn")
-        self._analyze_btn.setFixedHeight(38)
+        btn_row = QHBoxLayout(); btn_row.setSpacing(12)
+        self._analyze_btn = QPushButton("🤖  Analyze High-Risk Students")
+        self._analyze_btn.setObjectName("intervAnalyzeBtn"); self._analyze_btn.setFixedHeight(38)
         self._analyze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._analyze_btn.setEnabled(False)
-        self._analyze_btn.clicked.connect(self._on_analyze_student)
-
-        self._cohort_btn = QPushButton("📊  Cohort Summary — All At-Risk")
-        self._cohort_btn.setObjectName("intervCohortBtn")
-        self._cohort_btn.setFixedHeight(38)
+        self._analyze_btn.clicked.connect(self._on_analyze_all)
+        self._cancel_btn = QPushButton("✕  Cancel")
+        self._cancel_btn.setObjectName("intervCancelBtn"); self._cancel_btn.setFixedHeight(38)
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.setVisible(False); self._cancel_btn.clicked.connect(self._on_cancel_batch)
+        self._cohort_btn = QPushButton("📊  Cohort Summary")
+        self._cohort_btn.setObjectName("intervCohortBtn"); self._cohort_btn.setFixedHeight(38)
         self._cohort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._cohort_btn.setEnabled(False)
-        self._cohort_btn.clicked.connect(lambda: self._on_cohort_summary(filtered=False))
-
-        self._cohort_filtered_btn = QPushButton("🔍  Cohort Summary — Filtered")
-        self._cohort_filtered_btn.setObjectName("intervCohortFiltBtn")
-        self._cohort_filtered_btn.setFixedHeight(38)
-        self._cohort_filtered_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._cohort_filtered_btn.setEnabled(False)
-        self._cohort_filtered_btn.clicked.connect(
-            lambda: self._on_cohort_summary(filtered=True))
-
-        btn_row.addWidget(self._analyze_btn)
-        btn_row.addWidget(self._cohort_btn)
-        btn_row.addWidget(self._cohort_filtered_btn)
+        self._cohort_btn.setEnabled(False); self._cohort_btn.clicked.connect(self._on_cohort_summary)
         self._export_btn = QPushButton("📄  Export Report")
-        self._export_btn.setObjectName("intervExportBtn")
-        self._export_btn.setFixedHeight(38)
+        self._export_btn.setObjectName("intervExportBtn"); self._export_btn.setFixedHeight(38)
         self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._export_btn.setEnabled(False)
-        self._export_btn.setToolTip(
-            "Export all intervention records for a selected term as PDF")
-        self._export_btn.clicked.connect(self._on_export_report)
-        btn_row.addWidget(self._export_btn)
-
+        self._export_btn.setEnabled(False); self._export_btn.clicked.connect(self._on_export_report)
         self._logs_btn = QPushButton("📋  Intervention Logs")
-        self._logs_btn.setObjectName("intervLogsBtn")
-        self._logs_btn.setFixedHeight(38)
+        self._logs_btn.setObjectName("intervLogsBtn"); self._logs_btn.setFixedHeight(38)
         self._logs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._logs_btn.setToolTip("View, search and manage all intervention log records")
         self._logs_btn.clicked.connect(self._on_show_logs)
-        btn_row.addWidget(self._logs_btn)
-
+        for w in [self._analyze_btn, self._cancel_btn, self._cohort_btn,
+                  self._export_btn, self._logs_btn]:
+            btn_row.addWidget(w)
         btn_row.addStretch()
+        self._progress_lbl = QLabel(""); self._progress_lbl.setObjectName("intervCount")
+        btn_row.addWidget(self._progress_lbl); root.addLayout(btn_row)
 
-        self._progress_lbl = QLabel("")
-        self._progress_lbl.setObjectName("intervCount")
-        btn_row.addWidget(self._progress_lbl)
-        root.addLayout(btn_row)
+        self._batch_bar = QProgressBar(); self._batch_bar.setFixedHeight(4)
+        self._batch_bar.setTextVisible(False); self._batch_bar.setRange(0,100)
+        self._batch_bar.setValue(0); self._batch_bar.setVisible(False)
+        self._batch_bar.setStyleSheet("""
+            QProgressBar { background:rgba(255,255,255,0.08); border-radius:2px; border:none; }
+            QProgressBar::chunk { background:#4f8cff; border-radius:2px; }""")
+        root.addWidget(self._batch_bar)
 
-        # ── Main body: student card + results ─────────────────────────
-        body = QHBoxLayout()
-        body.setSpacing(16)
-
-        # Left: student profile
-        self._profile_frame = QFrame()
-        self._profile_frame.setObjectName("intervProfileCard")
-        self._profile_frame.setFixedWidth(310)
-        self._profile_lo = QVBoxLayout(self._profile_frame)
-        self._profile_lo.setContentsMargins(20, 18, 20, 18)
-        self._profile_lo.setSpacing(10)
-        self._profile_lo.addWidget(self._empty_profile())
-        body.addWidget(self._profile_frame)
-
-        # Right: results stack
         self._results_stack = QStackedWidget()
-
-        # index 0 — empty
-        empty_w = QWidget()
-        el = QVBoxLayout(empty_w)
+        empty_w = QWidget(); el = QVBoxLayout(empty_w)
         el.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ei = QLabel("🤖")
-        ei.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ei = QLabel("🤖"); ei.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ei.setStyleSheet("font-size:52px;")
-        em = QLabel(
-            "Select a student and click Analyze,\n"
-            "or run a Cohort Summary to identify systemic issues."
-        )
+        em = QLabel("Load high-risk students for a term, then click\n"
+                    "\"Analyze High-Risk Students\" to choose programs\n"
+                    "and generate personalized AI intervention plans.")
         em.setAlignment(Qt.AlignmentFlag.AlignCenter)
         em.setStyleSheet(
-            "color:rgba(255,255,255,0.28); font-size:13px; background:transparent;"
-        )
-        el.addWidget(ei)
-        el.addSpacing(12)
-        el.addWidget(em)
-        self._results_stack.addWidget(empty_w)         # 0
+            "color:rgba(255,255,255,0.28); font-size:13px; background:transparent;")
+        el.addWidget(ei); el.addSpacing(12); el.addWidget(em)
+        self._results_stack.addWidget(empty_w)   # 0
 
-        # index 1 — loading
-        loading_w = QWidget()
-        ll = QVBoxLayout(loading_w)
-        ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._loading_lbl = QLabel("Generating recommendations…")
-        self._loading_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._loading_lbl.setStyleSheet(
-            "color:rgba(255,255,255,0.50); font-size:13px; background:transparent;"
-        )
-        self._loading_bar = QProgressBar()
-        self._loading_bar.setRange(0, 0)   # indeterminate
-        self._loading_bar.setFixedHeight(4)
-        self._loading_bar.setFixedWidth(280)
-        self._loading_bar.setTextVisible(False)
-        self._loading_bar.setStyleSheet("""
-            QProgressBar { background:rgba(255,255,255,0.08);
-                border-radius:2px; border:none; }
-            QProgressBar::chunk { background:#34d399; border-radius:2px; }
-        """)
-        ll.addWidget(self._loading_lbl)
-        ll.addSpacing(14)
-        ll.addWidget(self._loading_bar,
-                     alignment=Qt.AlignmentFlag.AlignCenter)
-        self._results_stack.addWidget(loading_w)       # 1
+        for attr, lo_attr in [("_batch_host","_batch_lo"),("_co_host","_co_lo")]:
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+            host = QWidget(); host.setStyleSheet("background:transparent;")
+            lo = QVBoxLayout(host); lo.setContentsMargins(0,0,8,0); lo.setSpacing(0)
+            lo.addStretch(); scroll.setWidget(host)
+            setattr(self, attr, host); setattr(self, lo_attr, lo)
+            self._results_stack.addWidget(scroll)  # 1, 2
 
-        # index 2 — per-student scroll
-        ps_scroll = QScrollArea()
-        ps_scroll.setWidgetResizable(True)
-        ps_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        ps_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        ps_scroll.setStyleSheet(
-            "QScrollArea { background:transparent; border:none; border-radius:0; }")
-        self._ps_host = QWidget()
-        self._ps_host.setStyleSheet("background:transparent;")
-        self._ps_lo = QVBoxLayout(self._ps_host)
-        self._ps_lo.setContentsMargins(8, 8, 8, 8)
-        self._ps_lo.setSpacing(4)
-        self._ps_lo.addStretch()
-        ps_scroll.setWidget(self._ps_host)
-        self._results_stack.addWidget(ps_scroll)       # 2
-
-        # index 3 — cohort scroll
-        co_scroll = QScrollArea()
-        co_scroll.setWidgetResizable(True)
-        co_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        co_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        co_scroll.setStyleSheet(
-            "QScrollArea { background:transparent; border:none; border-radius:0; }")
-        self._co_host = QWidget()
-        self._co_host.setStyleSheet("background:transparent;")
-        self._co_lo = QVBoxLayout(self._co_host)
-        self._co_lo.setContentsMargins(8, 8, 8, 8)
-        self._co_lo.setSpacing(4)
-        self._co_lo.addStretch()
-        co_scroll.setWidget(self._co_host)
-        self._results_stack.addWidget(co_scroll)       # 3
-
-        body.addWidget(self._results_stack, 1)
-        root.addLayout(body, 1)
-
-    def _empty_profile(self) -> QWidget:
-        w = QWidget()
-        lo = QVBoxLayout(w)
-        lo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl = QLabel("No student selected")
-        lbl.setStyleSheet(
-            "color:rgba(255,255,255,0.25); font-size:12px; background:transparent;"
-        )
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lo.addWidget(lbl)
-        return w
-
-    def _build_profile(self, s: dict) -> QWidget:
-        w = QWidget()
-        w.setStyleSheet("background:transparent;")
-        lo = QVBoxLayout(w)
-        lo.setContentsMargins(0, 0, 0, 0)
-        lo.setSpacing(10)
-
-        score_raw  = s.get("predicted_risk_score") or 0
-        score      = round(float(score_raw) * 100, 1)
-        risk_label = s.get("risk_label", "—")
-        color      = _risk_color(risk_label)
-
-        # Name + badge
-        name_lbl = QLabel(s.get("full_name", "—"))
-        name_lbl.setStyleSheet(
-            "color:#e8eaf0; font-size:15px; font-weight:bold; background:transparent;"
-        )
-        name_lbl.setWordWrap(True)
-        badge = QLabel(f"● {risk_label} — {score:.1f}%")
-        badge.setStyleSheet(
-            f"color:{color}; font-size:12px; font-weight:600; background:transparent;"
-        )
-        lo.addWidget(name_lbl)
-        lo.addWidget(badge)
-
-        # Divider
-        div = QFrame()
-        div.setFrameShape(QFrame.Shape.HLine)
-        div.setStyleSheet("color:rgba(255,255,255,0.08);")
-        lo.addWidget(div)
-
-        # Details
-        def _row(label, value):
-            r = QHBoxLayout()
-            r.setSpacing(8)
-            lbl = QLabel(label)
-            lbl.setStyleSheet(
-                "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;"
-            )
-            lbl.setFixedWidth(110)
-            val = QLabel(str(value) if value else "—")
-            val.setStyleSheet(
-                "color:rgba(255,255,255,0.75); font-size:11px; background:transparent;"
-            )
-            val.setWordWrap(True)
-            r.addWidget(lbl)
-            r.addWidget(val, 1)
-            return r
-
-        exam  = s.get("entrance_exam_score")
-        gpa   = s.get("high_school_gpa")
-        lo.addLayout(_row("Student ID",    s.get("student_id", "—")))
-        lo.addLayout(_row("Program",       s.get("program", "—")))
-        lo.addLayout(_row("College",       s.get("college", "—")))
-        lo.addLayout(_row("Entrance Exam", f"{float(exam):.0f}" if exam else "—"))
-        lo.addLayout(_row("HS GPA",        f"{float(gpa):.2f}" if gpa else "—"))
-        lo.addLayout(_row("Top Factor",    s.get("primary_factor", "—")))
-        lo.addStretch()
-        return w
-
-    # ── Term loading ──────────────────────────────────────────────────
+        root.addWidget(self._results_stack, 1)
 
     def _load_terms(self):
-        self._term_loader = _TermLoader()
+        self._term_loader = TermLoader()
         self._term_loader.finished.connect(self._on_terms_loaded)
-        self._term_loader.error.connect(
-            lambda e: self._progress_lbl.setText(f"⚠ {e}"))
+        self._term_loader.error.connect(lambda e: (
+            self._progress_lbl.setText(f"⚠ {e}"),
+            _safe_cleanup(self._term_loader),
+        ))
         self._term_loader.finished.connect(self._term_loader.deleteLater)
-        self._term_loader.error.connect(self._term_loader.deleteLater)
         self._term_loader.start()
 
     def _on_terms_loaded(self, terms: list):
         self._ay_combo.clear()
-        if not terms:
-            self._ay_combo.addItem("No data")
-            return
+        if not terms: self._ay_combo.addItem("No data"); return
         seen = []
         for ay, _ in terms:
-            if ay not in seen:
-                seen.append(ay)
+            if ay not in seen: seen.append(ay)
         self._ay_combo.addItems(seen)
-        ay, sem = terms[0]
-        self._ay_combo.setCurrentText(ay)
+        ay, sem = terms[0]; self._ay_combo.setCurrentText(ay)
         self._sem_combo.setCurrentIndex(sem - 1)
-        self._ay_combo.setEnabled(True)
-        self._load_btn.setEnabled(True)
-
-    # ── Student loading ───────────────────────────────────────────────
+        self._ay_combo.setEnabled(True); self._load_btn.setEnabled(True)
 
     def _on_load_students(self):
-        ay  = self._ay_combo.currentText().strip()
+        ay = self._ay_combo.currentText().strip()
         sem = self._sem_combo.currentIndex() + 1
-        if not ay or ay == "No data":
-            return
+        if not ay or ay == "No data": return
         self._ay, self._sem = ay, sem
-        self._load_btn.setEnabled(False)
-        self._load_btn.setText("Loading…")
-        self._progress_lbl.setText("")
-
-        self._student_loader = _StudentLoader(ay, sem)
+        self._load_btn.setEnabled(False); self._load_btn.setText("Loading…")
+        self._progress_lbl.setText(""); self._student_count.setText("")
+        self._student_loader = StudentLoader(ay, sem)
         self._student_loader.finished.connect(self._on_students_loaded)
-        self._student_loader.error.connect(self._on_load_error)
+        self._student_loader.error.connect(lambda e: (
+            self._on_load_error(e),
+            _safe_cleanup(self._student_loader),
+        ))
         self._student_loader.finished.connect(self._student_loader.deleteLater)
-        self._student_loader.error.connect(self._student_loader.deleteLater)
         self._student_loader.start()
 
     def _on_students_loaded(self, students: list):
-        self._load_btn.setEnabled(True)
-        self._load_btn.setText("⟳  Load Students")
-        self._students  = students
-        self._filtered  = students
-        self._student_count.setText(f"{len(students):,} at-risk")
-        self._rebuild_student_combo(students)
+        self._load_btn.setEnabled(True); self._load_btn.setText("⟳  Load High-Risk Students")
+        self._students = students; count = len(students)
+        self._student_count.setText(
+            f"{count:,} high-risk student{'s' if count != 1 else ''} loaded")
+        self._analyze_btn.setEnabled(bool(students))
         self._cohort_btn.setEnabled(bool(students))
-        self._cohort_filtered_btn.setEnabled(bool(students))
         self._export_btn.setEnabled(True)
-        self._check_ollama()
+        self._results_stack.setCurrentIndex(0); self._check_ollama()
 
     def _on_load_error(self, msg: str):
-        self._load_btn.setEnabled(True)
-        self._load_btn.setText("⟳  Load Students")
+        self._load_btn.setEnabled(True); self._load_btn.setText("⟳  Load High-Risk Students")
         self._progress_lbl.setText(f"⚠ {msg}")
-
-    def _filter_students(self, text: str):
-        text = text.lower().strip()
-        if not text:
-            self._filtered = self._students
-        else:
-            self._filtered = [
-                s for s in self._students
-                if text in s.get("full_name","").lower()
-                or text in str(s.get("student_id","")).lower()
-            ]
-        self._rebuild_student_combo(self._filtered)
-        self._cohort_filtered_btn.setEnabled(bool(self._filtered))
-
-    def _rebuild_student_combo(self, students: list):
-        self._student_combo.blockSignals(True)
-        self._student_combo.clear()
-        if not students:
-            self._student_combo.addItem("— No matches —")
-            self._student_combo.setEnabled(False)
-            self._analyze_btn.setEnabled(False)
-        else:
-            for s in students:
-                score = round(float(s.get("predicted_risk_score") or 0)*100,1)
-                self._student_combo.addItem(
-                    f"{s['full_name']}  ({score:.0f}%)",
-                    userData=s,
-                )
-            self._student_combo.setEnabled(True)
-        self._student_combo.blockSignals(False)
-        self._on_student_selected(0)
-
-    def _on_student_selected(self, idx: int):
-        data = self._student_combo.itemData(idx, Qt.ItemDataRole.UserRole)
-        self._current_student = data
-        self._analyze_btn.setEnabled(data is not None)
-
-        # Rebuild profile panel
-        while self._profile_lo.count():
-            item = self._profile_lo.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._profile_lo.addWidget(
-            self._build_profile(data) if data else self._empty_profile()
-        )
-
-    # ── Ollama check ──────────────────────────────────────────────────
 
     def _check_ollama(self):
         self._status_pill.setText("⟳  Checking Ollama…")
-        self._check_worker = _OllamaWorker("You are a test.", "Reply with: OK")
+        self._check_worker = OllamaWorker("You are a test.", "Reply: OK")
         self._check_worker.finished.connect(
-            lambda _: self._status_pill.setText(
-                f"🟢  {SystemConfig.ollama_model()} — Ready"
-            )
-        )
-        self._check_worker.error.connect(
-            lambda e: self._status_pill.setText(f"🔴  Ollama offline: {e[:60]}")
-        )
+            lambda _: self._status_pill.setText(f"🟢  {SystemConfig.ollama_model()} — Ready"))
+        self._check_worker.error.connect(lambda e: (
+            self._status_pill.setText(
+                "🔴  Ollama offline — is Ollama running?"
+                if "Connection" in e or "Max retri" in e or "refused" in e.lower()
+                else f"🔴  Ollama error: {e[:80]}"),
+            _safe_cleanup(self._check_worker),
+        ))
         self._check_worker.finished.connect(self._check_worker.deleteLater)
-        self._check_worker.error.connect(self._check_worker.deleteLater)
         self._check_worker.start()
 
-    # ── Per-student analysis ──────────────────────────────────────────
+    # ── Analyze — shows program selector first ────────────────────────
 
-    def _on_analyze_student(self):
-        s = self._current_student
-        if not s:
+    def _on_analyze_all(self):
+        if not self._students:
             return
 
-        score_raw  = s.get("predicted_risk_score") or 0
-        score      = round(float(score_raw) * 100, 1)
-        exam       = s.get("entrance_exam_score")
-        gpa        = s.get("high_school_gpa")
-        factor     = s.get("primary_factor", "Not available")
-
-        prompt = _USER_PER_STUDENT.format(
-            name       = s.get("full_name", "—"),
-            program    = s.get("program", "—"),
-            college    = s.get("college", "—"),
-            score      = f"{score:.1f}",
-            risk_label = s.get("risk_label", "—"),
-            factors    = factor,
-            exam_score = f"{float(exam):.0f}" if exam else "N/A",
-            hs_gpa     = f"{float(gpa):.2f}"  if gpa  else "N/A",
-        )
-
-        self._set_loading("Generating intervention plan…")
-        self._analyze_btn.setEnabled(False)
-
-        self._ollama_worker = _OllamaWorker(_SYSTEM_PER_STUDENT, prompt)
-        self._ollama_worker.finished.connect(
-            lambda raw: self._on_per_student_done(raw, s))
-        self._ollama_worker.error.connect(self._on_ollama_error)
-        self._ollama_worker.finished.connect(self._ollama_worker.deleteLater)
-        self._ollama_worker.error.connect(self._ollama_worker.deleteLater)
-        self._ollama_worker.start()
-
-    def _on_per_student_done(self, raw: str, s: dict):
-        self._analyze_btn.setEnabled(True)
-        self._stop_loading()
-        print(f"[Interventions] Raw response ({len(raw)} chars):")
-        print(raw[:500])
-        recs = _parse_json_response(raw)
-        if not recs:
-            self._progress_lbl.setText("⚠ Could not parse AI response.")
-            self._results_stack.setCurrentIndex(0)
+        # Show program selector dialog before starting analysis
+        dlg = _ProgramSelectorDialog(self._students, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Render cards
-        self._clear_layout(self._ps_lo)
-        score = round(float(s.get("predicted_risk_score") or 0)*100, 1)
+        selected_programs = dlg.selected_programs()
+        if not selected_programs:
+            return
 
-        header = QLabel(
-            f"Intervention Plan — {s.get('full_name','—')}  "
-            f"({score:.1f}% risk)"
+        # Filter students to only the selected programs
+        selected_set = set(selected_programs)
+        filtered_students = [
+            s for s in self._students
+            if str(s.get("program") or "Unknown").strip() in selected_set
+        ]
+
+        if not filtered_students:
+            self._progress_lbl.setText("⚠ No students matched the selected programs.")
+            return
+
+        count = len(filtered_students)
+        prog_count = len(selected_programs)
+
+        # Confirm if large batch
+        if count > 20:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Start AI Analysis")
+            msg.setText(
+                f"Generate intervention plans for {count:,} students "
+                f"across {prog_count} program{'s' if prog_count != 1 else ''}?"
+            )
+            msg.setInformativeText(
+                f"This will make {count:,} sequential Ollama calls.\n"
+                f"Estimated time: {count*10//60}–{count*15//60} minutes.\n\n"
+                "You can cancel at any time."
+            )
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+            msg.button(QMessageBox.StandardButton.Yes).setText("Start Analysis")
+            msg.setStyleSheet("""
+                QMessageBox { background:#13172a; }
+                QMessageBox QLabel { color:#e8eaf0; font-size:13px; background:transparent; }
+                QMessageBox QPushButton { background:rgba(255,255,255,0.06);
+                    border:1px solid rgba(255,255,255,0.14); border-radius:8px;
+                    color:rgba(255,255,255,0.80); font-size:12px; font-weight:600;
+                    padding:8px 24px; min-width:80px; }
+                QMessageBox QPushButton:hover { background:rgba(255,255,255,0.12); }
+                QMessageBox QPushButton[text="Start Analysis"] {
+                    background:#4f8cff; border:none; color:white; }
+                QMessageBox QPushButton[text="Start Analysis"]:hover {
+                    background:rgba(79,140,255,0.85); }
+            """)
+            if msg.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+        self._start_batch(filtered_students, selected_programs)
+
+    def _start_batch(self, students: list, programs: list):
+        """Launch BatchWorker for the given filtered student list."""
+        count = len(students)
+        self._clear_batch(); self._results_stack.setCurrentIndex(1)
+
+        sem_lbl = "1st Semester" if self._sem == 1 else "2nd Semester"
+        prog_summary = (
+            programs[0] if len(programs) == 1
+            else f"{len(programs)} programs"
         )
-        header.setStyleSheet(
-            "color:#e8eaf0; font-size:13px; font-weight:bold; background:transparent;"
+        hdr = QLabel(
+            f"Intervention Plans  ·  {sem_lbl} AY {self._ay}  ·  "
+            f"{prog_summary}  ·  {count:,} student{'s' if count != 1 else ''}"
         )
-        self._ps_lo.addWidget(header)
-        self._ps_lo.addSpacing(8)
+        hdr.setStyleSheet(
+            "color:#e8eaf0; font-size:13px; font-weight:bold; "
+            "background:transparent; padding-bottom:8px;")
+        self._batch_lo.insertWidget(self._batch_lo.count() - 1, hdr)
 
-        for i, rec in enumerate(recs):
-            self._ps_lo.addWidget(_rec_card(rec, i))
-            if i < len(recs) - 1:
-                div = QFrame()
-                div.setFrameShape(QFrame.Shape.HLine)
-                div.setStyleSheet(
-                    "color:rgba(255,255,255,0.06); margin:0 4px;")
-                self._ps_lo.addWidget(div)
-        self._ps_lo.addStretch()
+        self._batch_bar.setValue(0); self._batch_bar.setVisible(True)
+        self._analyze_btn.setEnabled(False); self._cancel_btn.setVisible(True)
+        self._cohort_btn.setEnabled(False)
+        self._progress_lbl.setText(f"0 / {count:,}  —  Starting…")
 
+        self._batch_worker = BatchWorker(students, self._ay, self._sem)
+        self._batch_worker.progress.connect(self._on_batch_progress)
+        self._batch_worker.one_done.connect(self._on_one_done)
+        self._batch_worker.finished.connect(self._on_batch_finished)
+        self._batch_worker.cancelled.connect(self._on_batch_cancelled)
+        self._batch_worker.error.connect(self._on_batch_error)
+        self._batch_worker.finished.connect(self._batch_worker.deleteLater)
+        self._batch_worker.start()
+        self._batch_new_count     = 0
+        self._batch_skipped_count = 0
+
+    def _on_batch_progress(self, done: int, total: int, name: str):
+        self._batch_bar.setValue(int(done / max(total,1) * 100))
+        if name:
+            self._progress_lbl.setText(f"{done:,} / {total:,}  —  Checking {name}…")
+
+    def _on_one_done(self, student: dict, recs: list, skipped: bool):
+        self._batch_lo.insertWidget(
+            self._batch_lo.count() - 1,
+            _StudentResultCard(student, recs, skipped=skipped))
+        if skipped:
+            self._batch_skipped_count += 1
+        else:
+            self._batch_new_count += 1
+            score_raw = student.get("predicted_risk_score") or 0
+            self._auto_save({
+                "student_id":      str(student.get("student_id","")),
+                "academic_year":   self._ay, "semester": self._sem,
+                "mode":            "per_student",
+                "risk_score":      round(float(score_raw)*100, 2),
+                "risk_label":      student.get("risk_label",""),
+                "risk_factors":    student.get("primary_factor",""),
+                "recommendations": recs,
+            })
+
+    def _on_batch_finished(self):
+        self._batch_bar.setValue(100); self._batch_bar.setVisible(False)
+        self._cancel_btn.setVisible(False); self._analyze_btn.setEnabled(True)
+        self._cohort_btn.setEnabled(bool(self._students))
+        new     = self._batch_new_count
+        skipped = self._batch_skipped_count
+        parts   = []
+        if new:
+            parts.append(f"{new:,} new plan{'s' if new != 1 else ''} generated")
+        if skipped:
+            parts.append(f"{skipped:,} already analyzed (skipped)")
+        self._progress_lbl.setText("✓  " + ("  ·  ".join(parts) if parts else "Done"))
+        self._batch_worker = None
+
+    def _on_batch_cancelled(self):
+        self._batch_bar.setVisible(False); self._cancel_btn.setVisible(False)
+        self._analyze_btn.setEnabled(True); self._cohort_btn.setEnabled(bool(self._students))
+        self._progress_lbl.setText("Analysis cancelled.")
+        w = self._batch_worker; self._batch_worker = None
+        if w:
+            try: w.wait(3000)
+            except RuntimeError: pass
+            QTimer.singleShot(0, w.deleteLater)
+
+    def _on_batch_error(self, msg: str):
+        self._batch_bar.setVisible(False); self._cancel_btn.setVisible(False)
+        self._analyze_btn.setEnabled(True); self._cohort_btn.setEnabled(bool(self._students))
+        self._progress_lbl.setText(f"⚠ {msg[:80]}")
+        w = self._batch_worker; self._batch_worker = None
+        if w:
+            try: w.wait(3000)
+            except RuntimeError: pass
+            QTimer.singleShot(0, w.deleteLater)
+
+    def _on_cancel_batch(self):
+        if self._batch_worker:
+            self._batch_worker.cancel(); self._cancel_btn.setEnabled(False)
+            self._progress_lbl.setText("Cancelling after current student…")
+
+    def _clear_batch(self):
+        while self._batch_lo.count() > 1:
+            item = self._batch_lo.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+    def _on_cohort_summary(self):
+        if not self._students: return
+        self._cohort_btn.setEnabled(False)
+        self._progress_lbl.setText("Generating cohort summary…")
+        prompt = build_cohort_prompt(self._students, self._ay, self._sem)
+        self._cohort_worker = OllamaWorker(SYSTEM_COHORT, prompt)
+        self._cohort_worker.finished.connect(
+            lambda raw: self._on_cohort_done(raw, self._students))
+        self._cohort_worker.error.connect(lambda e: (
+            self._on_cohort_error(e),
+            _safe_cleanup(self._cohort_worker),
+        ))
+        self._cohort_worker.finished.connect(self._cohort_worker.deleteLater)
+        self._cohort_worker.start()
+
+    def _on_cohort_done(self, raw: str, students: list):
+        self._cohort_btn.setEnabled(bool(self._students))
+        issues = parse_json_response(raw)
+        if not issues:
+            self._progress_lbl.setText("⚠ Could not parse cohort response."); return
+        while self._co_lo.count() > 1:
+            item = self._co_lo.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        sem_lbl = "1st Semester" if self._sem == 1 else "2nd Semester"
+        term = f"{self._ay} — {sem_lbl}"
+        hdr = QLabel(f"Cohort Systemic Issues  ·  {term}  ·  {len(students):,} high-risk students")
+        hdr.setStyleSheet(
+            "color:#e8eaf0; font-size:13px; font-weight:bold; "
+            "background:transparent; padding-bottom:8px;")
+        self._co_lo.insertWidget(0, hdr)
+        for i, issue in enumerate(issues):
+            self._co_lo.insertWidget(i+1, _cohort_row(issue, i))
+            if i < len(issues) - 1:
+                sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setStyleSheet("color:rgba(255,255,255,0.06);")
+                self._co_lo.insertWidget(i+2, sep)
         self._results_stack.setCurrentIndex(2)
         self._progress_lbl.setText(
-            f"✓  {len(recs)} recommendations generated — saved to log")
-
-        # Auto-save
-        self._auto_save({
-            "student_id":     str(s.get("student_id", "")),
-            "academic_year":  self._ay,
-            "semester":       self._sem,
-            "mode":           "per_student",
-            "risk_score":     round(float(s.get("predicted_risk_score") or 0)*100, 2),
-            "risk_label":     s.get("risk_label", ""),
-            "risk_factors":   s.get("primary_factor", ""),
-            "recommendations": recs,
-        })
-
-    # ── Cohort summary ────────────────────────────────────────────────
-
-    def _on_cohort_summary(self, filtered: bool = False):
-        students = self._filtered if filtered else self._students
-        if not students:
-            self._progress_lbl.setText("⚠ No students to analyze.")
-            return
-
-        total    = len(students)
-        high     = sum(1 for s in students
-                       if "high" in s.get("risk_label","").lower())
-        moderate = total - high
-
-        # Factor frequency
-        factor_counts: dict[str, int] = {}
-        for s in students:
-            f = s.get("primary_factor")
-            if f:
-                factor_counts[f] = factor_counts.get(f, 0) + 1
-
-        top_factors = sorted(
-            factor_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        factors_summary = ", ".join(
-            f"{f}({c})" for f, c in top_factors
-        ) or "No factor data"
-
-        # College breakdown — top 3 only
-        college_counts: dict[str, int] = {}
-        for s in students:
-            c = s.get("college", "—")
-            college_counts[c] = college_counts.get(c, 0) + 1
-
-        top_colleges = sorted(
-            college_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        college_summary = ", ".join(
-            f"{col}({cnt})" for col, cnt in top_colleges
-        ) or "No college data"
-
-        sem_label = "1st Semester" if self._sem == 1 else "2nd Semester"
-        term = f"{self._ay} — {sem_label}"
-        scope = "filtered subset" if filtered else "all at-risk students"
-
-        prompt = _USER_COHORT.format(
-            term=term,
-            total=total,
-            high=high,
-            moderate=moderate,
-            factors_summary=factors_summary,
-            college_summary=college_summary,
-        )
-
-        self._set_loading(
-            f"Analyzing {total:,} {scope}…"
-        )
-        self._cohort_btn.setEnabled(False)
-        self._cohort_filtered_btn.setEnabled(False)
-
-        self._ollama_worker = _OllamaWorker(_SYSTEM_COHORT, prompt)
-        self._ollama_worker.finished.connect(
-            lambda raw: self._on_cohort_done(raw, students, term, filtered))
-        self._ollama_worker.error.connect(self._on_ollama_error)
-        self._ollama_worker.finished.connect(self._ollama_worker.deleteLater)
-        self._ollama_worker.error.connect(self._ollama_worker.deleteLater)
-        self._ollama_worker.start()
-
-    def _on_cohort_done(self, raw: str, students: list,
-                         term: str, filtered: bool):
-        self._cohort_btn.setEnabled(bool(self._students))
-        self._cohort_filtered_btn.setEnabled(bool(self._filtered))
-        self._stop_loading()
-        print(f"[Interventions-cohort] Raw response ({len(raw)} chars):")
-        print(raw[:500])
-        issues = _parse_json_response(raw)
-        if not issues:
-            self._progress_lbl.setText("⚠ Could not parse AI response.")
-            self._results_stack.setCurrentIndex(0)
-            return
-
-        self._clear_layout(self._co_lo)
-
-        scope = "Filtered" if filtered else "All At-Risk"
-        header = QLabel(
-            f"Cohort Systemic Issues — {term}  ({scope},  {len(students):,} students)"
-        )
-        header.setStyleSheet(
-            "color:#e8eaf0; font-size:13px; font-weight:bold; background:transparent;"
-        )
-        self._co_lo.addWidget(header)
-        self._co_lo.addSpacing(8)
-
-        for i, issue in enumerate(issues):
-            self._co_lo.addWidget(_cohort_row(issue, i))
-            if i < len(issues) - 1:
-                div = QFrame()
-                div.setFrameShape(QFrame.Shape.HLine)
-                div.setStyleSheet(
-                    "color:rgba(255,255,255,0.06); margin:0 4px;")
-                self._co_lo.addWidget(div)
-        self._co_lo.addStretch()
-
-        self._results_stack.setCurrentIndex(3)
-        self._progress_lbl.setText(
             f"✓  {len(issues)} systemic issues identified — saved to log")
-
-        # Auto-save cohort record (student_id=NULL for cohort mode)
         self._auto_save({
-            "student_id":      None,
-            "academic_year":   self._ay,
-            "semester":        self._sem,
-            "mode":            "cohort",
-            "risk_score":      None,
-            "risk_label":      f"{len(students)} students · {scope}",
-            "risk_factors":    term,
-            "recommendations": issues,
+            "student_id": None, "academic_year": self._ay, "semester": self._sem,
+            "mode": "cohort", "risk_score": None,
+            "risk_label": f"{len(students)} high-risk students",
+            "risk_factors": term, "recommendations": issues,
         })
 
-    # ── Error / loading helpers ───────────────────────────────────────
-
-    def _on_ollama_error(self, msg: str):
-        self._stop_loading()
-        self._analyze_btn.setEnabled(self._current_student is not None)
+    def _on_cohort_error(self, msg: str):
         self._cohort_btn.setEnabled(bool(self._students))
-        self._cohort_filtered_btn.setEnabled(bool(self._filtered))
-        self._results_stack.setCurrentIndex(0)
-        self._progress_lbl.setText(f"⚠ Ollama error: {msg[:80]}")
-
-    def _set_loading(self, msg: str):
-        self._loading_lbl.setText(msg)
-        self._results_stack.setCurrentIndex(1)
-        self._progress_lbl.setText("")
-        # Animate dots so the counselor knows it's working
-        self._dot_count = 0
-        if not hasattr(self, "_dot_timer"):
-            self._dot_timer = QTimer(self)
-            self._dot_timer.timeout.connect(self._tick_dots)
-        self._dot_msg = msg
-        self._dot_timer.start(600)
-
-    def _tick_dots(self):
-        self._dot_count = (self._dot_count + 1) % 4
-        dots = "." * self._dot_count
-        self._loading_lbl.setText(f"{self._dot_msg}{dots}")
-
-    def _stop_loading(self):
-        if hasattr(self, "_dot_timer"):
-            self._dot_timer.stop()
-
-    def _clear_layout(self, lo):
-        while lo.count() > 1:
-            item = lo.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-    # ── Auto-save ─────────────────────────────────────────────────────
+        self._progress_lbl.setText(f"⚠ Cohort error: {msg[:80]}")
 
     def _auto_save(self, record: dict):
-        self._save_worker = _SaveWorker(record)
-        self._save_worker.finished.connect(self._save_worker.deleteLater)
-        self._save_worker.error.connect(
-            lambda e: print(f"[Interventions] Save error: {e}"))
-        self._save_worker.error.connect(self._save_worker.deleteLater)
-        self._save_worker.start()
-
-    # ── Export report ─────────────────────────────────────────────────
+        worker = SaveWorker(record)
+        worker.error.connect(lambda e: (
+            print(f"[Interventions] Save error: {e}"),
+            _safe_cleanup(worker),
+        ))
+        worker.finished.connect(
+            lambda: self._save_workers.remove(worker) if worker in self._save_workers else None)
+        worker.finished.connect(worker.deleteLater)
+        self._save_workers.append(worker); worker.start()
 
     def _on_export_report(self):
-        """Show term-selection dialog then generate PDF."""
-        # Build list of available terms from loaded data
-        # (use the already-loaded term list or fall back to DB)
         dlg = _TermSelectDialog(self)
-        if dlg.exec() != _TermSelectDialog.DialogCode.Accepted:
-            return
-
+        if dlg.exec() != _TermSelectDialog.DialogCode.Accepted: return
         ay, sem, term_label = dlg.selected_term()
-        if not ay:
-            return
-
+        if not ay: return
         from PyQt6.QtWidgets import QFileDialog
-        ay_safe  = ay.replace("-", "_").replace(" ", "")
-        default  = f"InterventionReport_{ay_safe}_Sem{sem}.pdf"
-        path, _  = QFileDialog.getSaveFileName(
-            self, "Save Intervention Report", default, "PDF Files (*.pdf)")
-        if not path:
-            return
-
-        self._export_btn.setEnabled(False)
-        self._export_btn.setText("Loading records…")
-        self._progress_lbl.setText("")
-
-        # Load intervention records for the selected term
-        self._record_loader = _InterventionRecordLoader(ay, sem)
+        ay_safe = ay.replace("-","_").replace(" ","")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Intervention Report",
+            f"InterventionReport_{ay_safe}_Sem{sem}.pdf", "PDF Files (*.pdf)")
+        if not path: return
+        self._export_btn.setEnabled(False); self._export_btn.setText("Loading records…")
+        self._record_loader = InterventionRecordLoader(ay, sem)
         self._record_loader.finished.connect(
             lambda rows: self._on_records_loaded(rows, ay, sem, term_label, path))
-        self._record_loader.error.connect(self._on_export_error)
+        self._record_loader.error.connect(lambda e: (
+            self._on_export_error(e),
+            _safe_cleanup(self._record_loader),
+        ))
         self._record_loader.finished.connect(self._record_loader.deleteLater)
-        self._record_loader.error.connect(self._record_loader.deleteLater)
         self._record_loader.start()
 
-    def _on_records_loaded(self, rows: list, ay: str, sem: int,
-                            term_label: str, path: str):
+    def _on_records_loaded(self, rows, ay, sem, term_label, path):
         if not rows:
+            self._export_btn.setEnabled(True); self._export_btn.setText("📄  Export Report")
+            self._progress_lbl.setText(f"⚠ No records found for {term_label}."); return
+        self._export_btn.setText("Generating PDF…")
+
+        from ui.dialogs.report_customization import ReportCustomizationDialog
+        colleges = list({r.get("college","") for r in rows if r.get("college")})
+        dlg = ReportCustomizationDialog(parent=self, colleges=sorted(colleges))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             self._export_btn.setEnabled(True)
             self._export_btn.setText("📄  Export Report")
-            self._progress_lbl.setText(
-                f"⚠ No intervention records found for {term_label}.")
             return
-
-        self._export_btn.setText("Generating PDF…")
-        self._progress_lbl.setText(
-            f"Generating report for {term_label} ({len(rows)} records)…")
-
-        self._report_worker = _InterventionReportWorker(
-            records       = rows,
-            term_label    = term_label,
-            academic_year = ay,
-            semester      = sem,
-            save_path     = path,
+        self._report_worker = InterventionReportWorker(
+            rows, term_label, ay, sem, path,
+            config=dlg.intervention_config()
         )
+        
         self._report_worker.finished.connect(self._on_export_done)
-        self._report_worker.error.connect(self._on_export_error)
+        self._report_worker.error.connect(lambda e: (
+            self._on_export_error(e),
+            _safe_cleanup(self._report_worker),
+        ))
         self._report_worker.finished.connect(self._report_worker.deleteLater)
-        self._report_worker.error.connect(self._report_worker.deleteLater)
         self._report_worker.start()
 
     def _on_export_done(self, path: str):
-        self._export_btn.setEnabled(True)
-        self._export_btn.setText("📄  Export Report")
-        self._progress_lbl.setText(f"✓  Report saved.")
-
-        # Open file location
+        self._export_btn.setEnabled(True); self._export_btn.setText("📄  Export Report")
+        self._progress_lbl.setText("✓  Report saved.")
         import subprocess, sys, os
         try:
-            if sys.platform == "win32":
-                subprocess.Popen(["explorer", "/select,", path])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", path])
-            else:
-                subprocess.Popen(["xdg-open", os.path.dirname(path)])
-        except Exception:
-            pass
-
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(
-            self, "Report Exported",
-            "Intervention report saved successfully.\n\n" + path
-        )
+            if sys.platform == "win32": subprocess.Popen(["explorer","/select,",path])
+            elif sys.platform == "darwin": subprocess.Popen(["open","-R",path])
+            else: subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except Exception: pass
+        QMessageBox.information(self,"Report Exported",
+            "Intervention report saved successfully.\n\n" + path)
 
     def _on_export_error(self, msg: str):
-        self._export_btn.setEnabled(True)
-        self._export_btn.setText("📄  Export Report")
+        self._export_btn.setEnabled(True); self._export_btn.setText("📄  Export Report")
         self._progress_lbl.setText(f"⚠ Export failed: {msg[:80]}")
 
-    # ── Intervention logs ─────────────────────────────────────────────
-
     def _on_show_logs(self):
-        dlg = InterventionLogDialog(self)
-        dlg.exec()
+        InterventionLogDialog(self).exec()
 
-    # ── Styles ────────────────────────────────────────────────────────
+    def closeEvent(self, event):
+        if self._batch_worker is not None:
+            try: self._batch_worker.cancelled.disconnect()
+            except RuntimeError: pass
+            self._batch_worker.cancel()
+            try: self._batch_worker.wait(5000)
+            except RuntimeError: pass
+            try: self._batch_worker.deleteLater()
+            except RuntimeError: pass
+            self._batch_worker = None
+        for attr in ("_term_loader","_student_loader","_check_worker",
+                     "_cohort_worker","_record_loader","_report_worker"):
+            w = getattr(self, attr, None)
+            if w is None: continue
+            try:
+                w.finished.disconnect(); w.error.disconnect()
+                if w.isRunning(): w.quit(); w.wait(2000)
+            except (RuntimeError, Exception): pass
+        for w in list(self._save_workers):
+            try:
+                if w.isRunning(): w.quit(); w.wait(1000)
+            except Exception: pass
+        super().closeEvent(event)
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            #intervSub {
-                color: rgba(255,255,255,0.35); font-size:11px;
-                background:transparent;
-            }
-            #intervStatusPill {
-                color: rgba(255,255,255,0.55); font-size:11px;
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 8px;
-                padding: 5px 14px;
-                min-width: 180px;
-            }
-            #intervSelCard {
-                background: rgba(255,255,255,0.02);
-                border: none;
-                border-bottom: 1px solid rgba(255,255,255,0.06);
-                border-radius: 0;
-            }
-            QComboBox#intervCombo {
-                background: rgba(255,255,255,0.06);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 7px; color: #e8eaf0;
-                font-size: 12px; padding: 5px 10px; min-height: 30px;
-            }
-            QComboBox#intervCombo:hover {
-                border-color: rgba(52,211,153,0.35);
-            }
+            #intervSub { color:rgba(255,255,255,0.35); font-size:11px; background:transparent; }
+            #intervStatusPill { color:rgba(255,255,255,0.70); font-size:11px;
+                background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.10);
+                border-radius:8px; padding:5px 16px; min-width:220px; }
+            #intervSelCard { background:rgba(255,255,255,0.02); border:none;
+                border-bottom:1px solid rgba(255,255,255,0.06); border-radius:0; }
+            QComboBox#intervCombo { background:rgba(255,255,255,0.06);
+                border:1px solid rgba(255,255,255,0.12); border-radius:7px;
+                color:#e8eaf0; font-size:12px; padding:5px 10px; min-height:30px; }
+            QComboBox#intervCombo:hover { border-color:rgba(52,211,153,0.35); }
             QComboBox#intervCombo::drop-down { border:none; width:16px; }
-            QComboBox#intervCombo QAbstractItemView {
-                background: #1a1f35; border: 1px solid rgba(255,255,255,0.12);
-                color: #e8eaf0;
-                selection-background-color: rgba(52,211,153,0.18);
-            }
-            QPushButton#intervLoadBtn {
-                background: #34d399; border:none; border-radius:7px;
-                color: #0e1120; font-size:12px; font-weight:700;
-                padding: 0 16px;
-            }
-            QPushButton#intervLoadBtn:hover { background: rgba(52,211,153,0.85); }
-            QPushButton#intervLoadBtn:disabled {
-                background: rgba(255,255,255,0.06); color:rgba(255,255,255,0.25);
-            }
-            QLineEdit#intervSearch {
-                background: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 8px; color: #e8eaf0;
-                font-size: 12px; padding: 7px 12px;
-            }
-            QLineEdit#intervSearch:focus {
-                border-color: rgba(52,211,153,0.40);
-            }
-            QPushButton#intervAnalyzeBtn {
-                background: #4f8cff; border:none; border-radius:8px;
-                color: white; font-size:12px; font-weight:700;
-                padding: 0 20px;
-            }
-            QPushButton#intervAnalyzeBtn:hover {
-                background: rgba(79,140,255,0.85);
-            }
-            QPushButton#intervAnalyzeBtn:disabled {
-                background: rgba(255,255,255,0.06); color:rgba(255,255,255,0.25);
-            }
-            QPushButton#intervCohortBtn {
-                background: rgba(167,139,250,0.12);
-                border: 1px solid rgba(167,139,250,0.30);
-                border-radius:8px; color:#a78bfa;
-                font-size:12px; font-weight:600; padding: 0 18px;
-            }
-            QPushButton#intervCohortBtn:hover {
-                background: rgba(167,139,250,0.22);
-            }
-            QPushButton#intervCohortBtn:disabled {
-                background: rgba(255,255,255,0.03);
-                border-color: rgba(255,255,255,0.08);
-                color: rgba(255,255,255,0.20);
-            }
-            QPushButton#intervCohortFiltBtn {
-                background: rgba(245,179,53,0.10);
-                border: 1px solid rgba(245,179,53,0.28);
-                border-radius:8px; color:#f5b335;
-                font-size:12px; font-weight:600; padding: 0 18px;
-            }
-            QPushButton#intervCohortFiltBtn:hover {
-                background: rgba(245,179,53,0.20);
-            }
-            QPushButton#intervCohortFiltBtn:disabled {
-                background: rgba(255,255,255,0.03);
-                border-color: rgba(255,255,255,0.08);
-                color: rgba(255,255,255,0.20);
-            }
-            #intervProfileCard {
-                background: rgba(255,255,255,0.02);
-                border: none;
-                border-right: 1px solid rgba(255,255,255,0.06);
-                border-radius: 0;
-            }
-            #intervCount {
-                color: rgba(255,255,255,0.35); font-size:11px;
-                background:transparent;
-            }
-            QPushButton#intervExportBtn {
-                background: rgba(52,211,153,0.10);
-                border: 1px solid rgba(52,211,153,0.30);
-                border-radius: 8px; color: #34d399;
-                font-size: 12px; font-weight: 600; padding: 0 18px;
-            }
-            QPushButton#intervExportBtn:hover {
-                background: rgba(52,211,153,0.20);
-                border-color: rgba(52,211,153,0.55);
-            }
-            QPushButton#intervExportBtn:disabled {
-                background: rgba(255,255,255,0.03);
-                border-color: rgba(255,255,255,0.08);
-                color: rgba(255,255,255,0.20);
-            }
-            QPushButton#intervLogsBtn {
-                background: rgba(79,140,255,0.10);
-                border: 1px solid rgba(79,140,255,0.28);
-                border-radius: 8px; color: #4f8cff;
-                font-size: 12px; font-weight: 600; padding: 0 18px;
-            }
-            QPushButton#intervLogsBtn:hover {
-                background: rgba(79,140,255,0.20);
-                border-color: rgba(79,140,255,0.50);
-            }
+            QComboBox#intervCombo QAbstractItemView { background:#1a1f35; color:#e8eaf0;
+                selection-background-color:rgba(52,211,153,0.18); }
+            QPushButton#intervLoadBtn { background:#34d399; border:none; border-radius:7px;
+                color:#0e1120; font-size:12px; font-weight:700; padding:0 16px; }
+            QPushButton#intervLoadBtn:hover { background:rgba(52,211,153,0.85); }
+            QPushButton#intervLoadBtn:disabled { background:rgba(255,255,255,0.06);
+                color:rgba(255,255,255,0.25); }
+            QPushButton#intervAnalyzeBtn { background:#4f8cff; border:none; border-radius:8px;
+                color:white; font-size:12px; font-weight:700; padding:0 20px; }
+            QPushButton#intervAnalyzeBtn:hover { background:rgba(79,140,255,0.85); }
+            QPushButton#intervAnalyzeBtn:disabled { background:rgba(255,255,255,0.06);
+                color:rgba(255,255,255,0.25); }
+            QPushButton#intervCancelBtn { background:rgba(255,91,91,0.12);
+                border:1px solid rgba(255,91,91,0.30); border-radius:8px; color:#ff5b5b;
+                font-size:12px; font-weight:600; padding:0 16px; }
+            QPushButton#intervCancelBtn:hover { background:rgba(255,91,91,0.22); }
+            QPushButton#intervCohortBtn { background:rgba(167,139,250,0.12);
+                border:1px solid rgba(167,139,250,0.30); border-radius:8px; color:#a78bfa;
+                font-size:12px; font-weight:600; padding:0 18px; }
+            QPushButton#intervCohortBtn:hover { background:rgba(167,139,250,0.22); }
+            QPushButton#intervCohortBtn:disabled { background:rgba(255,255,255,0.03);
+                border-color:rgba(255,255,255,0.08); color:rgba(255,255,255,0.20); }
+            QPushButton#intervExportBtn { background:rgba(52,211,153,0.10);
+                border:1px solid rgba(52,211,153,0.30); border-radius:8px; color:#34d399;
+                font-size:12px; font-weight:600; padding:0 18px; }
+            QPushButton#intervExportBtn:hover { background:rgba(52,211,153,0.20); }
+            QPushButton#intervExportBtn:disabled { background:rgba(255,255,255,0.03);
+                border-color:rgba(255,255,255,0.08); color:rgba(255,255,255,0.20); }
+            QPushButton#intervLogsBtn { background:rgba(79,140,255,0.10);
+                border:1px solid rgba(79,140,255,0.28); border-radius:8px; color:#4f8cff;
+                font-size:12px; font-weight:600; padding:0 18px; }
+            QPushButton#intervLogsBtn:hover { background:rgba(79,140,255,0.20); }
+            #intervCount { color:rgba(255,255,255,0.35); font-size:11px; background:transparent; }
         """)

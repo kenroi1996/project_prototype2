@@ -157,6 +157,11 @@ class PredictionEngine:
         try:
             scores, probas = cls._predict_sklearn(model_data["model"], X)
             is_mock = False
+            # ── DEBUG ──────────────────────────────────────────────────
+            print(f"[DEBUG] Top 5 probas:    {sorted(probas, reverse=True)[:5]}")
+            print(f"[DEBUG] Bottom 5 probas: {sorted(probas)[:5]}")
+            print(f"[DEBUG] Sample probas (first 5): {probas[:5]}")
+            # ───────────────────────────────────────────────────────────
         except Exception as _exc:
             print(f"[PredictionEngine] sklearn predict failed ({_exc}), using mock")
             scores, probas = cls._predict_mock(X)
@@ -194,9 +199,13 @@ class PredictionEngine:
         predictions = []
         for i, sid in enumerate(student_ids):
             score    = round(probas[i] * 100, 1)
+            # ── DEBUG ──────────────────────────────────────────────────
+            if score >= 99:
+                print(f"[DEBUG] 100% student: sid={sid} proba={probas[i]} binary={scores[i]}")
+            # ───────────────────────────────────────────────────────────
             category = classify_risk(score, binary_pred=scores[i])
             meta     = student_meta[i]
-            raw_vals = raw_feature_rows[i]   # dict: feature_name → raw float value
+            raw_vals = raw_feature_rows[i]
 
             shap_factors = cls._shap_factors(
                 feature_names, global_importances, raw_vals
@@ -580,90 +589,75 @@ class PredictionEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _predict_sklearn(
-        model,
-        X: list,
-        preprocessor   = None,
-        feature_names: list = None,
-        pred_headers:  list = None,
-    ) -> tuple[list, list]:
+    def _predict_sklearn(model, X, preprocessor=None,
+                         feature_names=None, pred_headers=None):
         import numpy as np
-        import pandas as pd
-
+ 
         X_arr = np.array(X, dtype=float)
-
-        if preprocessor is not None and feature_names and pred_headers:
-            try:
-                feat_cols = [h for h in pred_headers if h != "Student_ID"]
-                df_pred = pd.DataFrame(X, columns=feat_cols
-                          if len(feat_cols) == len(X[0]) else
-                          pred_headers[:len(X[0])])
-
-                for col, le in preprocessor._encoders.items():
-                    if col in df_pred.columns:
-                        filled = df_pred[col].fillna("__MISSING__").astype(str)
-                        known = set(le.classes_)
-                        filled = filled.apply(
-                            lambda v: v if v in known else le.classes_[0]
-                        )
-                        df_pred[col] = le.transform(filled)
-
-                if preprocessor._scaler is not None and preprocessor._numerical_columns:
-                    scale_cols = [c for c in preprocessor._numerical_columns
-                                  if c in df_pred.columns]
-                    if scale_cols:
-                        import numpy as _np
-                        scaled = preprocessor._scaler.transform(
-                            df_pred[scale_cols].values
-                        )
-                        scaled = _np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
-                        df_pred[scale_cols] = scaled
-
-                df_pred = df_pred.fillna(0.0)
-                avail = [f for f in feature_names if f in df_pred.columns]
-                if avail:
-                    import numpy as _np2
-                    X_arr = _np2.nan_to_num(
-                        df_pred[avail].values.astype(float),
-                        nan=0.0, posinf=0.0, neginf=0.0
-                    )
-
-            except Exception as prep_exc:
-                print(f"[PredictionEngine] Preprocessor transform failed "
-                      f"({prep_exc}), using raw X")
-                X_arr = np.array(X, dtype=float)
-
+ 
         preds = model.predict(X_arr)
+ 
         try:
             proba_matrix = model.predict_proba(X_arr)
-            classes = list(model.classes_)
-
-            # Detect positive class — handles int labels (0/1) AND
-            # string labels ('at_risk'/'not_at_risk') so probas are always
-            # the probability of the at-risk class (0.0–1.0).
+            classes      = list(model.classes_)
+            print(f"[PredictionEngine] classes={classes}")
+ 
+            # ── Strategy 1: known positive-class string/int labels ────────
             _POSITIVE = {1, '1', 'at_risk', 'at-risk', 'high_risk',
                          'risk', 'positive', True}
             pos_idx = next(
                 (i for i, c in enumerate(classes) if c in _POSITIVE), -1
             )
-            print(f'[PredictionEngine] classes={classes}, pos_idx={pos_idx}')
-
-            if pos_idx >= 0:
-                probas = [float(row[pos_idx]) for row in proba_matrix]
-            else:
-                # Fallback: minority class has lowest mean probability
-                import numpy as _np
-                proba_arr = _np.array(proba_matrix)
-                pos_idx   = int(_np.argmin(proba_arr.mean(axis=0)))
-                probas = [float(row[pos_idx]) for row in proba_matrix]
-                print(f'[PredictionEngine] WARNING: guessed pos class '
-                      f'col {pos_idx} from {classes}')
-
+ 
+            # ── Strategy 2: binary classes — minority has HIGHER mean proba
+            #    when class_weight='balanced' inflates minority predictions.
+            #    Pick the column whose mean is LOWER (minority class is rarer
+            #    so its average predicted probability is lower overall).
+            # ✅ With this
+            if pos_idx < 0 and len(classes) == 2:
+                proba_arr = np.array(proba_matrix)
+                means     = proba_arr.mean(axis=0)
+                # With class_weight='balanced', the model assigns elevated
+                # probabilities to the minority (at-risk) class, so its column
+                # has a HIGHER mean. argmin was inverting all predictions,
+                # causing top students (exam 128, GPA 97) to show 100% risk.
+                pos_idx = int(np.argmax(means))
+                print(f"[PredictionEngine] Inferred pos_idx={pos_idx} "
+                    f"via argmax(means={means.round(4)}), classes={classes}")
+ 
+            # ── Strategy 3: last resort ───────────────────────────────────
+            if pos_idx < 0:
+                pos_idx = min(1, len(classes) - 1)
+                print(f"[PredictionEngine] WARNING: fallback pos_idx={pos_idx}")
+ 
+            probas = [float(row[pos_idx]) for row in proba_matrix]
+            print(f"[PredictionEngine] pos_idx={pos_idx}, "
+                  f"sample probas={[round(p, 3) for p in probas[:5]]}")
+ 
+            # ── Sanity check: if majority of probas > 0.5, the column is
+            #    likely the negative class — flip to the other column.
+            high_count = sum(1 for p in probas if p > 0.5)
+            if high_count > len(probas) * 0.6:
+                alt_idx = 1 - pos_idx   # only valid for binary
+                if 0 <= alt_idx < len(classes):
+                    alt_probas = [float(row[alt_idx]) for row in proba_matrix]
+                    alt_high   = sum(1 for p in alt_probas if p > 0.5)
+                    if alt_high < high_count:
+                        print(f"[PredictionEngine] SANITY FLIP: "
+                              f"{high_count}/{len(probas)} probas >0.5 "
+                              f"with pos_idx={pos_idx}, "
+                              f"flipping to col {alt_idx} "
+                              f"({alt_high}/{len(probas)} >0.5)")
+                        pos_idx = alt_idx
+                        probas  = alt_probas
+ 
         except (AttributeError, ValueError) as exc:
-            print(f'[PredictionEngine] predict_proba failed ({exc}), using binary preds')
+            print(f"[PredictionEngine] predict_proba failed ({exc}), "
+                  f"using binary preds")
             probas = [float(p) for p in preds]
+ 
         return list(preds), probas
-
+    
     @staticmethod
     def _predict_mock(X) -> tuple[list, list]:
         preds  = []

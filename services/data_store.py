@@ -148,12 +148,12 @@ class DataStore:
             rows = list(reversed(rows))
 
             _ACTION_ICON = {
-                "LOGIN":        "🔐",
-                "LOGOUT":       "🚪",
-                "LOGIN_FAILED": "⛔",
-                "UPLOAD":       "📂",
-                "MERGE":        "🔀",
-                "TRAIN":        "🧠",
+                "LOGIN":        "",
+                "LOGOUT":       "",
+                "LOGIN_FAILED": "",
+                "UPLOAD":       "",
+                "MERGE":        "",
+                "TRAIN":        "",
                 "PREDICT":      "⚡",
                 "VIEW":         "👁",
                 "EXPORT":       "💾",

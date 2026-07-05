@@ -286,6 +286,15 @@ _PREDICTION_FEATURE_DEFAULTS: dict[str, Any] = {
     # Sex_code removed — not a training feature
 }
 
+PASSTHROUGH_COLUMNS: list[str] = [
+    "firstname", "first_name", "First_Name", "FIRSTNAME", "FIRST_NAME",
+    "fname", "FNAME", "given_name", "Given_Name",
+    "lastname",  "last_name",  "Last_Name",  "LASTNAME",  "LAST_NAME",
+    "lname", "LNAME", "surname", "Surname",
+    "full_name", "Full_Name", "FULL_NAME",
+    "name", "NAME", "student_name", "Student_Name", "STUDENT_NAME",
+    "Program", "College",   # already in TRAINING_FEATURES / meta, but safe to keep
+]
 
 # =============================================================================
 # PUBLIC API
@@ -707,11 +716,21 @@ def select_prediction_features(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = _PREDICTION_FEATURE_DEFAULTS.get(col, 0)
 
-    df = df[PREDICTION_FEATURES]
+    # Collect whichever passthrough (name/meta) columns actually exist
+    # in this dataframe — different portal exports use different casing.
+    existing_passthrough = [
+        c for c in PASSTHROUGH_COLUMNS
+        if c in df.columns and c not in PREDICTION_FEATURES
+    ]
+
+    keep = PREDICTION_FEATURES + existing_passthrough
+    df = df[keep]
 
     print(
         f"[FeatureEngineering] Prediction feature set enforced: "
-        f"{len(df.columns)} columns -> {list(df.columns)}"
+        f"{len(PREDICTION_FEATURES)} model columns + "
+        f"{len(existing_passthrough)} passthrough columns "
+        f"({existing_passthrough})"
     )
     return df
 

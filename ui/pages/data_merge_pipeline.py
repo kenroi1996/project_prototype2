@@ -88,7 +88,7 @@ class FullDatasetDialog(QDialog):
         header_row = QHBoxLayout()
         header_row.setSpacing(16)
 
-        title = QLabel("📋 Unified Dataset")
+        title = QLabel("Unified Dataset")
         title.setObjectName("datasetDialogTitle")
         self._title_lbl = title
 
@@ -97,7 +97,7 @@ class FullDatasetDialog(QDialog):
 
         self._search = QLineEdit()
         self._search.setObjectName("datasetDialogSearch")
-        self._search.setPlaceholderText("🔍 Search by any column…")
+        self._search.setPlaceholderText("Search by any column…")
         self._search.textChanged.connect(self._on_search)
 
         header_row.addWidget(title)
@@ -665,17 +665,17 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._sem_pill_lbl.setObjectName("pipelineSemesterPill")
         self._sem_pill_lbl.setObjectName("pipelineSemesterPill")
 
-        run_pred_btn = QPushButton("Run Prediction")
-        run_pred_btn.setObjectName("mergeRunPredBtn")
-        run_pred_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        run_pred_btn.setFixedWidth(130)
-        run_pred_btn.clicked.connect(self.on_run_prediction)
+        #run_pred_btn = QPushButton("Run Prediction")
+        #run_pred_btn.setObjectName("mergeRunPredBtn")
+        #run_pred_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        #run_pred_btn.setFixedWidth(130)
+        #run_pred_btn.clicked.connect(self.on_run_prediction)
 
         pill_layout.addWidget(dot)
         pill_layout.addWidget(status_lbl)
         pill_layout.addSpacing(8)
         pill_layout.addWidget(self._sem_pill_lbl)
-        pill_layout.addWidget(run_pred_btn)
+        #pill_layout.addWidget(run_pred_btn)
         row.addWidget(model_pill)
         layout.addLayout(row)
         return container
@@ -869,9 +869,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         strategy_grid.setSpacing(24)
 
         for label, value, icon_text in [
-            ("Join Type",     "Left Join",               "⊕"),
-            ("Master Source", "MIS Portal",              "★"),
-            ("Join Key",      "Student ID",              "🔑"),
+            ("Join Type",     "Left Join",               ""),
+            ("Master Source", "MIS Portal",              ""),
+            ("Join Key",      "Student ID",              ""),
             ("Output Cols",   str(len(UNIFIED_COLUMNS)), "📊"),
         ]:
             tile = QFrame()
@@ -1094,7 +1094,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
 
         print(f">>> View Full Dataset button created, enabled={self._view_full_btn.isEnabled()}")
 
-        self._save_btn = QPushButton("💾  Save Unified Dataset")
+        self._save_btn = QPushButton("Save Unified Dataset")
         self._save_btn.setObjectName("mergeSaveBtn")
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_btn.clicked.connect(self._on_save)
@@ -1158,11 +1158,11 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._stage_arrows  = []
 
         stages = [
-            ("📥", "Ingest",     "read_excel"),
-            ("🧹", "Clean",      "handle_missing"),
-            ("🔗", "Merge",      "remove_duplicates"),
-            ("📐", "Normalize",  "scale_numerical"),
-            ("✅", "Ready",      "save_outputs"),
+            ("", "Ingest",     "read_excel"),
+            ("", "Clean",      "handle_missing"),
+            ("", "Merge",      "remove_duplicates"),
+            ("", "Normalize",  "scale_numerical"),
+            ("", "Ready",      "save_outputs"),
         ]
 
         for i, (icon, name, step_key) in enumerate(stages):

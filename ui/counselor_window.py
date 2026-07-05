@@ -29,11 +29,12 @@ from services.system_config import SystemConfig
 # ── Page index ────────────────────────────────────────────────────────────────
 _PAGE_IDX = {
     "Dashboard":          0,
-    "Risk Alerts":        1,
-    "Student Cohort":     2,
-    "Prediction History": 3,
-    "Interventions":      4,
-    "Settings":           5,
+    "Data Analytics":     1,   # ← ADD
+    "Risk Alerts":        2,   # ← was 1
+    "Student Cohort":     3,   # ← was 2
+    "Prediction History": 4,   # ← was 3
+    "Interventions":      5,   # ← was 4
+    "Settings":           6,   # ← was 5
 }
 
 
@@ -124,10 +125,11 @@ class _CounselorTermLoader(QThread):
     # ── Build PredictionResult from DB rows ───────────────────────────
 
     @staticmethod
-    def _category(label: str) -> str:
-        lc = label.lower()
-        if "high"     in lc: return "high_risk"
-        if "moderate" in lc or "medium" in lc: return "moderate_risk"
+    def _category(score: float) -> str:
+        """Derive category from probability score — ignores DB risk_label."""
+        pct = float(score or 0) * 100
+        if pct >= 50:   return "high_risk"
+        if pct >= 25:   return "moderate_risk"
         return "low_risk"
 
     # ── Feature label map ─────────────────────────────────────────────
@@ -196,9 +198,9 @@ class _CounselorTermLoader(QThread):
 
         predictions = []
         for r in rows:
-            cat   = self._category(r.get("risk_label", ""))
             score_raw = r.get("predicted_risk_score")
             score = round(float(score_raw) * 100, 1) if score_raw else 0.0
+            cat   = self._category(score_raw) 
 
             # Use per-student primary_factor stored in DB when available.
             # This is the real top SHAP factor saved at prediction time.
@@ -379,8 +381,10 @@ class CounselorWindow(_Bg):
         from ui.pages.student_cohort_page     import StudentCohortPage
         from ui.pages.prediction_history_page import PredictionHistoryPage
         from ui.pages.settings_page           import SettingsPage
+        from ui.pages.analytics_page          import AnalyticsPage
 
         self.dashboard_page          = DashboardPage()
+        self._analytics_page         = AnalyticsPage()
         self.risk_alerts_page        = RiskAlertsPage()
         self.student_cohort_page     = StudentCohortPage()
         self.prediction_history_page = PredictionHistoryPage()
@@ -390,6 +394,7 @@ class CounselorWindow(_Bg):
 
         pages = [
             (self.dashboard_page,          _PAGE_IDX["Dashboard"]),
+            (self._analytics_page,         _PAGE_IDX["Data Analytics"]),  # ← ADD
             (self.risk_alerts_page,        _PAGE_IDX["Risk Alerts"]),
             (self.student_cohort_page,     _PAGE_IDX["Student Cohort"]),
             (self.prediction_history_page, _PAGE_IDX["Prediction History"]),
@@ -404,12 +409,18 @@ class CounselorWindow(_Bg):
         if self._db_conn:
             DataStore.get().set_db_conn(self._db_conn)
 
+        # Clear predictions on open so counselor pages start blank
+        # and only load data when counselor explicitly clicks Load Term.
+        # This also prevents admin prediction data bleeding into counselor view.
+        DataStore.get().predictions = None
+
         # Default nav
         self.stacked_widget.setCurrentIndex(_PAGE_IDX["Dashboard"])
         self.nav_buttons["Dashboard"].setChecked(True)
 
-        # Populate term dropdowns from DB
-        self._load_term_list()
+        # Defer term list loading until after window is shown
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(200, self._load_term_list)
 
     # ── Term bar ──────────────────────────────────────────────────────
 
@@ -551,6 +562,7 @@ class CounselorWindow(_Bg):
         nav_lo.addWidget(self._section_label("OVERVIEW"))
         for text, icon, key in [
             ("Dashboard",      "assets/icons/dashboard.svg",       "Dashboard"),
+            ("Data Analytics", "assets/icons/analytics.png",       "Data Analytics"),  # ← ADD
             ("Risk Alerts",    "assets/icons/risk-alerts.svg",     "Risk Alerts"),
             ("Student Cohort", "assets/icons/student-cohorts.svg", "Student Cohort"),
         ]:
@@ -707,7 +719,8 @@ class CounselorWindow(_Bg):
             f"{high:,} high-risk"
         )
 
-        # Push into DataStore — all pages update via their listeners
+        # Tag and store — source tag prevents admin pages from consuming this
+        result._source = "counselor"
         store = DataStore.get()
         store.predictions = result
         store._notify("predictions")
@@ -833,6 +846,45 @@ class CounselorWindow(_Bg):
             sys.exit(0)
         _launch_for_role(dlg.db_conn)
 
+    def closeEvent(self, event):
+        """Stop all running threads before the window is destroyed."""
+        for worker in (self._term_list_loader, self._term_loader):
+            if worker is None:
+                continue
+            try:
+                # Guard: the C++ object may already be deleted by deleteLater
+                worker.finished.disconnect()
+                worker.error.disconnect()
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(2000)
+            except RuntimeError:
+                pass   # already deleted — safe to ignore
+            except Exception:
+                pass
+        # Remove DataStore listeners from all pages to prevent
+        # signals firing into destroyed widgets
+        try:
+            from services.data_store import DataStore
+            store = DataStore.get()
+            for attr in ("dashboard_page", "risk_alerts_page",
+             "student_cohort_page", "prediction_history_page",
+             "interventions_page", "settings_page",
+             "_analytics_page"):   # ← ADD
+                page = getattr(self, attr, None)
+                if page is None:
+                    continue
+                if hasattr(page, "_on_store_updated"):
+                    store.remove_listener(page._on_store_updated)
+                if hasattr(page, "closeEvent"):
+                    try:
+                        page.closeEvent(event)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_term_bar_styles()
@@ -863,11 +915,18 @@ def _launch_for_role(db_conn):
     role = (_AS.current_role() or "").strip().lower()
     print(f"[Routing] current_role='{role}' → "
           f"{'CounselorWindow' if role == 'counselor' else 'DashboardWindow'}")
+
+    app = QApplication.instance()
+    app._main_window = None
+
     if role == "counselor":
         w = CounselorWindow(db_conn=db_conn)
     else:
         from ui.dashboard_window_new import DashboardWindow
         w = DashboardWindow(db_conn=db_conn)
+
     w.show()
-    QApplication.instance()._main_window = w
+    w.raise_()
+    w.activateWindow()
+    app._main_window = w
     return w

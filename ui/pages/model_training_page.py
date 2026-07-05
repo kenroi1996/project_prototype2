@@ -543,7 +543,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         section_desc.setObjectName("trainSectionDesc")
         section_left.addWidget(section_title)
         section_left.addWidget(section_desc)
-        train_btn = QPushButton("🧠 Train Model")
+        train_btn = QPushButton("Train Model")
         train_btn.setObjectName("trainModelBtn")
         train_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         train_btn.setFixedHeight(40)

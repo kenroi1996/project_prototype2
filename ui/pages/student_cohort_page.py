@@ -17,10 +17,10 @@ TABLE_COLUMNS = [
     ("STUDENT ID",     1),
     ("NAME",           2),
     ("COLLEGE",        1),
-    ("RISK SCORE",     2),
-    ("RISK LEVEL",     1),
-    ("PRIMARY FACTOR", 2),
-    ("",               1),
+    ("RISK SCORE",     2),   # col 3 — score bar + percentage
+    ("RISK LEVEL",     1),   # col 4
+    ("PRIMARY FACTOR", 2),   # col 5
+    ("",               1),   # col 6 — View button
 ]
 
 
@@ -44,7 +44,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         DataStore.get().add_listener(self._on_store_updated)
 
         existing = DataStore.get().predictions
-        if existing and existing.success:
+        if existing and getattr(existing, "success", False):
             self._apply_predictions(existing)
 
     # ------------------------------------------------------------------
@@ -134,14 +134,20 @@ class StudentCohortPage(PredictionMixin, QWidget):
     # Cell / badge builders
     # ------------------------------------------------------------------
 
-    def _create_risk_score_cell(self, score):
+    def _create_risk_score_cell(self, score: float):
+        """
+        score is a float in 0-100 range.
+        QProgressBar.setValue() requires int, so we cast explicitly.
+        The label shows '< 1%' for sub-1% scores to avoid showing '0%'
+        for students who have a tiny but non-zero risk probability.
+        """
         container = QWidget()
         layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
         bar = QProgressBar()
-        bar.setValue(max(0, min(100, score)))
+        bar.setValue(max(0, min(100, int(score))))   # int required by Qt
         bar.setTextVisible(False)
         bar.setFixedHeight(8)
         bar.setMaximumWidth(80)
@@ -160,9 +166,15 @@ class StudentCohortPage(PredictionMixin, QWidget):
             }}
         """)
 
-        pct = QLabel(f"{score}%")
+        # Show '< 1%' for sub-1 scores so the cell never reads '0%'
+        if 0 < score < 1:
+            label_text = "< 1%"
+        else:
+            label_text = f"{score:.1f}%" if score % 1 else f"{int(score)}%"
+
+        pct = QLabel(label_text)
         pct.setStyleSheet("color: rgba(255,255,255,0.55); font-size: 12px;")
-        pct.setFixedWidth(36)
+        pct.setFixedWidth(42)
 
         layout.addWidget(bar, 1)
         layout.addWidget(pct)
@@ -194,9 +206,11 @@ class StudentCohortPage(PredictionMixin, QWidget):
         for col, (_, stretch) in enumerate(TABLE_COLUMNS):
             grid.setColumnStretch(col, stretch)
 
+        # col 0 — Student ID
         id_lbl = QLabel(student["id"])
         id_lbl.setObjectName("cohortCellId")
 
+        # col 1 — Name (clickable)
         name_lbl = QLabel(student["name"])
         name_lbl.setObjectName("cohortCellName")
         name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -205,26 +219,21 @@ class StudentCohortPage(PredictionMixin, QWidget):
             if e.button() == Qt.MouseButton.LeftButton else None
         )
 
+        # col 2 — College
         college_lbl = QLabel(student["college"])
         college_lbl.setObjectName("cohortCellMuted")
 
-        gwa_val = student.get("gwa", 0.0)
-        gwa_lbl = QLabel(f"{gwa_val:.2f}" if gwa_val else "—")
-        gwa_lbl.setObjectName(
-            "cohortGwaRisk" if isinstance(gwa_val, float) and gwa_val >= 2.5
-            else "cohortGwaGood"
-        )
+        # col 3 — Risk Score (bar + percentage)
+        score_cell = self._create_risk_score_cell(student["score"])
 
-        abs_val = student.get("absences", 0)
-        abs_lbl = QLabel(str(abs_val) if abs_val else "—")
-        abs_lbl.setObjectName(
-            "cohortAbsencesRisk" if isinstance(abs_val, int) and abs_val >= 10
-            else "cohortCellMuted"
-        )
+        # col 4 — Risk Level badge
+        risk_badge = self._create_risk_badge(student["risk_level"])
 
+        # col 5 — Primary Factor
         factor_lbl = QLabel(student.get("factor", "—"))
         factor_lbl.setObjectName("cohortCellMuted")
 
+        # col 6 — View button
         view_btn = QPushButton("View")
         view_btn.setObjectName("cohortViewButton")
         view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -232,15 +241,13 @@ class StudentCohortPage(PredictionMixin, QWidget):
             lambda _, s=student: self._open_student_profile(s)
         )
 
-        grid.addWidget(id_lbl,     0, 0)
-        grid.addWidget(name_lbl,   0, 1)
-        grid.addWidget(college_lbl,0, 2)
-        grid.addWidget(gwa_lbl,    0, 3)
-        grid.addWidget(abs_lbl,    0, 4)
-        grid.addWidget(self._create_risk_score_cell(student["score"]), 0, 5)
-        grid.addWidget(self._create_risk_badge(student["risk_level"]),  0, 6)
-        grid.addWidget(factor_lbl, 0, 7)
-        grid.addWidget(view_btn,   0, 8, Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(id_lbl,      0, 0)
+        grid.addWidget(name_lbl,    0, 1)
+        grid.addWidget(college_lbl, 0, 2)
+        grid.addWidget(score_cell,  0, 3)
+        grid.addWidget(risk_badge,  0, 4)
+        grid.addWidget(factor_lbl,  0, 5)
+        grid.addWidget(view_btn,    0, 6, Qt.AlignmentFlag.AlignRight)
 
         row.mousePressEvent = lambda e, s=student: (
             self._open_student_profile(s)
@@ -365,7 +372,19 @@ class StudentCohortPage(PredictionMixin, QWidget):
     # ------------------------------------------------------------------
 
     def _prediction_to_student(self, pred: dict) -> dict:
-        category = pred.get("category", "low_risk")
+        # score arrives as 0-100 float from both PredictionEngine and
+        # DashboardTermService — keep as float, never cast to int here
+        # so sub-1% scores display as '< 1%' instead of '0%'.
+        score = round(float(pred.get("score", 0)), 1)
+        score = max(0.0, min(100.0, score))
+
+        if score >= 50:
+            category = "high_risk"
+        elif score >= 25:
+            category = "moderate_risk"
+        else:
+            category = "low_risk"
+
         try:
             gwa = float(pred.get("gwa") or 0)
         except (TypeError, ValueError):
@@ -374,6 +393,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
             absences = int(float(pred.get("absences") or 0))
         except (TypeError, ValueError):
             absences = 0
+
         return {
             "name":         pred.get("name", "—"),
             "id":           str(pred.get("student_id", "—")),
@@ -381,7 +401,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
             "program":      pred.get("program", "—"),
             "gwa":          gwa,
             "absences":     absences,
-            "score":        int(round(float(pred.get("score", 0)))),
+            "score":        score,
             "risk_level":   self._RISK_LEVELS.get(category, "Low"),
             "factor":       pred.get("factor", "—"),
             "category":     category,
@@ -393,8 +413,22 @@ class StudentCohortPage(PredictionMixin, QWidget):
             self._refresh_term_labels()
         if key in ("predictions", "all"):
             result = DataStore.get().predictions
-            if result and result.success:
-                self._apply_predictions(result)
+            if result and getattr(result, "success", False):
+                from services.auth_service import AuthService
+                role   = (AuthService.current_role() or "").strip().lower()
+                source = getattr(result, "_source", "admin")
+                if (role == "counselor" and source == "counselor") or \
+                (role != "counselor" and source != "counselor"):
+                    self._apply_predictions(result)
+            else:
+                # ── Predictions cleared — reset to empty state ────────────
+                self._populate_table([])
+                self.explorer_meta.setText(
+                    "No prediction results yet  ·  "
+                    "Run prediction to populate this table"
+                )
+                if self._profile_drawer is not None and self._profile_drawer._is_open:
+                    self._profile_drawer.close_drawer()
 
     def _refresh_term_labels(self):
         if hasattr(self, "_ay_sub_lbl"):
@@ -480,7 +514,6 @@ class StudentCohortPage(PredictionMixin, QWidget):
         run_button.setIcon(QIcon("assets/icons/play.svg"))
         run_button.clicked.connect(self._go_to_prediction_page)
         run_button.setFixedWidth(155)
-        # Hide for counselors
         from services.auth_service import AuthService
         if (AuthService.current_role() or "").strip().lower() == "counselor":
             run_button.hide()
@@ -540,7 +573,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
             ["All risk levels", "High", "Moderate", "Low"]
         )
         self.college_combo = self._create_filter_combo(
-            ["All colleges", "CTE", "CBAA", "CITE", "COED", "CON", "CAS"]
+            ["All colleges", "COTE","CTHM"]
         )
 
         self.risk_combo.currentIndexChanged.connect(self._apply_filters)

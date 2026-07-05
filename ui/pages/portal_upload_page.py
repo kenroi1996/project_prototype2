@@ -1057,17 +1057,17 @@ class PortalUploadPage(QWidget):
         self._pull_db_btn.clicked.connect(self._pull_from_database)
         self._pull_db_btn.setFixedWidth(130)
 
-        self._etl_btn = QPushButton("🔄 Run ETL")
-        self._etl_btn.setObjectName("runButton")
-        self._etl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._etl_btn.clicked.connect(self._run_star_schema_etl)
-        self._etl_btn.setFixedWidth(130)
+        #self._etl_btn = QPushButton("🔄 Run ETL")
+        #self._etl_btn.setObjectName("runButton")
+        #self._etl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        #self._etl_btn.clicked.connect(self._run_star_schema_etl)
+        #self._etl_btn.setFixedWidth(130)
 
         model_layout.addWidget(model_status)
         model_layout.addWidget(self._sem_pill_lbl)
         model_layout.addWidget(self._save_db_btn)
         model_layout.addWidget(self._pull_db_btn)
-        model_layout.addWidget(self._etl_btn)
+        #model_layout.addWidget(self._etl_btn)
 
         model_card.setLayout(model_layout)
         header_layout.addWidget(model_card)

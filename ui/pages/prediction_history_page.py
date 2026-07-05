@@ -209,13 +209,14 @@ class _ReportWorker(QThread):
     finished = pyqtSignal(str)
     error    = pyqtSignal(str)
 
-    def __init__(self, rows, term_label, academic_year, semester, save_path):
+    def __init__(self, rows, term_label, academic_year, semester, save_path, config=None):
         super().__init__()
         self._rows          = rows
         self._term_label    = term_label
         self._academic_year = academic_year
         self._semester      = semester
         self._save_path     = save_path
+        self._config        = config          # ← add this
 
     def run(self):
         try:
@@ -225,6 +226,7 @@ class _ReportWorker(QThread):
                 term_label    = self._term_label,
                 academic_year = self._academic_year,
                 semester      = self._semester,
+                config        = self._config,  # ← add this
             )
             buf = gen.build_bytes()
             with open(self._save_path, "wb") as f:
@@ -250,8 +252,9 @@ class PredictionHistoryPage(QWidget):
         self._delete_worker: _DeleteTermWorker | None = None
         self._setup_ui()
         self._apply_styles()
-        self._load_available_terms()
         DataStore.get().add_listener(self._on_store_updated)
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(300, self._load_available_terms)
 
     def _on_store_updated(self, key: str):
         if key not in ("predictions", "last_prediction_run", "all"):
@@ -278,7 +281,7 @@ class PredictionHistoryPage(QWidget):
         title_col = QVBoxLayout()
         title_col.setSpacing(4)
 
-        title = QLabel("PREDICTION HISTORY")
+        title = QLabel("Prediction History")
         title.setObjectName("histTitle")
         sub = QLabel("Browse and restore past prediction runs from the database")
         sub.setObjectName("histSubtitle")
@@ -900,6 +903,18 @@ class PredictionHistoryPage(QWidget):
             show_warning(self, "No Data", "Load a term first before exporting.")
             return
 
+        # ── Show customization dialog first ──────────────────────────────
+        from ui.dialogs.report_customization import ReportCustomizationDialog
+        colleges = sorted({
+            str(r.get("college", "")).strip()
+            for r in self._rows if r.get("college") and r.get("college") != "—"
+        })
+        dlg = ReportCustomizationDialog(parent=self, colleges=colleges)
+        if dlg.exec() != ReportCustomizationDialog.DialogCode.Accepted:
+            return
+        config = dlg.cohort_config()
+
+        # ── Then ask where to save ────────────────────────────────────────
         from PyQt6.QtWidgets import QFileDialog
         ay      = self._ay_combo.currentText().strip()
         sem     = self._sem_combo.currentIndex() + 1
@@ -919,6 +934,7 @@ class PredictionHistoryPage(QWidget):
             academic_year = ay,
             semester      = sem,
             save_path     = path,
+            config        = config,              # ← pass config
         )
         self._report_worker.finished.connect(self._on_export_done)
         self._report_worker.error.connect(self._on_export_error)
@@ -945,6 +961,28 @@ class PredictionHistoryPage(QWidget):
     # ─────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Stop all running worker threads before destruction
+        for attr in ("_term_worker", "_loader", "_silent_loader",
+                     "_delete_worker", "_report_worker"):
+            worker = getattr(self, attr, None)
+            if worker is None:
+                continue
+            try:
+                worker.finished.disconnect()
+            except Exception:
+                pass
+            try:
+                worker.error.disconnect()
+            except Exception:
+                pass
+            try:
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(2000)
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
         DataStore.get().remove_listener(self._on_store_updated)
         super().closeEvent(event)
 

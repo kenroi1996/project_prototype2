@@ -39,8 +39,33 @@ class RiskAlertsPage(PredictionMixin, QWidget):
             self._refresh_term_labels()
         if key in ("predictions", "all"):
             result = DataStore.get().predictions
-            if result and result.success:
-                self._apply_predictions(result)
+            if result and getattr(result, "success", False):
+                from services.auth_service import AuthService
+                role   = (AuthService.current_role() or "").strip().lower()
+                source = getattr(result, "_source", "admin")
+                if (role == "counselor" and source == "counselor") or \
+                (role != "counselor" and source != "counselor"):
+                    self._apply_predictions(result)
+            else:
+                # ── Predictions cleared — reset to empty state ────────────
+                self._has_predictions = False
+                while self.cards_layout.count():
+                    item = self.cards_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+                self._alert_cards.clear()
+                self._empty_state.setVisible(True)
+                self._live_content.setVisible(False)
+                self._banner_text.setText(
+                    "Run a prediction to populate risk alerts.")
+                for tid, btn in self._tab_buttons.items():
+                    labels = {
+                        "all": "All Alerts",
+                        "high_risk": "High Risk",
+                        "moderate_risk": "Moderate Risk",
+                    }
+                    btn.setText(f"{labels[tid]} (0)")
+
 
     def _apply_predictions(self, result):
         self._has_predictions = True
@@ -232,10 +257,6 @@ class RiskAlertsPage(PredictionMixin, QWidget):
         actions.setSpacing(8)
         actions.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        notify_btn = QPushButton("Notify Advisor")
-        notify_btn.setObjectName("alertActionButton")
-        notify_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
         profile_btn = QPushButton("View Profile")
         profile_btn.setObjectName("alertActionButton")
         profile_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -243,7 +264,6 @@ class RiskAlertsPage(PredictionMixin, QWidget):
             lambda _, s=student: self._open_student_profile(s)
         )
 
-        actions.addWidget(notify_btn)
         actions.addWidget(profile_btn)
 
         layout.addLayout(info, 1)
@@ -393,20 +413,20 @@ class RiskAlertsPage(PredictionMixin, QWidget):
         self._sem_pill_lbl.setObjectName("semesterPill")
         self._sem_pill_lbl.setObjectName("semesterPill")
 
-        run_btn = QPushButton("Run Prediction")
-        run_btn.setObjectName("runButton")
-        run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        run_btn.setIcon(QIcon("assets/icons/play.svg"))
-        run_btn.clicked.connect(self.on_run_prediction)
-        run_btn.setFixedWidth(130)
+        #run_btn = QPushButton("Run Prediction")
+        #run_btn.setObjectName("runButton")
+        #run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        #run_btn.setIcon(QIcon("assets/icons/play.svg"))
+        #run_btn.clicked.connect(self.on_run_prediction)
+        #run_btn.setFixedWidth(130)
         # Hide for counselors
-        from services.auth_service import AuthService
-        if (AuthService.current_role() or "").strip().lower() == "counselor":
-            run_btn.hide()
+        #from services.auth_service import AuthService
+        #if (AuthService.current_role() or "").strip().lower() == "counselor":
+        #    run_btn.hide()
 
         mc_layout.addWidget(self.model_status)
         mc_layout.addWidget(self._sem_pill_lbl)
-        mc_layout.addWidget(run_btn)
+        #mc_layout.addWidget(run_btn)
         header_row.addWidget(model_card)
 
         fh_layout.addLayout(header_row)
