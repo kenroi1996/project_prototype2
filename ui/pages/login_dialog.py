@@ -259,7 +259,7 @@ class LoginDialog(QDialog):
         layout.addStretch()
 
         # Footer
-        footer = QLabel("Philippine Normal University — Visayas")
+        footer = QLabel("Cebu Technological University - Daanbantayan Campus")
         footer.setObjectName("loginFooter")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(footer)

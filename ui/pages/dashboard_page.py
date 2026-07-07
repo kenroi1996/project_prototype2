@@ -1,3 +1,20 @@
+"""
+ui/pages/dashboard_page.py
+=============================
+Admin dashboard with cross-filtering, term selector, and live refresh.
+
+The one background worker used here has been split out to keep this file
+focused on the page itself:
+  workers/dashboard_workers.py -> _InterventionRateLoader
+
+No logic changes — only relocation and import wiring. Everything else
+(cross-filtering, SHAP factor aggregation, alerts panel, program heatmap,
+trend chart, coverage refresh, setup_ui/_build_* methods) stays here since
+it's tightly coupled to this page's own widgets (self._metric_1,
+self._shap_factors_layout, self._heatmap_grid, etc.) — splitting it further
+would mean introducing a controller/presenter layer, which is a design
+change, not a relocation.
+"""
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QSizePolicy, QGraphicsOpacityEffect, QProgressBar,
@@ -5,7 +22,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     QTimer, Qt, QPropertyAnimation, QEasingCurve, QMargins,
-    QThread, pyqtSignal as _Signal,
 )
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QIcon, QCursor,
@@ -29,31 +45,7 @@ from services.system_config import SystemConfig
 from services.dashboard_refresh_service import DashboardRefreshService
 from services.dashboard_term_service import DashboardTermService
 
-
-# ── Intervention count loader ─────────────────────────────────────────────────
-
-class _InterventionRateLoader(QThread):
-    """Counts total intervention log records across all terms."""
-    finished = _Signal(int, int)   # (total_logs, per_student_logs)
-    error    = _Signal(str)
-
-    def run(self) -> None:
-        conn = DataStore.get().db_conn
-        if not conn:
-            self.error.emit("No DB connection")
-            return
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM public.interventions")
-                total = int(cur.fetchone()[0])
-                cur.execute(
-                    "SELECT COUNT(*) FROM public.interventions "
-                    "WHERE mode = 'per_student'"
-                )
-                per_student = int(cur.fetchone()[0])
-            self.finished.emit(total, per_student)
-        except Exception as exc:
-            self.error.emit(str(exc))
+from workers.dashboard_workers import _InterventionRateLoader
 
 
 # ── Dashboard Page ────────────────────────────────────────────────────────────

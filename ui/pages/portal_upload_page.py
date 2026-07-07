@@ -1,3 +1,19 @@
+"""
+ui/pages/portal_upload_page.py
+=================================
+Data upload portal for office record uploads (MIS, SAO, Guidance, Registrar).
+
+Configuration data and the page stylesheet have been split out into their
+own modules to keep this file focused on the page's behavior:
+  ui/pages/portal_upload_configs.py  -> PORTAL_CONFIGS
+  ui/styles/portal_upload_styles.py  -> build_portal_upload_stylesheet()
+
+No logic changes — only relocation and import wiring. Everything else
+(dynamic-state helpers, DB push/pull, view/edit handlers, setup_ui) stays
+here since these methods are tightly bound to this page's own widgets
+(self._pipeline_log, self.file_label, etc.) — splitting them further would
+mean restructuring how they're called, not just relocating code.
+"""
 from pathlib import Path
 from typing import Optional
 
@@ -26,73 +42,8 @@ from services.excel_service import read_excel_file, dataframe_to_rows, rows_to_d
 from services.database_service import DatabaseService, PORTAL_SOURCE_CONFIGS
 from services.preprocessing_service import CleaningEngine, compute_issues
 
-
-PORTAL_CONFIGS = {
-    "mis": {
-        "title": "MIS PORTAL",
-        "office": "Management Information System",
-        "subtitle": "Academic records & enrollment data",
-        "description": (
-            "Upload semester grades, units earned, failed subjects, "
-            "and program enrollment from the MIS office."
-        ),
-        "accent": "#4f8cff",
-        "file_hint": "mis_academic_records_2024.csv",
-        "fields": [
-            "KEYID", "SYSTEMCODE", "ID_NO", "PROGRAM", "COLLEGE",
-            "SECCODE", "YEAR", "SEX_CODE", "HOME_ADDRESS", "CIVIL_STATUS",
-            "RELIGION", "FINAL_AVG_GRD",
-        ],
-    },
-    "sao": {
-        "title": "SAO PORTAL",
-        "office": "Student Affairs Office",
-        "subtitle": "Attendance, conduct & student life data",
-        "description": (
-            "Upload attendance logs, org membership, violations, "
-            "and financial aid status from the SAO office."
-        ),
-        "accent": "#34d399",
-        "file_hint": "sao_student_affairs_2024.csv",
-        "fields": [
-            "STUDENT_ID", "SCHOLARSHIP_APPLICANT", "SCHOLARSHIP_TYPE",
-            "GENDER", "BIRTHDATE", "MUNICIPALITY", "PROGRAM",
-        ],
-    },
-    "guidance": {
-        "title": "Guidance PORTAL",
-        "office": "Guidance & Counseling Office",
-        "subtitle": "Psychological screening & referral records",
-        "description": (
-            "Upload psychometric scores, counseling referrals, "
-            "and socio-economic background from the Guidance office."
-        ),
-        "accent": "#f59e0b",
-        "file_hint": "guidance_psych_records_2024.csv",
-        "fields": [
-            "Date", "student_id", "systemcode", "last_name", "first_name",
-            "entrance_exam_score", "family_income_bracket",
-            "parent_highest_education", "applicant_age",
-            "home_municipality", "program_code"
-        ],
-    },
-    "registrar": {
-        "title": "Registrar PORTAL",
-        "office": "Office of the Registrar",
-        "subtitle": "Student biographical & high school background data",
-        "description": (
-            "Upload student identity, demographic, and high school "
-            "background records for cohort mapping and risk modeling."
-        ),
-        "accent": "#a78bfa",
-        "file_hint": "registrar_student_records_2024.csv",
-        "fields": [
-            "student_id", "lastname", "firstname", "gender", "hs_gpa",
-            "year_graduated", "shs_strand", "hs_type", "graduation_honors",
-            "hs_school", "municipality", "home_address", "year_enrolled",
-        ],
-    },
-}
+from ui.pages.portal_upload_configs import PORTAL_CONFIGS
+from ui.styles.portal_upload_styles import build_portal_upload_stylesheet
 
 
 class PortalUploadPage(QWidget):
@@ -789,196 +740,7 @@ class PortalUploadPage(QWidget):
 
     def _apply_page_styles(self):
         accent = self.config["accent"]
-        self.setStyleSheet(f"""
-            #portalModelCard {{
-                background-color: rgba(0, 0, 0, 0.2);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 12px;
-            }}
-            #portalModelStatus {{
-                color: #2ecc71;
-                font-weight: bold;
-                font-size: 12px;
-            }}
-            #portalSemesterPill {{
-                background-color: rgba(255, 255, 255, 0.06);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 8px;
-                color: rgba(255, 255, 255, 0.85);
-                font-size: 12px;
-                padding: 8px 14px;
-            }}
-            #portalCard {{
-                background-color: rgba(0, 0, 0, 0.22);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 14px;
-            }}
-            #portalCardTitle {{
-                color: rgba(255, 255, 255, 0.4);
-                font-size: 11px;
-                font-weight: bold;
-                letter-spacing: 1px;
-            }}
-            #portalOfficeName {{
-                font-size: 16px;
-                font-weight: bold;
-                color: white;
-            }}
-            #portalOfficeDesc {{
-                color: rgba(255, 255, 255, 0.45);
-                font-size: 12px;
-            }}
-            #portalStatusBadge {{
-                background-color: rgba(255, 255, 255, 0.06);
-                border: 1px solid {accent};
-                border-radius: 12px;
-                color: {accent};
-                font-size: 11px;
-                font-weight: 600;
-                padding: 5px 12px;
-            }}
-            #portalUploadZone {{
-                background-color: rgba(255, 255, 255, 0.03);
-                border: 2px dashed rgba(255, 255, 255, 0.15);
-                border-radius: 12px;
-            }}
-            #portalUploadIcon {{
-                font-size: 32px;
-            }}
-            #portalUploadTitle {{
-                font-size: 14px;
-                font-weight: bold;
-                color: white;
-            }}
-            #portalUploadHint {{
-                color: rgba(255, 255, 255, 0.4);
-                font-size: 12px;
-            }}
-            #portalBrowseBtn {{
-                background-color: {accent};
-                border: none;
-                border-radius: 8px;
-                color: white;
-                font-size: 12px;
-                font-weight: 600;
-                padding: 10px 20px;
-            }}
-            #portalBrowseBtn:hover {{
-                background-color: rgba(79, 140, 255, 0.85);
-            }}
-            #portalClearBtn {{
-                background-color: rgba(255,91,91,0.08);
-                border: 1px solid rgba(255,91,91,0.25);
-                border-radius: 8px;
-                color: #ff5b5b;
-                font-size: 12px;
-                font-weight: 600;
-                padding: 8px 16px;
-            }}
-            #portalClearBtn:hover {{
-                background-color: rgba(255,91,91,0.18);
-            }}
-            #portalViewBtn {{
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 8px;
-                color: rgba(255, 255, 255, 0.85);
-                font-size: 12px;
-                font-weight: 600;
-                padding: 8px 16px;
-            }}
-            #portalViewBtn:hover:enabled {{
-                background-color: rgba(255, 255, 255, 0.1);
-            }}
-            #portalViewBtn:disabled {{
-                color: rgba(255, 255, 255, 0.25);
-                border-color: rgba(255, 255, 255, 0.06);
-            }}
-            #portalEditBtn {{
-                background-color: rgba(79, 140, 255, 0.12);
-                border: 1px solid rgba(79, 140, 255, 0.35);
-                border-radius: 8px;
-                color: #6eb5ff;
-                font-size: 12px;
-                font-weight: 600;
-                padding: 8px 16px;
-            }}
-            #portalEditBtn:hover:enabled {{
-                background-color: rgba(79, 140, 255, 0.22);
-            }}
-            #portalEditBtn:disabled {{
-                color: rgba(255, 255, 255, 0.25);
-                border-color: rgba(255, 255, 255, 0.06);
-                background-color: rgba(255, 255, 255, 0.03);
-            }}
-            #portalStatValue {{
-                font-size: 22px;
-                font-weight: bold;
-                color: white;
-            }}
-            #portalStatLabel {{
-                color: rgba(255, 255, 255, 0.4);
-                font-size: 11px;
-            }}
-            #portalFieldPill {{
-                background-color: rgba(255, 255, 255, 0.04);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 14px;
-                color: rgba(255, 255, 255, 0.7);
-                font-size: 11px;
-                padding: 6px 12px;
-            }}
-            #portalHistoryRow {{
-                border-top: 1px solid rgba(255, 255, 255, 0.06);
-            }}
-            #portalHistoryName {{
-                color: white;
-                font-size: 13px;
-            }}
-            #portalHistoryMeta {{
-                color: rgba(255, 255, 255, 0.4);
-                font-size: 11px;
-            }}
-            #portalHistorySuccess {{
-                color: #34d399;
-                font-size: 11px;
-            }}
-            #portalHistoryWarning {{
-                color: #f5b335;
-                font-size: 11px;
-            }}
-            QMessageBox {{
-                background-color: #13172a;
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 12px;
-            }}
-            QMessageBox QLabel {{
-                color: #e8eaf0;
-                font-size: 13px;
-                background: transparent;
-            }}
-            QMessageBox QPushButton {{
-                background-color: rgba(255,255,255,0.06);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 8px;
-                color: rgba(255,255,255,0.80);
-                font-size: 12px;
-                font-weight: 600;
-                padding: 8px 20px;
-                min-width: 70px;
-            }}
-            QMessageBox QPushButton:hover {{
-                background-color: rgba(255,255,255,0.12);
-            }}
-            QMessageBox QPushButton[default="true"] {{
-                background-color: #ff5b5b;
-                border: none;
-                color: white;
-            }}
-            QMessageBox QPushButton[default="true"]:hover {{
-                background-color: rgba(255,91,91,0.85);
-            }}
-        """)
+        self.setStyleSheet(build_portal_upload_stylesheet(accent))
 
 
 
