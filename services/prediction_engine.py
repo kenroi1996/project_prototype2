@@ -438,7 +438,14 @@ class PredictionEngine:
                 )
 
             meta = {
-                "name":    full_name,
+                # Displayed identifier is the student ID only — real
+                # names are never shown in the UI, per the anonymization
+                # requirement. first_name/last_name below are still
+                # captured and passed through separately so
+                # RiskPersistenceService can correctly encrypt and store
+                # the real name in dim_student; this "name" field is
+                # display-only and intentionally never the real name.
+                "name":    sid,
                 "program": _cell(row, program_idx) or snap.get("Program") or "—",
                 "college": _cell(row, college_idx) or snap.get("College") or "—",
                 "gwa":     _cell(row, gwa_idx)     or snap.get("Final_Avg_GRD") or "—",

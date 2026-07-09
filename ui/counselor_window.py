@@ -77,8 +77,8 @@ class _CounselorTermLoader(QThread):
     _SQL = """
         SELECT
             ds.student_id,
-            TRIM(COALESCE(ds.first_name,'') || ' ' ||
-                 COALESCE(ds.last_name,''))              AS full_name,
+            ds.first_name,
+            ds.last_name,
             COALESCE(dp.program_name, 'Unknown')         AS program,
             COALESCE(dp.college,      '—')               AS college,
             COALESCE(rl.risk_label,   'Low Risk')        AS risk_label,
@@ -212,8 +212,13 @@ class _CounselorTermLoader(QThread):
             student_factor = db_factor if db_factor else top_factor
             student_shap   = shap_factors   # model-level importances for all
 
+            # Names are encrypted at rest and never decrypted for display —
+            # the student ID is shown instead, per the anonymization
+            # requirement. Real names remain stored (encrypted) in the DB.
+            full_name = str(r.get("student_id", "—"))
+
             predictions.append({
-                "name":         r.get("full_name", "—"),
+                "name":         full_name,
                 "student_id":   str(r.get("student_id", "—")),
                 "program":      r.get("program", "—"),
                 "college":      r.get("college", "—"),

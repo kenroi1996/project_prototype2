@@ -69,8 +69,8 @@ class _TermDataWorker(QThread):
     _SQL = """
         SELECT
             ds.student_id,
-            TRIM(COALESCE(ds.first_name,'') || ' ' ||
-                 COALESCE(ds.last_name,''))              AS full_name,
+            ds.first_name,
+            ds.last_name,
             COALESCE(dp.program_name, 'Unknown')         AS program,
             COALESCE(dp.college,      '—')               AS college,
             COALESCE(rl.risk_label,   'Low Risk')        AS risk_label,
@@ -212,8 +212,15 @@ class _TermDataWorker(QThread):
             db_factor      = r.get("primary_factor")
             student_factor = db_factor if db_factor else top_factor
 
+            # Names are encrypted at rest and are never decrypted for
+            # display — the student ID is shown instead, per the study's
+            # anonymization requirement. The database write path still
+            # stores real names (encrypted); this only affects what the
+            # UI is allowed to show.
+            full_name = str(r.get("student_id", "—"))
+
             predictions.append({
-                "name":         r.get("full_name", "—"),
+                "name":         full_name,
                 "id":           str(r.get("student_id", "—")),
                 "student_id":   str(r.get("student_id", "—")),
                 "program":      r.get("program", "—"),

@@ -503,8 +503,8 @@ class StudentLoader(QThread):
     _SQL = """
         SELECT
             ds.student_id,
-            TRIM(COALESCE(ds.first_name,'') || ' ' ||
-                 COALESCE(ds.last_name,''))             AS full_name,
+            ds.first_name,
+            ds.last_name,
             COALESCE(dp.program_name,'Unknown')         AS program,
             COALESCE(dp.college,'—')                    AS college,
             COALESCE(rl.risk_label,'High')              AS risk_label,
@@ -539,8 +539,15 @@ class StudentLoader(QThread):
             with conn.cursor() as cur:
                 cur.execute(self._SQL, (self._ay, self._sem))
                 cols = [d[0] for d in cur.description]
-                self.finished.emit(
-                    [dict(zip(cols, r)) for r in cur.fetchall()])
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+                for row in rows:
+                    # Names are encrypted at rest and never decrypted for
+                    # display — the student ID is shown instead, per the
+                    # anonymization requirement.
+                    row.pop("first_name", None)
+                    row.pop("last_name", None)
+                    row["full_name"] = str(row.get("student_id", "—"))
+                self.finished.emit(rows)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -642,11 +649,11 @@ class LogLoader(QThread):
             if f.get("student_id"):
                 clauses.append("i.student_id ILIKE %s")
                 params.append(f"%{f['student_id']}%")
-            if f.get("student_name"):
-                clauses.append(
-                    "(TRIM(COALESCE(ds.first_name,'') || ' ' || "
-                    "COALESCE(ds.last_name,'')) ILIKE %s)")
-                params.append(f"%{f['student_name']}%")
+            # student_name filtering was removed entirely — names are
+            # encrypted at rest and never decrypted for display anywhere
+            # in the app, so there is no plaintext name to search by.
+            # Searching/filtering intervention logs is done by student_id
+            # only (above).
             if f.get("date_from"):
                 clauses.append("i.logged_at >= %s")
                 params.append(f["date_from"])
@@ -657,23 +664,28 @@ class LogLoader(QThread):
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             sql = f"""
                 SELECT i.intervention_id, i.student_id,
-                    TRIM(COALESCE(ds.first_name,'') || ' ' ||
-                         COALESCE(ds.last_name,''))         AS student_name,
                     i.academic_year, i.semester, i.mode,
                     i.risk_score, i.risk_label, i.risk_factors,
                     jsonb_array_length(
                         COALESCE(i.recommendations,'[]'::jsonb)) AS rec_count,
                     i.logged_at
                 FROM public.interventions i
-                LEFT JOIN public.dim_student ds ON ds.student_id = i.student_id
                 {where}
                 ORDER BY i.logged_at DESC
             """
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 cols = [d[0] for d in cur.description]
-                self.finished.emit(
-                    [dict(zip(cols, r)) for r in cur.fetchall()])
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # Names are encrypted at rest and never decrypted for display —
+            # the student ID is shown instead, per the anonymization
+            # requirement. This also means the dim_student join above is
+            # no longer needed at all, since nothing from it is displayed.
+            for row in rows:
+                row["student_name"] = str(row.get("student_id", "—"))
+
+            self.finished.emit(rows)
         except Exception as e:
             self.error.emit(str(e))
 

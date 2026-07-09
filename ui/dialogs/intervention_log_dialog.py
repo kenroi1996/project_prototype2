@@ -33,14 +33,13 @@ class InterventionLogDialog(QDialog):
     _COL_CHK  = 0
     _COL_ID   = 1
     _COL_SID  = 2
-    _COL_NAME = 3
-    _COL_TERM = 4
-    _COL_TYPE = 5
-    _COL_RISK = 6
-    _COL_RECS = 7
-    _COL_LOG  = 8
-    _COL_VIEW = 9
-    _COL_DEL  = 10
+    _COL_TERM = 3
+    _COL_TYPE = 4
+    _COL_RISK = 5
+    _COL_RECS = 6
+    _COL_LOG  = 7
+    _COL_VIEW = 8
+    _COL_DEL  = 9
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -96,7 +95,6 @@ class InterventionLogDialog(QDialog):
 
         f1 = QHBoxLayout(); f1.setSpacing(10)
         self._sid_search  = self._inp("🔍  Student ID",    150)
-        self._name_search = self._inp("🔍  Student Name",  200)
         self._ay_filter   = self._cb(["All Terms"])
         self._sem_filter  = self._cb(["All Semesters","1st Semester","2nd Semester"])
         self._mode_filter = self._cb(["All Types","per_student","cohort"])
@@ -105,14 +103,14 @@ class InterventionLogDialog(QDialog):
         clr = QPushButton("✕  Clear"); clr.setObjectName("logClearBtn")
         clr.setFixedHeight(32); clr.setCursor(Qt.CursorShape.PointingHandCursor)
         clr.clicked.connect(self._clear_filters)
-        for w in [self._sid_search, self._name_search, self._ay_filter,
+        for w in [self._sid_search, self._ay_filter,
                   self._sem_filter, self._mode_filter, self._date_from,
                   self._date_to, clr]:
             f1.addWidget(w)
         f1.addStretch()
         self._count_lbl = QLabel(""); self._count_lbl.setObjectName("logCount")
         f1.addWidget(self._count_lbl); root.addLayout(f1)
-        for w in (self._sid_search, self._name_search,
+        for w in (self._sid_search,
                   self._date_from, self._date_to):
             w.textChanged.connect(self._on_filter_changed)
         for c in (self._ay_filter, self._sem_filter, self._mode_filter):
@@ -154,9 +152,9 @@ class InterventionLogDialog(QDialog):
         root.addWidget(self._batch_bar_frame)
 
         self._table = QTableWidget(); self._table.setObjectName("logTable")
-        self._table.setColumnCount(11)
+        self._table.setColumnCount(10)
         self._table.setHorizontalHeaderLabels([
-            "☐", "ID", "Student ID", "Name", "Term",
+            "☐", "ID", "Student ID", "Term",
             "Type", "Risk", "Recs", "Logged At", "View", "Delete",
         ])
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -173,7 +171,6 @@ class InterventionLogDialog(QDialog):
             (self._COL_CHK,  QHeaderView.ResizeMode.Fixed,            32),
             (self._COL_ID,   QHeaderView.ResizeMode.Fixed,            44),
             (self._COL_SID,  QHeaderView.ResizeMode.Fixed,            80),
-            (self._COL_NAME, QHeaderView.ResizeMode.Fixed,           160),
             (self._COL_TERM, QHeaderView.ResizeMode.ResizeToContents, 0),
             (self._COL_TYPE, QHeaderView.ResizeMode.ResizeToContents, 0),
             (self._COL_RISK, QHeaderView.ResizeMode.ResizeToContents, 0),
@@ -271,7 +268,6 @@ class InterventionLogDialog(QDialog):
             "semester":      sem  if sem  != 0            else "",
             "mode":          mode if mode != "All Types"  else "",
             "student_id":    self._sid_search.text().strip(),
-            "student_name":  self._name_search.text().strip(),
             "date_from":     self._date_from.text().strip(),
             "date_to":       self._date_to.text().strip(),
         }
@@ -313,7 +309,7 @@ class InterventionLogDialog(QDialog):
         self._ft.start(400)
 
     def _clear_filters(self):
-        for w in (self._sid_search, self._name_search,
+        for w in (self._sid_search,
                   self._date_from, self._date_to):
             w.blockSignals(True); w.clear(); w.blockSignals(False)
         for c in (self._ay_filter, self._sem_filter, self._mode_filter):
@@ -348,9 +344,6 @@ class InterventionLogDialog(QDialog):
         for ri, row in enumerate(rows):
             iid     = row.get("intervention_id", "")
             sid     = str(row.get("student_id") or "—")
-            name    = str(row.get("student_name") or "—").strip() or "—"
-            if len(name) > 22:
-                name = name[:20] + "…"
             ay      = str(row.get("academic_year") or "—")
             sem_n   = row.get("semester")
             term    = f"{ay} S{sem_n}" if sem_n else ay
@@ -376,7 +369,7 @@ class InterventionLogDialog(QDialog):
             self._table.setCellWidget(ri, self._COL_CHK, cb)
 
             for ci, (text, color) in enumerate([
-                (str(iid), None), (sid, None), (name, None), (term, None),
+                (str(iid), None), (sid, None), (term, None),
                 (ml, None), (risk_l, rc), (f"{rec_cnt} recs", None), (ls, None),
             ], 1):
                 item = QTableWidgetItem(text)

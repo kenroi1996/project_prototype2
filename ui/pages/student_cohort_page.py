@@ -15,12 +15,11 @@ from services.system_config import SystemConfig
 
 TABLE_COLUMNS = [
     ("STUDENT ID",     1),
-    ("NAME",           2),
     ("COLLEGE",        1),
-    ("RISK SCORE",     2),   # col 3 — score bar + percentage
-    ("RISK LEVEL",     1),   # col 4
-    ("PRIMARY FACTOR", 2),   # col 5
-    ("",               1),   # col 6 — View button
+    ("RISK SCORE",     2),   # col 2 — score bar + percentage
+    ("RISK LEVEL",     1),   # col 3
+    ("PRIMARY FACTOR", 2),   # col 4
+    ("",               1),   # col 5 — View button
 ]
 
 
@@ -206,34 +205,33 @@ class StudentCohortPage(PredictionMixin, QWidget):
         for col, (_, stretch) in enumerate(TABLE_COLUMNS):
             grid.setColumnStretch(col, stretch)
 
-        # col 0 — Student ID
+        # col 0 — Student ID (clickable — real names are never shown,
+        # per the anonymization requirement; the ID is the sole
+        # identifier displayed and now carries the click-to-view behavior
+        # that used to live on the name label).
         id_lbl = QLabel(student["id"])
         id_lbl.setObjectName("cohortCellId")
-
-        # col 1 — Name (clickable)
-        name_lbl = QLabel(student["name"])
-        name_lbl.setObjectName("cohortCellName")
-        name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        name_lbl.mousePressEvent = lambda e, s=student: (
+        id_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        id_lbl.mousePressEvent = lambda e, s=student: (
             self._open_student_profile(s)
             if e.button() == Qt.MouseButton.LeftButton else None
         )
 
-        # col 2 — College
+        # col 1 — College
         college_lbl = QLabel(student["college"])
         college_lbl.setObjectName("cohortCellMuted")
 
-        # col 3 — Risk Score (bar + percentage)
+        # col 2 — Risk Score (bar + percentage)
         score_cell = self._create_risk_score_cell(student["score"])
 
-        # col 4 — Risk Level badge
+        # col 3 — Risk Level badge
         risk_badge = self._create_risk_badge(student["risk_level"])
 
-        # col 5 — Primary Factor
+        # col 4 — Primary Factor
         factor_lbl = QLabel(student.get("factor", "—"))
         factor_lbl.setObjectName("cohortCellMuted")
 
-        # col 6 — View button
+        # col 5 — View button
         view_btn = QPushButton("View")
         view_btn.setObjectName("cohortViewButton")
         view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -242,12 +240,11 @@ class StudentCohortPage(PredictionMixin, QWidget):
         )
 
         grid.addWidget(id_lbl,      0, 0)
-        grid.addWidget(name_lbl,    0, 1)
-        grid.addWidget(college_lbl, 0, 2)
-        grid.addWidget(score_cell,  0, 3)
-        grid.addWidget(risk_badge,  0, 4)
-        grid.addWidget(factor_lbl,  0, 5)
-        grid.addWidget(view_btn,    0, 6, Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(college_lbl, 0, 1)
+        grid.addWidget(score_cell,  0, 2)
+        grid.addWidget(risk_badge,  0, 3)
+        grid.addWidget(factor_lbl,  0, 4)
+        grid.addWidget(view_btn,    0, 5, Qt.AlignmentFlag.AlignRight)
 
         row.mousePressEvent = lambda e, s=student: (
             self._open_student_profile(s)
@@ -338,7 +335,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         for row, student in self._table_rows:
             visible = True
             if query:
-                haystack = f"{student['name']} {student['id']}".lower()
+                haystack = str(student['id']).lower()
                 visible  = query in haystack
             if visible and risk_filter != "All risk levels":
                 visible = student["risk_level"] == risk_filter
@@ -563,7 +560,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("cohortSearchInput")
-        self.search_input.setPlaceholderText("Search name or ID...")
+        self.search_input.setPlaceholderText("Search by student ID...")
         self.search_input.textChanged.connect(self._apply_filters)
 
         search_inner.addWidget(search_icon)

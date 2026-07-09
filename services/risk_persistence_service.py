@@ -16,6 +16,8 @@ always divide by 100 before storing — no conditional needed.
 """
 from __future__ import annotations
 
+from services.encryption_utils import encrypt_field, decrypt_field
+
 _FEATURE_HUMAN_LABELS = {
     "Entrance_Exam_Score":      "Entrance Exam Score",
     "entrance_exam_score":      "Entrance Exam Score",
@@ -363,7 +365,7 @@ class RiskPersistenceService:
                     RETURNING student_key
                 """, (
                     student_id,
-                    first_name or None, last_name or None,
+                    encrypt_field(first_name or None), encrypt_field(last_name or None),
                     shs_strand, hs_type, graduation_honors, hs_school_name,
                     sex_code, civil_status, home_municipality,
                     family_income_bracket, parent_highest_education,

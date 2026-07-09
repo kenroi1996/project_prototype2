@@ -205,7 +205,7 @@ class RiskAlertsPage(PredictionMixin, QWidget):
         dot.setObjectName("riskStatusDot")
         dot.setFixedWidth(14)
 
-        name_lbl = QLabel(student["name"])
+        name_lbl = QLabel(student.get("id", student.get("name", "—")))
         name_lbl.setObjectName("studentAlertName")
 
         badge = QLabel(student.get("label", "At Risk"))
@@ -220,7 +220,7 @@ class RiskAlertsPage(PredictionMixin, QWidget):
         name_row.addStretch()
 
         meta = QLabel(
-            f"{student['id']}  ·  {student['college']}  ·  {student['program']}"
+            f"{student['college']}  ·  {student['program']}"
         )
         meta.setObjectName("studentAlertMeta")
 

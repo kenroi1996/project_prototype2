@@ -1,15 +1,3 @@
-"""
-config.py
-─────────
-Loads all environment variables from .env and exposes them as typed
-module-level constants.  Import this anywhere instead of touching os.environ
-directly.
-
-Usage
------
-    from config import DATABASE_URL, AT_RISK_THRESHOLD, CAMPUS_LAT, CAMPUS_LNG
-"""
-
 from __future__ import annotations
 
 import os

@@ -731,9 +731,10 @@ class StudentProfilePanel(QFrame):
         """Populate panel fields from a student record dict."""
 
         # ── Identity ──────────────────────────────────────────────────
-        self.name_label.setText(student.get("name", "—"))
+        # Real names are never shown, per the anonymization requirement —
+        # the student ID is the sole identifier displayed here.
+        self.name_label.setText(student.get("id") or student.get("name", "—"))
         self.meta_label.setText(
-            f"{student.get('id', '—')}  ·  "
             f"{student.get('college', '—')}  ·  "
             f"{student.get('program', '—')}"
         )

@@ -10,7 +10,10 @@ Changes
 -------
 - Added "🗑 Delete Term" button beside search bar
 - Search bar constrained to fixed width (no longer stretches full row)
-- _DeleteTermWorker: deletes all fact rows for the selected term from DB
+- _DeleteTermWorker: deletes all fact rows for the selected term from DB,
+  plus any dim_student rows left fully orphaned as a result (students with
+  no remaining record in any other term). Students still active in another
+  term are never touched.
 """
 from __future__ import annotations
 
@@ -64,8 +67,6 @@ class _HistoryLoader(QThread):
     _SQL = """
         SELECT
             ds.student_id,
-            TRIM(COALESCE(ds.first_name, '') || ' ' ||
-                 COALESCE(ds.last_name,  ''))             AS full_name,
             ds.first_name,
             ds.last_name,
             COALESCE(dp.program_name, 'Unknown')          AS program,
@@ -110,7 +111,17 @@ class _HistoryLoader(QThread):
                 rows[0][cols.index("term_label")]
                 if rows else f"{self._academic_year} Sem {self._semester}"
             )
-            self.finished.emit([dict(zip(cols, r)) for r in rows], term_label)
+            row_dicts = [dict(zip(cols, r)) for r in rows]
+            for row in row_dicts:
+                # Names are encrypted at rest and never decrypted for
+                # display — the student ID is shown instead, per the
+                # anonymization requirement. Real names remain stored
+                # (encrypted) in the DB; first_name/last_name are dropped
+                # here so no ciphertext leaks into the UI layer at all.
+                row.pop("first_name", None)
+                row.pop("last_name", None)
+                row["full_name"] = str(row.get("student_id", "—"))
+            self.finished.emit(row_dicts, term_label)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -139,10 +150,24 @@ class _TermLoader(QThread):
 
 class _DeleteTermWorker(QThread):
     """
-    Deletes all fact_student_academic_risk rows for a given term.
-    Does NOT delete the dim_academic_term row itself — just the fact data.
+    Deletes all fact_student_academic_risk rows for a given term, then
+    also deletes any dim_student rows that become fully orphaned as a
+    result — i.e. students who have NO remaining fact_student_academic_risk
+    rows left in ANY term after this deletion.
+
+    Does NOT delete the dim_academic_term row itself — just the fact data
+    and any now-orphaned student dimension rows.
+
+    IMPORTANT: dim_student is NOT term-scoped — one row is shared across
+    every term a student appears in. A student with records in multiple
+    terms is deliberately left untouched if they still have at least one
+    other term's fact row after this deletion; only students with zero
+    remaining fact rows anywhere are removed from dim_student. This is
+    enforced with a single atomic CTE query, not two separate statements,
+    so a crash between steps can't leave the database in a half-deleted
+    state.
     """
-    finished = pyqtSignal(int)   # number of rows deleted
+    finished = pyqtSignal(int, int)   # (fact rows deleted, dim_student rows deleted)
     error    = pyqtSignal(str)
 
     def __init__(self, academic_year: str, semester: int):
@@ -157,6 +182,8 @@ class _DeleteTermWorker(QThread):
             return
         try:
             with conn.cursor() as cur:
+                # Step 1: delete this term's fact rows, capturing which
+                # students were affected.
                 cur.execute("""
                     DELETE FROM public.fact_student_academic_risk
                     WHERE term_key IN (
@@ -165,10 +192,34 @@ class _DeleteTermWorker(QThread):
                         WHERE  academic_year = %s
                           AND  semester      = %s
                     )
+                    RETURNING student_key
                 """, (self._ay, self._sem))
-                deleted = cur.rowcount
+                affected_keys = [row[0] for row in cur.fetchall()]
+                facts_deleted = len(affected_keys)
+
+                # Step 2: SEPARATE statement, not a sibling CTE. This matters —
+                # PostgreSQL data-modifying CTEs in the same WITH clause all
+                # share the snapshot from the START of the query, so a
+                # NOT EXISTS check against the base table inside a sibling
+                # CTE would NOT see step 1's deletions and would never treat
+                # anyone as orphaned. Running this as its own statement in
+                # the same transaction correctly sees step 1's effects.
+                students_deleted = 0
+                if affected_keys:
+                    cur.execute("""
+                        DELETE FROM public.dim_student
+                        WHERE student_key = ANY(%s)
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM   public.fact_student_academic_risk fsr
+                              WHERE  fsr.student_key = dim_student.student_key
+                          )
+                        RETURNING student_key
+                    """, (affected_keys,))
+                    students_deleted = cur.rowcount
+
             conn.commit()
-            self.finished.emit(deleted)
+            self.finished.emit(facts_deleted, students_deleted)
         except Exception as exc:
             try:
                 conn.rollback()
@@ -642,7 +693,10 @@ class PredictionHistoryPage(QWidget):
         )
         msg.setInformativeText(
             f"This will remove {len(self._rows):,} student records from the "
-            f"database. This action cannot be undone."
+            f"database. Students with no remaining predictions in any other "
+            f"term will also be removed from the system; students who still "
+            f"have records in another term are kept. This action cannot be "
+            f"undone."
         )
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setStandardButtons(
@@ -697,7 +751,7 @@ class PredictionHistoryPage(QWidget):
         self._delete_worker.error.connect(self._delete_worker.deleteLater)
         self._delete_worker.start()
 
-    def _on_delete_done(self, deleted: int):
+    def _on_delete_done(self, deleted: int, students_deleted: int):
         ay  = self._ay_combo.currentText().strip()
         sem = self._sem_combo.currentIndex() + 1
         sem_label = "1st" if sem == 1 else "2nd"
@@ -720,12 +774,21 @@ class PredictionHistoryPage(QWidget):
         # Refresh the term dropdown — the deleted term may now have 0 rows
         self._load_available_terms()
 
+        student_note = (
+            f"{students_deleted:,} student(s) with no remaining records in "
+            f"any other term were also removed from the system."
+            if students_deleted > 0 else
+            "No students were fully removed — all affected students still "
+            "have records in another term."
+        )
+
         QMessageBox.information(
             self,
             "Deleted",
             f"Successfully deleted {deleted:,} prediction records for\n"
             f"{ay} — {sem_label} Semester.\n\n"
-            f"The academic term entry is kept; only the prediction data was removed.",
+            f"The academic term entry is kept; only the prediction data was removed.\n\n"
+            f"{student_note}",
         )
 
     def _on_delete_error(self, msg: str):
@@ -833,8 +896,6 @@ class PredictionHistoryPage(QWidget):
                 haystack = " ".join([
                     str(row.get("student_id", "")),
                     str(row.get("full_name",  "")),
-                    str(row.get("first_name", "")),
-                    str(row.get("last_name",  "")),
                 ]).lower()
                 if text not in haystack:
                     continue

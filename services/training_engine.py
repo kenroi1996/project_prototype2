@@ -235,6 +235,13 @@ class TrainingEngine:
         df_cat = pd.get_dummies(df_features[cat_cols], drop_first=False) \
                  if cat_cols else pd.DataFrame(index=df_features.index)
         df_num = df_features[num_cols].reset_index(drop=True)
+        # Coerce to true numeric dtype BEFORE the median fillna below —
+        # without this, a column that arrived as strings (e.g. from the
+        # merge pipeline) is silently skipped by median(numeric_only=True),
+        # leaving its NaNs unfilled all the way through to model training,
+        # where SMOTE (unlike RandomForestClassifier) rejects NaN outright.
+        for col in df_num.columns:
+            df_num[col] = pd.to_numeric(df_num[col], errors="coerce")
         df_encoded = pd.concat(
             [df_num, df_cat.reset_index(drop=True)], axis=1
         )
