@@ -472,7 +472,7 @@ class StudentCohortPage(PredictionMixin, QWidget):
         header_text_layout = QVBoxLayout()
         header_text_layout.setSpacing(5)
 
-        header = QLabel("Student Cohort")
+        header = QLabel("STUDENT COHORT EXPLORER")
         header.setObjectName("header")
 
         self._ay_sub_lbl = QLabel(f"Academic Year {SystemConfig.academic_year()}")

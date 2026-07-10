@@ -19,6 +19,25 @@ before splitting, causing direct target leakage.  If you want to reintroduce
 them in a future iteration, compute them inside each training fold only and
 apply the learned mapping to held-out rows — never on the full dataset.
 
+TARGET DERIVATION — Final_Avg_GRD ONLY
+-----------------------------------------
+define_target() derives risk_label from Final_Avg_GRD alone. A row with no
+Final_Avg_GRD gets risk_label = NaN and is dropped by TrainingEngine's
+valid_mask (listwise deletion) — it is never imputed and never labeled from
+a substitute signal.
+
+A previous version fell back to Entrance_Exam_Score when Final_Avg_GRD was
+missing, and defaulted to "at_risk" when both were missing. Both were bugs:
+  1. Falling back to Entrance_Exam_Score created direct target leakage —
+     Entrance_Exam_Score is also a TRAINING_FEATURES input, so for those rows
+     the label was literally a thresholded copy of a feature the model was
+     simultaneously trained to use as a predictor.
+  2. Defaulting to "at_risk" when both were missing fabricated a positive
+     label with zero grounding in any actual data. Because the result was
+     always a valid string, never NaN, TrainingEngine's listwise-deletion
+     safety net (valid_mask) had nothing to catch — these fabricated rows
+     silently entered training as if they were real at-risk students.
+
 Two-phase usage
 ---------------
   Phase 1 — Training (historical data that has Final_Avg_GRD):
@@ -57,6 +76,12 @@ import pandas as pd
 
 # ── GPA scale ────────────────────────────────────────────────────────────────
 GPA_AT_RISK_THRESHOLD  = 3.0
+
+# NOTE: EXAM_AT_RISK_THRESHOLD is no longer used to derive risk_label — see
+# "TARGET DERIVATION" above. Kept only in case a future iteration reintroduces
+# entrance-exam-based labeling in a leakage-safe way (e.g. as a separate,
+# clearly-disclosed weak-label signal, never mixed into the same target used
+# to train on Entrance_Exam_Score as a feature).
 EXAM_AT_RISK_THRESHOLD = 60
 
 # ── Strand–Program alignment tables ──────────────────────────────────────────
@@ -344,6 +369,15 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def define_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive risk_label from Final_Avg_GRD ONLY.
+
+    A row with no Final_Avg_GRD gets risk_label = NaN and is dropped
+    downstream by TrainingEngine's valid_mask (listwise deletion) — it is
+    never imputed and never labeled from a substitute signal such as
+    Entrance_Exam_Score. See the module docstring's "TARGET DERIVATION"
+    section for why the previous fallback/default behavior was unsafe.
+    """
     df = df.copy()
 
     if TARGET_COLUMN in df.columns:
@@ -353,41 +387,35 @@ def define_target(df: pd.DataFrame) -> pd.DataFrame:
     if "Final_Avg_GRD" in df.columns:
         grd = pd.to_numeric(df["Final_Avg_GRD"], errors="coerce")
 
-    exam = pd.Series(np.nan, index=df.index)
-    if "Entrance_Exam_Score" in df.columns:
-        exam = pd.to_numeric(df["Entrance_Exam_Score"], errors="coerce")
+    def _label(g: float):
+        if pd.isna(g):
+            return np.nan
+        return "at_risk" if g >= GPA_AT_RISK_THRESHOLD else "not_at_risk"
 
-    def _label(g: float, e: float) -> str:
-        if pd.notna(g):
-            return "at_risk" if g >= GPA_AT_RISK_THRESHOLD else "not_at_risk"
-        if pd.notna(e):
-            return "at_risk" if e < EXAM_AT_RISK_THRESHOLD else "not_at_risk"
-        return "at_risk"
+    df[TARGET_COLUMN] = grd.apply(_label)
 
-    df[TARGET_COLUMN] = [_label(g, e) for g, e in zip(grd, exam)]
-
-    counts     = df[TARGET_COLUMN].value_counts().to_dict()
+    counts     = df[TARGET_COLUMN].value_counts(dropna=True).to_dict()
     n_at_risk  = counts.get("at_risk", 0)
     n_not_risk = counts.get("not_at_risk", 0)
     n_total    = n_at_risk + n_not_risk
+    n_dropped  = len(df) - n_total
 
     print(
         f"[FeatureEngineering] Target distribution: "
-        f"at_risk={n_at_risk}, not_at_risk={n_not_risk}"
+        f"at_risk={n_at_risk}, not_at_risk={n_not_risk}, "
+        f"unlabeled/dropped (missing Final_Avg_GRD)={n_dropped}"
     )
 
     # ── Early detection: degenerate label distribution ────────────────────────
-    has_grades   = "Final_Avg_GRD" in df.columns and grd.notna().sum() > 0
-    grade_source = "Final_Avg_GRD" if has_grades else "Entrance_Exam_Score"
+    has_grades = "Final_Avg_GRD" in df.columns and grd.notna().sum() > 0
 
     if n_at_risk == 0:
         raise ValueError(
             f"Zero at-risk students detected after labeling "
-            f"(source: {grade_source}).\n\n"
+            f"(source: Final_Avg_GRD).\n\n"
             + (
-                f"Final_Avg_GRD is absent from this dataset — the fallback "
-                f"rule (Entrance_Exam_Score < {EXAM_AT_RISK_THRESHOLD}) labeled "
-                f"everyone 'not_at_risk' because all exam scores are above {EXAM_AT_RISK_THRESHOLD}.\n\n"
+                f"Final_Avg_GRD is absent from this dataset — every row was "
+                f"left unlabeled and would be dropped before training.\n\n"
                 f"This is the INCOMING STUDENTS dataset (no grades yet). "
                 f"It is correct for PREDICTION but not for TRAINING.\n\n"
                 f"To train the model, use the HISTORICAL MIS export that includes "

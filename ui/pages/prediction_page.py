@@ -3,7 +3,10 @@ from PyQt6.QtWidgets import (
     QFrame, QLineEdit, QFileDialog, QGraphicsOpacityEffect,
     QProgressBar, QScrollArea, QGridLayout, QComboBox,
 )
-from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
+from PyQt6.QtCore import (
+    Qt, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal,
+    QRect, QParallelAnimationGroup,
+)
 from PyQt6.QtGui import QColor, QIcon
 
 from ui.mixins.prediction_mixin import PredictionMixin
@@ -33,6 +36,88 @@ _DATASET_CONFIG = {
     "office": "Incoming First-Year Students",
     "accent": ACCENT,
 }
+
+
+# =============================================================================
+# SLIDE STACK — carousel-style step container
+# =============================================================================
+# Lightweight horizontal-slide equivalent of QStackedWidget. Uses the same
+# QPropertyAnimation-on-geometry technique as StudentProfileDrawer's slide-in
+# panel (ui/components/student_profile_drawer.py), just horizontal and scoped
+# to a fixed-size host instead of a full-window overlay. Qt clips child
+# widgets to their parent's rect by default, so pages positioned outside the
+# host's bounds during the slide are simply not painted — no manual clipping
+# needed.
+# =============================================================================
+
+class _SlideStack(QWidget):
+    """Holds N pages side-by-side; slide_to(index) animates between them."""
+
+    ANIM_DURATION = 320
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pages: list[QWidget] = []
+        self._current_index = -1
+        self._anim_group: QParallelAnimationGroup | None = None
+
+    def add_page(self, widget: QWidget) -> int:
+        widget.setParent(self)
+        widget.hide()
+        self._pages.append(widget)
+        if self._current_index == -1:
+            self._current_index = 0
+            widget.setGeometry(self.rect())
+            widget.show()
+        return len(self._pages) - 1
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if 0 <= self._current_index < len(self._pages):
+            self._pages[self._current_index].setGeometry(self.rect())
+
+    def current_index(self) -> int:
+        return self._current_index
+
+    def slide_to(self, index: int):
+        if index == self._current_index or not (0 <= index < len(self._pages)):
+            return
+        if self._anim_group and self._anim_group.state() == QParallelAnimationGroup.State.Running:
+            self._anim_group.stop()
+
+        direction = 1 if index > self._current_index else -1
+        outgoing  = self._pages[self._current_index]
+        incoming  = self._pages[index]
+        w, h      = self.width(), self.height()
+
+        incoming.setGeometry(direction * w, 0, w, h)
+        incoming.show()
+        incoming.raise_()
+
+        anim_out = QPropertyAnimation(outgoing, b"geometry")
+        anim_out.setDuration(self.ANIM_DURATION)
+        anim_out.setStartValue(outgoing.geometry())
+        anim_out.setEndValue(QRect(-direction * w, 0, w, h))
+        anim_out.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        anim_in = QPropertyAnimation(incoming, b"geometry")
+        anim_in.setDuration(self.ANIM_DURATION)
+        anim_in.setStartValue(incoming.geometry())
+        anim_in.setEndValue(QRect(0, 0, w, h))
+        anim_in.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        self._anim_group = QParallelAnimationGroup()
+        self._anim_group.addAnimation(anim_out)
+        self._anim_group.addAnimation(anim_in)
+
+        prev_index = self._current_index
+
+        def _on_finished():
+            self._pages[prev_index].hide()
+            self._current_index = index
+
+        self._anim_group.finished.connect(_on_finished)
+        self._anim_group.start()
 
 
 # =============================================================================
@@ -170,9 +255,23 @@ class _FusedPredictionWorker(QThread):
 
 class PredictionPage(PredictionMixin, QWidget):
     """
-    Upload four portal datasets → merge → run feature engineering
-    and model scoring → results saved to DB automatically.
+    4-step wizard: Dataset Details → Upload Portals → Merge & Clean →
+    Run Pipeline & Predict. Each step is a full-width page inside a
+    _SlideStack; Back/Next slide between them. Business logic (portal
+    upload, merge, clean, fused predict, DB checks) is unchanged from the
+    previous flat-scroll layout — only the navigation/presentation changed.
     """
+
+    _STEP_META = [
+        ("01", "Dataset Details"),
+        ("02", "Upload Portals"),
+        ("03", "Merge & Clean"),
+        ("04", "Run & Predict"),
+    ]
+    _WIZARD_HEIGHT = 460   # fixed height for the slide area; tallest step
+                           # (portal grid) sets the floor, shorter steps use
+                           # addStretch() to pin content to the top instead
+                           # of stretching to fill the space.
 
     def __init__(self):
         super().__init__()
@@ -183,6 +282,13 @@ class PredictionPage(PredictionMixin, QWidget):
         self._cleaned = False
         self._fused_worker: _FusedPredictionWorker | None = None
         self._available_terms: list = []
+
+        # Wizard navigation state
+        self._current_step  = 0
+        self._furthest_step = 0
+        self._step_badges: dict = {}
+        self._step_titles: dict = {}
+        self._step_connectors: list = []
 
         self.setup_ui()
         self._apply_styles()
@@ -223,10 +329,10 @@ class PredictionPage(PredictionMixin, QWidget):
 
         self.main_layout.addWidget(self._build_header())
         self.main_layout.addWidget(self._build_model_status_panel())
-        self.main_layout.addLayout(self._build_step_row())
-        self.main_layout.addWidget(self._build_merge_card())
-        self.main_layout.addWidget(self._build_fused_card())
+        self.main_layout.addWidget(self._build_wizard())
         self.main_layout.addStretch()
+
+        self._init_wizard_state()
 
     def _on_store_updated(self, key: str):
         if key in ("system_config", "all"):
@@ -318,7 +424,7 @@ class PredictionPage(PredictionMixin, QWidget):
         self._model_status_dot.setStyleSheet(
             "color: #34d399; font-size: 11px; background: transparent;"
         )
-        self._model_status_title.setText("✓  Model Active — Ready for Prediction")
+        self._model_status_title.setText("✓  Model Active - Ready for Prediction")
         self._model_status_title.setStyleSheet(
             "color: #34d399; font-size: 14px; font-weight: 700; background: transparent;"
         )
@@ -453,15 +559,233 @@ class PredictionPage(PredictionMixin, QWidget):
         return container
 
     # ------------------------------------------------------------------
-    # Steps
+    # Wizard shell: step indicator + slide stack + nav
     # ------------------------------------------------------------------
 
-    def _build_step_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(20)
-        row.addWidget(self._build_details_card(), 1)
-        row.addWidget(self._build_portals_card(), 2)
-        return row
+    def _build_wizard(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("predWizardCard")
+        card.setStyleSheet("""
+            QFrame#predWizardCard {
+                background-color: rgba(255,255,255,0.02);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+            }
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        layout.addWidget(self._build_step_indicator())
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(255,255,255,0.07); border: none;")
+        layout.addWidget(sep)
+
+        self._slide_stack = _SlideStack()
+        self._slide_stack.setObjectName("predSlideStack")
+        self._slide_stack.setFixedHeight(self._WIZARD_HEIGHT)
+
+        self._step_pages = [
+            self._build_details_card(),
+            self._build_portals_card(),
+            self._build_merge_card(),
+            self._build_fused_card(),
+        ]
+        for page in self._step_pages:
+            self._slide_stack.add_page(page)
+
+        layout.addWidget(self._slide_stack)
+        layout.addWidget(self._build_wizard_nav())
+        return card
+
+    def _build_step_indicator(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("predStepIndicatorBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(24, 18, 24, 18)
+        row.setSpacing(6)
+
+        for i, (num, title) in enumerate(self._STEP_META):
+            row.addWidget(self._build_step_chip(i, num, title), 1)
+            if i < len(self._STEP_META) - 1:
+                connector = QFrame()
+                connector.setFixedHeight(2)
+                connector.setFixedWidth(36)
+                row.addWidget(connector, 0)
+                self._step_connectors.append(connector)
+
+        return bar
+
+    def _build_step_chip(self, idx: int, num: str, title: str) -> QFrame:
+        chip = QFrame()
+        chip.setObjectName(f"predStepChip_{idx}")
+        chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        row = QHBoxLayout(chip)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(10)
+
+        badge = QLabel(num)
+        badge.setFixedSize(26, 26)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title_lbl = QLabel(title)
+
+        row.addWidget(badge)
+        row.addWidget(title_lbl)
+        row.addStretch()
+
+        # Click-to-jump — same inline mousePressEvent pattern already used
+        # elsewhere in this app (e.g. student_cohort_page.py's clickable
+        # student ID cell) rather than wrapping in a QPushButton, which
+        # doesn't lay out a badge + label combo cleanly.
+        chip.mousePressEvent = lambda e, i=idx: (
+            self._on_step_chip_clicked(i)
+            if e.button() == Qt.MouseButton.LeftButton else None
+        )
+
+        self._step_badges[idx] = badge
+        self._step_titles[idx] = title_lbl
+        return chip
+
+    def _build_wizard_nav(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("predWizardNav")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(24, 16, 24, 20)
+        row.setSpacing(10)
+
+        self._back_btn = QPushButton("←  Back")
+        self._back_btn.setObjectName("predSecondaryBtn")
+        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._back_btn.setFixedHeight(38)
+        self._back_btn.setFixedWidth(110)
+        self._back_btn.clicked.connect(self._go_back)
+
+        self._step_progress_lbl = QLabel("")
+        self._step_progress_lbl.setStyleSheet(
+            "color: rgba(255,255,255,0.30); font-size: 11px; background: transparent;"
+        )
+
+        self._next_btn = QPushButton("Next  →")
+        self._next_btn.setObjectName("predPrimaryBtn")
+        self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_btn.setFixedHeight(38)
+        self._next_btn.setFixedWidth(130)
+        self._next_btn.clicked.connect(self._go_next)
+
+        row.addWidget(self._back_btn)
+        row.addStretch()
+        row.addWidget(self._step_progress_lbl)
+        row.addStretch()
+        row.addWidget(self._next_btn)
+        return bar
+
+    # ------------------------------------------------------------------
+    # Wizard navigation state machine
+    # ------------------------------------------------------------------
+
+    def _init_wizard_state(self):
+        self._current_step  = 0
+        self._furthest_step = 0
+        self._update_wizard_nav()
+        self._update_step_indicator()
+
+    def _step_is_complete(self, idx: int) -> bool:
+        if idx == 0:
+            return bool(self._name_input.text().strip())
+        if idx == 1:
+            return self._all_portals_uploaded()
+        if idx == 2:
+            return self._merged and self._merged_rows is not None
+        return False   # step 3 (index) has no "next" — terminal step
+
+    def _go_next(self):
+        if self._current_step >= len(self._step_pages) - 1:
+            return
+        if not self._step_is_complete(self._current_step):
+            if self._current_step == 0:
+                self._name_input.setFocus()
+            return
+        self._go_to_step(self._current_step + 1)
+
+    def _go_back(self):
+        if self._current_step <= 0:
+            return
+        self._go_to_step(self._current_step - 1)
+
+    def _go_to_step(self, idx: int):
+        idx = max(0, min(idx, len(self._step_pages) - 1))
+        if idx > self._current_step and not self._step_is_complete(self._current_step):
+            return
+        self._current_step  = idx
+        self._furthest_step = max(self._furthest_step, idx)
+        self._slide_stack.slide_to(idx)
+        self._update_wizard_nav()
+        self._update_step_indicator()
+
+    def _on_step_chip_clicked(self, idx: int):
+        if idx <= self._furthest_step:
+            self._go_to_step(idx)
+
+    def _update_wizard_nav(self):
+        self._back_btn.setVisible(self._current_step > 0)
+        is_last = self._current_step == len(self._step_pages) - 1
+        self._next_btn.setVisible(not is_last)
+        self._next_btn.setEnabled(self._step_is_complete(self._current_step))
+        self._step_progress_lbl.setText(
+            f"Step {self._current_step + 1} of {len(self._step_pages)}"
+        )
+
+    def _update_step_indicator(self):
+        for i in range(len(self._STEP_META)):
+            badge     = self._step_badges[i]
+            title_lbl = self._step_titles[i]
+            num       = self._STEP_META[i][0]
+
+            if i == self._current_step:
+                badge.setText(num)
+                badge.setStyleSheet(
+                    f"background:{ACCENT}; color:white; border-radius:13px; "
+                    "font-size:11px; font-weight:800;"
+                )
+                title_lbl.setStyleSheet(
+                    "color:#e8eaf0; font-size:12px; font-weight:700; background:transparent;"
+                )
+            elif i < self._furthest_step or (i <= self._furthest_step and self._step_is_complete(i)):
+                badge.setText("✓")
+                badge.setStyleSheet(
+                    "background:rgba(52,211,153,0.18); color:#34d399; "
+                    "border:1px solid rgba(52,211,153,0.4); border-radius:13px; "
+                    "font-size:12px; font-weight:800;"
+                )
+                title_lbl.setStyleSheet(
+                    "color:rgba(255,255,255,0.55); font-size:12px; "
+                    "font-weight:600; background:transparent;"
+                )
+            else:
+                badge.setText(num)
+                badge.setStyleSheet(
+                    "background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.35); "
+                    "border:1px solid rgba(255,255,255,0.12); border-radius:13px; "
+                    "font-size:11px; font-weight:700;"
+                )
+                title_lbl.setStyleSheet(
+                    "color:rgba(255,255,255,0.30); font-size:12px; "
+                    "font-weight:600; background:transparent;"
+                )
+
+        for i, connector in enumerate(self._step_connectors):
+            passed = i < self._furthest_step or i < self._current_step
+            connector.setStyleSheet(
+                f"background:{'#34d399' if passed else 'rgba(255,255,255,0.10)'}; "
+                "border-radius:1px;"
+            )
+
+    # ------------------------------------------------------------------
+    # Step 01 — Dataset Details
+    # ------------------------------------------------------------------
 
     def _build_details_card(self) -> QFrame:
         card = QFrame()
@@ -473,7 +797,8 @@ class PredictionPage(PredictionMixin, QWidget):
         layout.addWidget(self._step_label("01", "Dataset Details"))
 
         hint = QLabel(
-            "Name this cohort, select the academic term, then upload portal files."
+            "Name this cohort, select the academic term, then continue to "
+            "upload the portal files."
         )
         hint.setObjectName("predHint")
         hint.setWordWrap(True)
@@ -535,6 +860,10 @@ class PredictionPage(PredictionMixin, QWidget):
         sem = self._semester_combo.currentData() or 1
         return ay, int(sem)
 
+    # ------------------------------------------------------------------
+    # Step 02 — Upload Portal Datasets
+    # ------------------------------------------------------------------
+
     def _build_portals_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("predCardPortals")
@@ -562,6 +891,7 @@ class PredictionPage(PredictionMixin, QWidget):
             grid.addWidget(pcard, i // 2, i % 2)
 
         layout.addLayout(grid)
+        layout.addStretch()
         return card
 
     def _build_portal_tile(self, key: str) -> QFrame:
@@ -627,6 +957,10 @@ class PredictionPage(PredictionMixin, QWidget):
 
         return tile
 
+    # ------------------------------------------------------------------
+    # Step 03 — Merge & Clean
+    # ------------------------------------------------------------------
+
     def _build_merge_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("predCardMerge")
@@ -656,13 +990,13 @@ class PredictionPage(PredictionMixin, QWidget):
         self._merge_btn.setFixedHeight(36)
         self._merge_btn.clicked.connect(self._run_merge)
 
-        self._view_merged_btn = QPushButton("👁  View Merged")
+        self._view_merged_btn = QPushButton("View Merged")
         self._view_merged_btn.setObjectName("predSecondaryBtn")
         self._view_merged_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._view_merged_btn.setFixedHeight(36)
         self._view_merged_btn.clicked.connect(self._view_merged)
 
-        self._clean_btn = QPushButton("🧹  Clean Data")
+        self._clean_btn = QPushButton("Clean Data")
         self._clean_btn.setObjectName("predSecondaryBtn")
         self._clean_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._clean_btn.setFixedHeight(36)
@@ -673,7 +1007,12 @@ class PredictionPage(PredictionMixin, QWidget):
         btn_row.addWidget(self._clean_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
+        layout.addStretch()
         return card
+
+    # ------------------------------------------------------------------
+    # Step 04 — Run Pipeline & Predict
+    # ------------------------------------------------------------------
 
     def _build_fused_card(self) -> QFrame:
         card = QFrame()
@@ -693,7 +1032,7 @@ class PredictionPage(PredictionMixin, QWidget):
         self._fused_hint.setWordWrap(True)
         label_col.addWidget(self._fused_hint)
 
-        self._fused_btn = QPushButton("⚡  Run Pipeline & Predict")
+        self._fused_btn = QPushButton("Run Pipeline & Predict")
         self._fused_btn.setObjectName("predRunBtn")
         self._fused_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._fused_btn.setFixedWidth(220)
@@ -715,6 +1054,7 @@ class PredictionPage(PredictionMixin, QWidget):
         self._progress_label.setObjectName("predHint")
         layout.addWidget(self._progress_label)
 
+        layout.addStretch()
         return card
 
     # ------------------------------------------------------------------
@@ -794,6 +1134,13 @@ class PredictionPage(PredictionMixin, QWidget):
             )
         else:
             self._fused_hint.setText("Merge the portal datasets to enable prediction.")
+
+        # Keep wizard nav / step indicator in sync with whatever changed
+        # (portal upload, merge, clean, or dataset-name edits all funnel
+        # through this one method already).
+        if hasattr(self, "_back_btn"):
+            self._update_wizard_nav()
+            self._update_step_indicator()
 
     def _update_portal_card_ui(self, key: str):
         cfg   = _PORTAL_CONFIG[key]
@@ -1015,6 +1362,7 @@ class PredictionPage(PredictionMixin, QWidget):
             show_warning(self, "Missing Details",
                          "Fill in the Dataset Name and School Year (Step 01) "
                          "before running prediction.")
+            self._go_to_step(0)
             self._name_input.setFocus()
             return
 

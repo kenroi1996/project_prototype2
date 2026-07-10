@@ -1,74 +1,74 @@
 {
-  "recall": 80.0,
-  "f1_score": 0.364,
-  "precision": 23.5,
-  "pr_auc": 0.321,
-  "decision_threshold": 0.18,
+  "recall": 82.2,
+  "f1_score": 0.359,
+  "precision": 23.0,
+  "pr_auc": 0.308,
+  "decision_threshold": 0.17,
   "cv_recalls": [
-    0.528,
-    0.472,
-    0.444,
-    0.556,
-    0.417
+    0.417,
+    0.417,
+    0.417,
+    0.583,
+    0.639
   ],
   "cv_f1s": [
-    0.418,
-    0.374,
-    0.427,
-    0.421,
-    0.39
+    0.345,
+    0.366,
+    0.375,
+    0.467,
+    0.541
   ],
   "cv_pr_aucs": [
-    0.344,
-    0.293,
-    0.38,
-    0.326,
-    0.4
+    0.261,
+    0.378,
+    0.318,
+    0.417,
+    0.402
   ],
-  "train_size": 2688,
+  "train_size": 2686,
   "test_size": 672,
   "feature_count": 22,
   "smote_applied": true,
   "feature_importance": [
     [
-      "HS_GPA",
-      27.3
+      "Entrance_Exam_Score",
+      25.6
     ],
     [
-      "Entrance_Exam_Score",
-      25.9
+      "HS_GPA",
+      25.6
     ],
     [
       "Has_HS_Honors",
-      10.1
+      10.4
     ],
     [
       "Has_Scholarship",
-      6.1
+      5.8
     ],
     [
       "First_Gen_Student",
-      5.0
+      5.2
     ],
     [
       "Strand_Program_Match",
-      3.4
+      4.9
     ],
     [
       "Financial_Stress",
-      3.3
-    ],
-    [
-      "Program_BIT-CT",
-      3.0
+      3.8
     ],
     [
       "Age_At_Enrollment",
-      2.7
+      3.1
     ],
     [
       "Program_BSHM",
-      2.1
+      2.5
+    ],
+    [
+      "Program_BIT-CT",
+      2.2
     ]
   ]
 }

@@ -9,7 +9,19 @@ Shared term selector header bar (always visible):
   AY [combo]  Semester [combo]  [Load Term Data]  ← status label
   On Load → _CounselorTermLoader queries DB → builds PredictionResult
   → pushes to DataStore.predictions → all pages update automatically.
+
+Per-student risk-factor breakdown
+----------------------------------
+fact_student_academic_risk.shap_factors_json holds each student's exact
+per-student breakdown as saved by RiskPersistenceService (a JSON-encoded
+list of [feature_name, human_label, formatted_value, pct] tuples).
+_CounselorTermLoader now reads this column and uses it per-student, same
+as DashboardTermService on the admin side. Rows saved before this column
+existed will have NULL here — for those we fall back to the model's
+global feature importances (the previous behavior for every row), which
+is an approximation, not a per-student value.
 """
+import json
 import sys
 
 from PyQt6.QtWidgets import (
@@ -86,7 +98,8 @@ class _CounselorTermLoader(QThread):
             fsr.entrance_exam_score,
             fsr.high_school_gpa,
             fsr.predicted_at,
-            fsr.primary_factor
+            fsr.primary_factor,
+            fsr.shap_factors_json
         FROM  public.fact_student_academic_risk fsr
         JOIN  public.dim_academic_term  t
               ON t.term_key       = fsr.term_key
@@ -150,6 +163,28 @@ class _CounselorTermLoader(QThread):
     }
 
     @staticmethod
+    def _parse_shap_json(raw) -> list | None:
+        """
+        Parse fsr.shap_factors_json into a list of
+        [feature_name, human_label, formatted_value, pct] tuples.
+
+        Returns None if the column is NULL/empty/unparseable, so the
+        caller can fall back to global importances for pre-migration rows.
+        """
+        if not raw:
+            return None
+        try:
+            # psycopg2 may already deserialize JSONB to a Python list,
+            # or hand back a raw JSON string depending on registration —
+            # handle both.
+            data = raw if isinstance(raw, list) else json.loads(raw)
+            if not isinstance(data, list) or not data:
+                return None
+            return [tuple(item) for item in data]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
     def _get_model_importances() -> dict:
         """Load saved model feature_importances_ as {feat: pct}."""
         try:
@@ -192,25 +227,34 @@ class _CounselorTermLoader(QThread):
             .total, .high_risk, .moderate_risk, .low_risk
             .avg_score, .high_risk_pct, .by_college
         """
-        importances  = self._get_model_importances()
-        shap_factors = self._build_shap_factors(importances)
-        top_factor   = shap_factors[0][1] if shap_factors else "—"
+        # Global-importance fallback — only used for rows saved before the
+        # shap_factors_json migration (where the per-row value is NULL).
+        fallback_importances  = self._get_model_importances()
+        fallback_shap_factors = self._build_shap_factors(fallback_importances)
+        fallback_top_factor   = (
+            fallback_shap_factors[0][1] if fallback_shap_factors else "—"
+        )
 
         predictions = []
         for r in rows:
             score_raw = r.get("predicted_risk_score")
             score = round(float(score_raw) * 100, 1) if score_raw else 0.0
-            cat   = self._category(score_raw) 
+            cat   = self._category(score_raw)
+
+            # ── Per-student breakdown, with fallback for pre-migration rows ──
+            student_shap_db = self._parse_shap_json(r.get("shap_factors_json"))
+            if student_shap_db is not None:
+                student_shap = student_shap_db
+                shap_top     = student_shap[0][1] if student_shap else "—"
+            else:
+                student_shap = fallback_shap_factors
+                shap_top     = fallback_top_factor
 
             # Use per-student primary_factor stored in DB when available.
             # This is the real top SHAP factor saved at prediction time.
-            # Falls back to model-level importances if column is NULL.
-            # Use per-student DB primary_factor as the label (shown on
-            # alert cards). Always use model importances for the SHAP bars —
-            # never a single-entry 100% list which breaks the chart.
+            # Falls back to the SHAP breakdown's own top factor otherwise.
             db_factor      = r.get("primary_factor")
-            student_factor = db_factor if db_factor else top_factor
-            student_shap   = shap_factors   # model-level importances for all
+            student_factor = db_factor if db_factor else shap_top
 
             # Names are encrypted at rest and never decrypted for display —
             # the student ID is shown instead, per the anonymization

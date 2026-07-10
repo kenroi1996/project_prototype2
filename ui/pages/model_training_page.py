@@ -15,7 +15,7 @@ from PyQt6.QtCharts import (
 
 from ui.components.loading_overlay import LoadingOverlay
 from ui.mixins.prediction_mixin import PredictionMixin
-from ui.dialogs.confirmation_dialog import show_error
+from ui.dialogs.confirmation_dialog import show_error, show_info
 from services.data_store import DataStore
 from services.training_engine import TrainingEngine, TrainingResult
 from services.system_config import SystemConfig
@@ -380,19 +380,23 @@ class ModelTrainingPage(PredictionMixin, QWidget):
 
         db_msg = self._persist_model_to_db()
 
-        from PyQt6.QtWidgets import QMessageBox
+        # Use the app's own styled dialog (show_info / show_error, already
+        # used elsewhere in this file and imported at module level) instead
+        # of a raw QMessageBox, which renders with the default OS theme and
+        # looks out of place against the rest of the dark UI.
         smote_line = (
-            "\nSMOTE oversampling applied (imbalanced-learn)."
+            "SMOTE oversampling applied (imbalanced-learn)."
             if result.smote_applied else
-            "\nclass_weight=balanced used (install imbalanced-learn for SMOTE)."
+            "class_weight=balanced used (install imbalanced-learn for SMOTE)."
         )
-        QMessageBox.information(
-            self, "Training Complete",
-            f"Random Forest trained successfully!\n\n"
+        show_info(
+            self,
+            "Training Complete",
+            "Random Forest trained successfully!",
             f"Recall    : {result.recall:.1f}%\n"
             f"F1 Score  : {result.f1_score:.3f}\n"
             f"PR-AUC    : {result.pr_auc:.3f}\n"
-            f"Threshold : {result.decision_threshold:.2f}\n"
+            f"Threshold : {result.decision_threshold:.2f}\n\n"
             f"{smote_line}\n\n"
             f"Model saved and ready for prediction.{db_msg}",
         )
@@ -706,7 +710,6 @@ class ModelTrainingPage(PredictionMixin, QWidget):
                         widget.setCurrentIndex(i)
                         return
             widget = widget.parent()
-        from ui.dialogs.confirmation_dialog import show_info
         show_info(self, "Go to Prediction",
                   "Navigate to the Prediction page to run prediction.",
                   "Use the sidebar or navigation to switch pages.")

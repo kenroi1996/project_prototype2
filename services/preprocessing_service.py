@@ -83,6 +83,22 @@ class CleaningEngine:
                         if not row[idx].strip():
                             row[idx] = value
 
+            # ── NEW: Drop rows where a specific column is missing ──────
+            # The correct operation for a missing TARGET value (e.g.
+            # Final_Avg_GRD): listwise deletion, not imputation. Imputing
+            # a missing grade would fabricate the ground truth the model
+            # learns from. Also useful for any column you consider
+            # required — rows without it get dropped entirely rather than
+            # filled with a guessed value.
+            elif op == "drop_rows_missing":
+                col = step["params"].get("col")
+                if col in h:
+                    idx = h.index(col)
+                    r = [
+                        row for row in r
+                        if idx < len(row) and row[idx].strip()
+                    ]
+
             elif op == "remove_duplicates":
                 seen = set()
                 cleaned = []

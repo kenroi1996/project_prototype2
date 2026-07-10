@@ -176,7 +176,28 @@ class DatabaseService:
     # ── PUSH: Portal CSV → Source Table ──────────────────────────────
 
     def push_data(self, portal_key: str, headers: List[str], rows: List[List[str]]) -> Dict[str, Any]:
-        """Push cleaned portal data to the appropriate source table."""
+        """
+        Push cleaned portal data to the appropriate source table.
+
+        Row-count reconciliation
+        --------------------------
+        The upsert query is `INSERT ... ON CONFLICT (id_field) DO UPDATE`, so
+        if the source `rows` contain the same id_field value more than once
+        (e.g. a student appears twice due to a re-export or a merge artifact
+        that CleaningEngine's exact-full-row "Remove Duplicates" wouldn't
+        catch, since the duplicate rows differ in some other column), every
+        occurrence after the first UPDATES the same DB row instead of
+        inserting a new one. cur.rowcount is never negative after a
+        successful execute, so a naive `if cur.rowcount >= 0: inserted += 1`
+        counts "statements that ran," not "rows now in the table" — those
+        numbers diverge exactly by the number of duplicate source IDs.
+
+        This method now detects duplicate ids_field values in the SOURCE
+        rows before writing, and measures the table's row count before and
+        after the batch, so the two numbers (rows processed vs. rows
+        actually added) are both available and explained rather than
+        silently conflated into one misleading "inserted" figure.
+        """
         if not self._conn:
             raise RuntimeError("Not connected to database")
 
@@ -208,6 +229,36 @@ class DatabaseService:
         if not col_indices:
             return {"success": False, "error": f"No matching columns for {portal_key}", "inserted": 0}
 
+        # ── Detect duplicate IDs in the SOURCE data before writing ────────────
+        # These are the rows that will collapse into the same DB row via
+        # ON CONFLICT DO UPDATE — not an error, but worth surfacing so the
+        # save-confirmation number and the actual table count can be
+        # reconciled instead of silently disagreeing.
+        duplicate_id_examples: List[str] = []
+        seen_ids: set = set()
+        if id_field in col_indices:
+            id_idx = col_indices[id_field]
+            for row in rows:
+                raw_id = row[id_idx] if id_idx < len(row) else None
+                norm_id = str(raw_id).strip() if raw_id is not None else ""
+                if not norm_id:
+                    continue
+                if norm_id in seen_ids:
+                    if len(duplicate_id_examples) < 10:
+                        duplicate_id_examples.append(norm_id)
+                else:
+                    seen_ids.add(norm_id)
+        n_duplicate_ids = len(rows) - len(seen_ids) if seen_ids else 0
+
+        if n_duplicate_ids:
+            print(
+                f"[DB] WARNING: {n_duplicate_ids} row(s) in the source data share "
+                f"an {id_field} value already seen earlier in this upload. "
+                f"These will UPDATE the existing row via ON CONFLICT, not add a "
+                f"new one — table row count will end up lower than rows pushed. "
+                f"Examples: {duplicate_id_examples}"
+            )
+
         db_cols = list(col_indices.keys())
         placeholders = ", ".join(["%s"] * len(db_cols))
         columns = ", ".join(db_cols)
@@ -220,6 +271,15 @@ class DatabaseService:
             query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
 
         print(f"[DB] query: {query[:120]}...")
+
+        # ── Row count BEFORE the batch, for net-new reconciliation ────────────
+        count_before = 0
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                count_before = cur.fetchone()[0]
+            except psycopg2.Error:
+                count_before = 0
 
         inserted = 0
         errors = []
@@ -247,7 +307,11 @@ class DatabaseService:
 
                 try:
                     cur.execute(query, values)
-                    # rowcount: 0 = no change (already exists, same values), 1 = inserted or updated
+                    # NOTE: cur.rowcount is never negative after a successful
+                    # execute, so this counts "statements that ran without
+                    # error" — inserts AND updates alike — not "new rows in
+                    # the table." See count_before/actual_count below for the
+                    # true net-new figure.
                     if cur.rowcount >= 0:
                         inserted += 1
                 except psycopg2.Error as e:
@@ -268,7 +332,13 @@ class DatabaseService:
             cur.execute(f"SELECT COUNT(*) FROM {table}")
             actual_count = cur.fetchone()[0]
 
-        print(f"[DB] done: inserted={inserted}, errors={len(errors)}, table_count={actual_count}")
+        net_new_rows = actual_count - count_before
+
+        print(
+            f"[DB] done: rows_processed={inserted}, errors={len(errors)}, "
+            f"count_before={count_before}, count_after={actual_count}, "
+            f"net_new_rows={net_new_rows}, duplicate_ids_in_source={n_duplicate_ids}"
+        )
 
         return {
             "success": True,
@@ -277,6 +347,11 @@ class DatabaseService:
             "total": len(rows),
             "table": table,
             "actual_db_count": actual_count,
+            # ── New, more precise fields ───────────────────────────────────
+            "count_before": count_before,
+            "net_new_rows": net_new_rows,
+            "duplicate_ids_in_source": n_duplicate_ids,
+            "duplicate_id_examples": duplicate_id_examples,
         }
 
     def get_stats(self, portal_key: str) -> Dict[str, Any]:

@@ -294,7 +294,7 @@ class TrainingEngine:
         imbalance_warning = None
         if minority_pct < 15:
             imbalance_warning = (
-                f"⚠️  Class imbalance detected: {n_at_risk} at-risk students "
+                f"⚠️ Class imbalance detected: {n_at_risk} at-risk students "
                 f"({minority_pct:.1f}% of {n_total:,} total). "
                 + ("SMOTE oversampling applied inside each training fold "
                    f"(target ratio 0.40)."

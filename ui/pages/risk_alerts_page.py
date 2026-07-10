@@ -380,7 +380,7 @@ class RiskAlertsPage(PredictionMixin, QWidget):
 
         text_col = QVBoxLayout()
         text_col.setSpacing(5)
-        title = QLabel("Risk Alerts")
+        title = QLabel("RISK ALERTS")
         title.setObjectName("header")
         self._ay_sub_lbl = QLabel(f"Academic Year {SystemConfig.academic_year()}")
         self._ay_sub_lbl.setObjectName("subHeader")

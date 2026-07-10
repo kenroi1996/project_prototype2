@@ -383,14 +383,9 @@ class StudentProfilePanel(QFrame):
         header_title = QLabel("Student Profile")
         header_title.setObjectName("profileHeaderTitle")
 
-        self.log_btn = QPushButton("📋  Log Intervention")
-        self.log_btn.setObjectName("profileLogButton")
-        self.log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
         top_bar.addWidget(self.back_btn)
         top_bar.addWidget(header_title)
         top_bar.addStretch()
-        top_bar.addWidget(self.log_btn)
         layout.addLayout(top_bar)
 
         # ── Identity ──────────────────────────────────────────────────
@@ -547,23 +542,6 @@ class StudentProfilePanel(QFrame):
 
         self._rec_stack.setCurrentIndex(1)
         layout.addWidget(self._rec_stack)
-
-        # ── Action buttons ────────────────────────────────────────────
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-        notify_btn  = QPushButton("✉  Notify Advisor")
-        notify_btn.setObjectName("profileNotifyBtn")
-        notify_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        counsel_btn = QPushButton("📅  Schedule Counseling")
-        counsel_btn.setObjectName("profileSecondaryBtn")
-        counsel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        export_btn  = QPushButton("↓  Export Report")
-        export_btn.setObjectName("profileExportBtn")
-        export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_row.addWidget(notify_btn, 2)
-        btn_row.addWidget(counsel_btn, 2)
-        btn_row.addWidget(export_btn, 1)
-        layout.addLayout(btn_row)
 
         layout.addStretch()
         scroll.setWidget(content)
@@ -951,12 +929,9 @@ class StudentProfilePanel(QFrame):
 
     def _render_fallback_recs(self, student: dict):
         """
-        Auto-generated recommendations when no intervention record exists.
-        Shown for high/moderate risk students not yet analyzed by Ollama.
+        Shown when no AI intervention record exists for this student yet
+        (high/moderate risk, not yet analyzed by Ollama).
         """
-        category = student.get("category", "")
-        factors  = student.get("shap_factors", [])
-
         note = QLabel(
             "No AI intervention record found for this student.\n"
             "Run \"Analyze All High-Risk Students\" on the Interventions page "
@@ -968,30 +943,6 @@ class StudentProfilePanel(QFrame):
             "background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); "
             "border-radius:8px; padding:10px 12px;")
         self.rec_container.addWidget(note)
-
-        recs: list[tuple[str, str]] = []
-        if category == "high_risk":
-            recs.append(("⚡", "Immediate referral to academic advisor recommended."))
-            recs.append(("💬", "Schedule guidance counseling session this week."))
-        elif "mod" in category.lower():
-            recs.append(("📋", "Monitor academic performance closely this semester."))
-            recs.append(("💬", "Consider a check-in with the guidance office."))
-
-        if factors:
-            top_feat = factors[0][0] if len(factors[0]) >= 1 else ""
-            if "Financial" in top_feat or "financial" in top_feat:
-                recs.append(("💰", "Refer to scholarship or financial assistance office."))
-            elif "Distance" in top_feat or "distance" in top_feat:
-                recs.append(("🏠", "Explore dormitory or housing assistance options."))
-            elif "Entrance" in top_feat or "HS_GPA" in top_feat:
-                recs.append(("📚", "Enroll in academic bridging or tutorial program."))
-            elif "Strand" in top_feat or "strand" in top_feat:
-                recs.append(("🔄", "Consider academic advising on program alignment."))
-            elif "First_Gen" in top_feat:
-                recs.append(("👨‍👩‍👧", "Connect with first-generation student support services."))
-
-        for icon, text in recs:
-            self.rec_container.addWidget(self._build_general_tip(icon, text))
 
     def _cancel_loaders(self):
         """Stop any in-flight QThreads. Safe to call at any time."""

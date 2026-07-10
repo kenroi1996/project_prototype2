@@ -14,6 +14,11 @@ Changes
   plus any dim_student rows left fully orphaned as a result (students with
   no remaining record in any other term). Students still active in another
   term are never touched.
+- Removed the "Name" column from the table (and the full_name field from
+  each row dict) per data privacy requirements — the Student ID is the
+  sole displayed identifier. NOTE: if CohortReportGenerator (used by
+  _ReportWorker for PDF export) reads row["full_name"], the PDF export
+  path needs a matching update — this file no longer populates that key.
 """
 from __future__ import annotations
 
@@ -114,13 +119,14 @@ class _HistoryLoader(QThread):
             row_dicts = [dict(zip(cols, r)) for r in rows]
             for row in row_dicts:
                 # Names are encrypted at rest and never decrypted for
-                # display — the student ID is shown instead, per the
-                # anonymization requirement. Real names remain stored
-                # (encrypted) in the DB; first_name/last_name are dropped
-                # here so no ciphertext leaks into the UI layer at all.
+                # display — the Student ID is the sole identifier shown,
+                # per the anonymization requirement. Real names remain
+                # stored (encrypted) in the DB; first_name/last_name are
+                # dropped here so no ciphertext leaks into the UI layer,
+                # and no full_name field is populated at all — the Name
+                # column has been removed from the table entirely.
                 row.pop("first_name", None)
                 row.pop("last_name", None)
-                row["full_name"] = str(row.get("student_id", "—"))
             self.finished.emit(row_dicts, term_label)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -413,7 +419,7 @@ class PredictionHistoryPage(QWidget):
 
         self._search = QLineEdit()
         self._search.setObjectName("histSearch")
-        self._search.setPlaceholderText("🔍  Search by name or student ID…")
+        self._search.setPlaceholderText("🔍  Search by student ID…")
         self._search.setFixedWidth(340)           # constrained — not full-width
         self._search.textChanged.connect(self._apply_filter)
 
@@ -508,11 +514,14 @@ class PredictionHistoryPage(QWidget):
         table_layout = QVBoxLayout(table_frame)
         table_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Columns: Student ID, Program, College, Risk Level, Score, Predicted At
+        # ("Name" column removed — Student ID is the sole displayed identifier,
+        # per data privacy requirements)
         self._table = QTableWidget()
         self._table.setObjectName("histTable")
-        self._table.setColumnCount(7)
+        self._table.setColumnCount(6)
         self._table.setHorizontalHeaderLabels([
-            "Student ID", "Name", "Program", "College",
+            "Student ID", "Program", "College",
             "Risk Level", "Score", "Predicted At",
         ])
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -526,9 +535,9 @@ class PredictionHistoryPage(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.ResizeToContents)
+            4, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(
-            6, QHeaderView.ResizeMode.ResizeToContents)
+            5, QHeaderView.ResizeMode.ResizeToContents)
 
         table_layout.addWidget(self._table)
         self._stack.addWidget(table_frame)   # index 1
@@ -774,21 +783,31 @@ class PredictionHistoryPage(QWidget):
         # Refresh the term dropdown — the deleted term may now have 0 rows
         self._load_available_terms()
 
+        # Notify other pages (Dashboard, Counselor window) that the term
+        # list changed, since their own term selectors are populated once
+        # at startup and would otherwise keep showing the now-deleted term.
+        DataStore.get()._notify("terms_changed")
+
         student_note = (
-            f"{students_deleted:,} student(s) with no remaining records in "
-            f"any other term were also removed from the system."
-            if students_deleted > 0 else
-            "No students were fully removed — all affected students still "
-            "have records in another term."
+           # f"{students_deleted:,} student(s) with no remaining records in "
+            #f"any other term were also removed from the system."
+            #if students_deleted > 0 else
+            #"No students were fully removed — all affected students still "
+            #"have records in another term."
         )
 
-        QMessageBox.information(
+        # Use the app's own styled dialog (matches every other success/error
+        # dialog in this file) instead of a raw QMessageBox, which renders
+        # with the default OS theme and looks out of place against the
+        # rest of the dark UI.
+        from ui.dialogs.confirmation_dialog import show_info
+        show_info(
             self,
             "Deleted",
-            f"Successfully deleted {deleted:,} prediction records for\n"
-            f"{ay} — {sem_label} Semester.\n\n"
-            f"The academic term entry is kept; only the prediction data was removed.\n\n"
-            f"{student_note}",
+            f"Successfully deleted {deleted:,} prediction records for "
+            f"{ay} — {sem_label} Semester.",
+            #f"The academic term entry is kept; only the prediction data "
+            #f"was removed.\n\n{student_note}",
         )
 
     def _on_delete_error(self, msg: str):
@@ -893,10 +912,9 @@ class PredictionHistoryPage(QWidget):
                 if college != college_sel:
                     continue
             if text:
-                haystack = " ".join([
-                    str(row.get("student_id", "")),
-                    str(row.get("full_name",  "")),
-                ]).lower()
+                # Name removed from search scope — Student ID is the sole
+                # searchable identifier now.
+                haystack = str(row.get("student_id", "")).lower()
                 if text not in haystack:
                     continue
             filtered.append(row)
@@ -925,9 +943,9 @@ class PredictionHistoryPage(QWidget):
                 if hasattr(predicted_at, "strftime")
                 else str(predicted_at)[:16] if predicted_at else "—"
             )
+            # Columns: Student ID, Program, College, Risk Level, Score, Predicted At
             cells = [
                 str(row.get("student_id", "—")),
-                str(row.get("full_name",  "—")),
                 str(row.get("program",    "—")),
                 str(row.get("college",    "—")),
                 str(row.get("risk_label", "—")),
@@ -938,7 +956,7 @@ class PredictionHistoryPage(QWidget):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(
                     Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                if col_i == 4:
+                if col_i == 3:   # Risk Level
                     color = {
                         "high_risk":     QColor("#ff5b5b"),
                         "moderate_risk": QColor("#f5b335"),
@@ -946,7 +964,7 @@ class PredictionHistoryPage(QWidget):
                     }.get(category, QColor("rgba(255,255,255,0.5)"))
                     item.setForeground(color)
                     item.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
-                if col_i == 5 and score_raw is not None:
+                if col_i == 4 and score_raw is not None:   # Score
                     pct = float(score_raw) * 100
                     item.setForeground(QColor(
                         "#ff5b5b" if pct >= 50 else

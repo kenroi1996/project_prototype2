@@ -19,6 +19,15 @@ keep this file focused on the page itself:
   ui/helpers/merge_pipeline_render.py   -> _divider, _quality_badge, _stat_tile
 
 No logic changes — only relocation and import wiring.
+
+Dialog styling fix
+--------------------
+Every QMessageBox in this page (pipeline complete/error, save errors, empty
+states) previously used the raw PyQt6 QMessageBox, which renders with the
+default OS theme and looks out of place against the rest of the dark UI.
+All 8 call sites now go through the app's own show_info / show_warning /
+show_error dialogs (ui/dialogs/confirmation_dialog.py), matching the styled
+dialogs already used throughout the rest of the app.
 """
 from __future__ import annotations
 
@@ -38,7 +47,6 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QStackedWidget,
     QGridLayout,
-    QMessageBox,
     QFileDialog,
 )
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
@@ -49,6 +57,7 @@ from services.merge_engine import MergeEngine, UNIFIED_COLUMNS
 from ui.mixins.prediction_mixin import PredictionMixin
 from ui.components.loading_overlay import LoadingOverlay
 from services.system_config import SystemConfig
+from ui.dialogs.confirmation_dialog import show_error, show_info, show_warning
 
 from workers.data_merge_workers import _MergeWorker, PipelineWorker
 from ui.dialogs.full_dataset_dialog import FullDatasetDialog
@@ -1260,7 +1269,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         store = DataStore.get()
 
         if store.unified_dataset is None:
-            QMessageBox.warning(
+            show_warning(
                 self,
                 "Merge Required",
                 "Please complete the Data Merge step above before running the pipeline.",
@@ -1371,10 +1380,11 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             self._pipeline_engineered_dataset is not None
         )
 
-        QMessageBox.information(
+        # Use the app's own styled dialog instead of a raw QMessageBox.
+        show_info(
             self,
             "Pipeline Complete",
-            f"Model trained successfully!\n\n"
+            "Model trained successfully!",
             f"Recall: {results.get('recall', 'N/A')}%\n"
             f"F1: {results.get('f1_score', 'N/A')}  PR-AUC: {results.get('pr_auc', 'N/A')}\n"
             f"Features: {len(eng_headers) - 1} engineered columns\n"
@@ -1385,13 +1395,13 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
     def _on_pipeline_error(self, error: str):
         self._pipeline_log.append(f"❌ ERROR: {error}")
         self._refresh_pipeline_gate()
-        QMessageBox.critical(self, "Pipeline Error", error)
+        show_error(self, "Pipeline Error", "The preprocessing pipeline failed.", error)
 
     def _on_view_pipeline_dataset(self):
         dataset = getattr(self, "_pipeline_engineered_dataset", None)
 
         if not dataset:
-            QMessageBox.information(
+            show_info(
                 self,
                 "No Engineered Dataset",
                 "Run the pipeline first to generate the engineered dataset.",
@@ -1402,9 +1412,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         rows    = dataset.get("rows", [])
 
         if not headers or not rows:
-            QMessageBox.information(
-                self, "Empty Dataset", "The engineered dataset is empty."
-            )
+            show_info(self, "Empty Dataset", "The engineered dataset is empty.")
             return
 
         dialog = FullDatasetDialog(headers, rows, parent=self)
@@ -1427,7 +1435,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         store   = DataStore.get()
         unified = store.unified_dataset
         if unified is None:
-            QMessageBox.warning(self, "No Data", "No unified dataset available.")
+            show_warning(self, "No Data", "No unified dataset available.")
             return
 
         try:
@@ -1437,9 +1445,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             else:
                 df = unified
             df.to_csv(path, index=False)
-            QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
+            show_info(self, "Saved", "Unified dataset saved successfully.", path)
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
+            show_error(self, "Save Error", "Could not save the unified dataset.", str(e))
 
     def _refresh_pipeline_quality(self):
         store = DataStore.get()

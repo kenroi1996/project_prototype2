@@ -62,6 +62,30 @@ class CleanDataWindow(QDialog):
     Read results via:
         window.cleaned_headers
         window.cleaned_rows
+
+    Removed actions
+    ----------------
+    "Normalize Column" and "Encode Categorical" were removed from this
+    manual, per-portal cleaning window. Both permanently mutate the saved
+    portal dataset *before* merge and *before* the automated training
+    pipeline's own scaling/encoding step runs on the full unified dataset.
+    Manually normalizing a column here would cause the pipeline to
+    double-scale it later (or, worse, PredictionEngine's SHAP formatting
+    — which assumes raw ranges like (60, 100) for HS_GPA — would silently
+    misinterpret an already-[0,1]-scaled value). Manually encoding a
+    categorical column here uses plain insertion-order integer labels
+    with no saved mapping, inconsistent across runs and disconnected from
+    the pipeline's own saved LabelEncoders. Scaling and encoding belong
+    exclusively to DataPipeline, once, downstream, on the full dataset.
+
+    Added action
+    -------------
+    "Drop Rows — Missing Value" performs listwise deletion on a specific
+    column, e.g. Final_Avg_GRD. This is the correct way to handle a
+    missing TARGET value — imputing a missing grade would fabricate the
+    ground truth the model learns from. Also useful for any column you
+    consider required, where you'd rather remove the row than guess a
+    value with mean/median/mode.
     """
 
     def __init__(self, headers: list, rows: list, config: dict, parent=None):
@@ -75,7 +99,6 @@ class CleanDataWindow(QDialog):
         self._accent = config.get("accent", "#4f8cff")
         self._steps: list = []
         self._drag_pos = None
-        self._encoded_cols: list = []
         self._filtered_rows: list = []
         self._filter_active: bool = False
         self._issue_data: dict = {}
@@ -347,14 +370,17 @@ class CleanDataWindow(QDialog):
         col_row.addWidget(self._col_combo, 1)
         inner_layout.addLayout(col_row)
 
+        # NOTE: "Normalize Column" and "Encode Categorical" were removed —
+        # see the class docstring for why. "Drop Rows — Missing Value" was
+        # added: the correct listwise-deletion action for a missing target
+        # (e.g. Final_Avg_GRD) or any other column you consider required.
         actions = [
             ("⬜  Fill Missing — Mean", self._act_fill_mean),
             ("⬜  Fill Missing — Median", self._act_fill_median),
             ("⬜  Fill Missing — Mode", self._act_fill_mode),
+            ("🗑  Drop Rows — Missing Value", self._act_drop_missing_rows),
             ("🗑  Remove Duplicates", self._act_remove_dupes),
             ("🗑  Remove Empty Rows", self._act_remove_empty),
-            ("📐  Normalize Column", self._act_normalize),
-            ("🔢  Encode Categorical", self._act_encode),
             ("📊  Remove Outliers (3σ)", self._act_outliers),
             ("✂  Drop Column", self._act_drop_col),
         ]
@@ -366,20 +392,6 @@ class CleanDataWindow(QDialog):
             inner_layout.addWidget(btn)
 
         inner_layout.addWidget(_divider())
-
-        # ── ENCODED COLUMNS ──────────────────────────────────────────
-        inner_layout.addWidget(_section_header("ENCODED COLUMNS"))
-
-        self._encoded_frame = QFrame()
-        self._encoded_frame.setObjectName("cleanEncodedCard")
-        self._encoded_layout = QVBoxLayout(self._encoded_frame)
-        self._encoded_layout.setContentsMargins(12, 10, 12, 10)
-        self._encoded_layout.setSpacing(4)
-
-        self._encoded_placeholder = QLabel("No columns encoded yet.")
-        self._encoded_placeholder.setObjectName("cleanMutedLabel")
-        self._encoded_layout.addWidget(self._encoded_placeholder)
-        inner_layout.addWidget(self._encoded_frame)
 
         undo_btn = QPushButton("↩  Undo Last Step")
         undo_btn.setObjectName("cleanUndoBtn")
@@ -523,7 +535,6 @@ class CleanDataWindow(QDialog):
         self._refresh_quality_bar()
         self._refresh_summary()
         self._refresh_table()
-        self._refresh_encoded_panel()
         self._refresh_footer_note()
 
     def _refresh_issues(self):
@@ -803,23 +814,6 @@ class CleanDataWindow(QDialog):
 
         self._row_count_lbl.setText(count_text)
 
-    def _refresh_encoded_panel(self):
-        while self._encoded_layout.count():
-            item = self._encoded_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        if not self._encoded_cols:
-            lbl = QLabel("No columns encoded yet.")
-            lbl.setObjectName("cleanMutedLabel")
-            self._encoded_layout.addWidget(lbl)
-            return
-
-        for col in self._encoded_cols:
-            pill = QLabel(f"🔢  {col}")
-            pill.setObjectName("cleanEncodedPill")
-            self._encoded_layout.addWidget(pill)
-
     def _refresh_log(self, message: str, level: str = "info"):
         colors = {"info": "#b8bcc8", "success": "#34d399", "warning": "#f5b335", "error": "#ff5b5b"}
         color = colors.get(level, "#b8bcc8")
@@ -939,6 +933,14 @@ class CleanDataWindow(QDialog):
         self._run_step({"op": "fill_missing_mode", "params": {"col": col},
                         "label": f"Fill Missing (Mode) → {col}"})
 
+    def _act_drop_missing_rows(self):
+        col = self._selected_col()
+        if not col:
+            self._toast("Select a target column first.")
+            return
+        self._run_step({"op": "drop_rows_missing", "params": {"col": col},
+                        "label": f"Drop Rows — Missing → {col}"})
+
     def _act_remove_dupes(self):
         self._run_step({"op": "remove_duplicates", "params": {},
                         "label": "Remove Duplicates"})
@@ -946,24 +948,6 @@ class CleanDataWindow(QDialog):
     def _act_remove_empty(self):
         self._run_step({"op": "remove_empty_rows", "params": {},
                         "label": "Remove Empty Rows"})
-
-    def _act_normalize(self):
-        col = self._selected_col()
-        if not col:
-            self._toast("Select a target column first.")
-            return
-        self._run_step({"op": "normalize", "params": {"col": col},
-                        "label": f"Normalize → {col}"})
-
-    def _act_encode(self):
-        col = self._selected_col()
-        if not col:
-            self._toast("Select a target column first.")
-            return
-        if col not in self._encoded_cols:
-            self._encoded_cols.append(col)
-        self._run_step({"op": "encode_categorical", "params": {"col": col},
-                        "label": f"Encode Categorical → {col}"})
 
     def _act_outliers(self):
         col = self._selected_col()
@@ -978,8 +962,6 @@ class CleanDataWindow(QDialog):
         if not col:
             self._toast("Select a target column first.")
             return
-        if col in self._encoded_cols:
-            self._encoded_cols.remove(col)
         self._run_step({"op": "drop_column", "params": {"col": col},
                         "label": f"Drop Column → {col}"})
 
@@ -987,10 +969,6 @@ class CleanDataWindow(QDialog):
         if not self._steps:
             return
         removed_step = self._steps.pop()
-        if removed_step["op"] == "encode_categorical":
-            col = removed_step["params"].get("col")
-            if col in self._encoded_cols:
-                self._encoded_cols.remove(col)
         self._headers, self._rows = CleaningEngine.apply(
             self._orig_headers, self._orig_rows, self._steps
         )
@@ -1001,7 +979,6 @@ class CleanDataWindow(QDialog):
 
     def _act_reset(self):
         self._steps = []
-        self._encoded_cols = []
         self._headers = list(self._orig_headers)
         self._rows = [list(r) for r in self._orig_rows]
         self._log.clear()
@@ -1130,21 +1107,6 @@ class CleanDataWindow(QDialog):
                 color: rgba(255,255,255,0.65);
                 font-size: 12px;
                 background: transparent;
-            }}
-
-            /* Encoded card */
-            #cleanEncodedCard {{
-                background-color: rgba(79,140,255,0.05);
-                border: 1px solid rgba(79,140,255,0.18);
-                border-radius: 10px;
-            }}
-            #cleanEncodedPill {{
-                background-color: rgba(79,140,255,0.12);
-                border: 1px solid rgba(79,140,255,0.30);
-                border-radius: 12px;
-                color: #6eb5ff;
-                font-size: 11px;
-                padding: 4px 10px;
             }}
 
             /* Config */

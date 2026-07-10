@@ -15,7 +15,20 @@ Usage (from DashboardPage):
     self._term_svc.result_error.connect(self._on_term_result_error)
     self._term_svc.busy_changed.connect(self._on_term_busy_changed)
     self._term_svc.load_term_list()
+
+Per-student risk-factor breakdown
+----------------------------------
+fact_student_academic_risk.shap_factors_json holds each student's exact
+per-student breakdown as saved by RiskPersistenceService (a JSON-encoded
+list of [feature_name, human_label, formatted_value, pct] tuples). When
+present, it's used verbatim so every student shows their own real
+breakdown after a reload. Rows saved before this column existed will have
+NULL here — for those we fall back to the model's global feature
+importances (same as before this fix), which is an approximation, not a
+per-student value.
 """
+
+import json
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
@@ -77,6 +90,7 @@ class _TermDataWorker(QThread):
             fsr.predicted_risk_score,
             fsr.predicted_at,
             fsr.primary_factor,
+            fsr.shap_factors_json,
             -- fact columns (pre-enrollment academic)
             fsr.year_level,
             fsr.entrance_exam_score,
@@ -161,6 +175,27 @@ class _TermDataWorker(QThread):
         if score_pct >= 25: return "moderate_risk"
         return "low_risk"
 
+    @staticmethod
+    def _parse_shap_json(raw) -> list | None:
+        """
+        Parse fsr.shap_factors_json into a list of
+        [feature_name, human_label, formatted_value, pct] tuples.
+
+        Returns None if the column is NULL/empty/unparseable, so the
+        caller can fall back to global importances for pre-migration rows.
+        """
+        if not raw:
+            return None
+        try:
+            # psycopg2 may already deserialize JSONB to a Python list,
+            # or hand back a raw JSON string depending on registration —
+            # handle both.
+            data = raw if isinstance(raw, list) else json.loads(raw)
+            if not isinstance(data, list) or not data:
+                return None
+            return [tuple(item) for item in data]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     @staticmethod
     def _get_model_importances() -> dict:
@@ -196,9 +231,13 @@ class _TermDataWorker(QThread):
         return out
 
     def _build_result(self, rows: list):
-        importances  = self._get_model_importances()
-        shap_factors = self._build_shap_factors(importances)
-        top_factor   = shap_factors[0][1] if shap_factors else "—"
+        # Global-importance fallback — only used for rows saved before the
+        # shap_factors_json migration (where the per-row value is NULL).
+        fallback_importances  = self._get_model_importances()
+        fallback_shap_factors = self._build_shap_factors(fallback_importances)
+        fallback_top_factor   = (
+            fallback_shap_factors[0][1] if fallback_shap_factors else "—"
+        )
 
         predictions = []
         for r in rows:
@@ -208,6 +247,15 @@ class _TermDataWorker(QThread):
             # Derive category from the raw decimal score — authoritative,
             # avoids stale/mismatched risk_label values in dim_risk_level.
             cat        = self._category_from_score(score)
+
+            # ── Per-student breakdown, with fallback for pre-migration rows ──
+            student_shap = self._parse_shap_json(r.get("shap_factors_json"))
+            if student_shap is not None:
+                shap_factors = student_shap
+                top_factor   = shap_factors[0][1] if shap_factors else "—"
+            else:
+                shap_factors = fallback_shap_factors
+                top_factor   = fallback_top_factor
 
             db_factor      = r.get("primary_factor")
             student_factor = db_factor if db_factor else top_factor

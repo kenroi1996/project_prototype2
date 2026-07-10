@@ -13,8 +13,19 @@ The old ">  1" / ">= 1.5" guard was fragile because a probability of
 exactly 0.01 rounds to 1.0 after × 100, making the guard ambiguous.
 The new approach is explicit: pred["score"] is ALWAYS 0-100, so we
 always divide by 100 before storing — no conditional needed.
+
+Per-student risk-factor breakdown
+----------------------------------
+pred["shap_factors"] — a list of (feature_name, human_label,
+formatted_value, pct) tuples produced by PredictionEngine._shap_factors()
+— is persisted verbatim as JSON in shap_factors_json so the dashboard and
+per-student risk views can reconstruct the exact per-student breakdown
+after an app restart, instead of falling back to the model's static
+global feature importances.
 """
 from __future__ import annotations
+
+import json
 
 from services.encryption_utils import encrypt_field, decrypt_field
 
@@ -53,6 +64,21 @@ def _extract_primary_factor(pred: dict) -> str | None:
         human = _FEATURE_HUMAN_LABELS.get(label_or_feat)
         return human if human else label_or_feat
     return None
+
+
+def _shap_factors_to_json(pred: dict) -> str:
+    """
+    Serialize pred["shap_factors"] verbatim to a JSON string for storage.
+
+    Stored exactly as PredictionEngine produces it — a list of
+    [feature_name, human_label, formatted_value, pct] — so the load side
+    can reconstruct each student's breakdown with no reshaping.
+    """
+    factors = pred.get("shap_factors") or []
+    try:
+        return json.dumps(list(factors))
+    except (TypeError, ValueError):
+        return "[]"
 
 
 def _to_numeric(value) -> float | None:
@@ -117,6 +143,9 @@ class RiskPersistenceService:
             has_factor_col = RiskPersistenceService._column_exists(
                 conn, "fact_student_academic_risk", "primary_factor"
             )
+            has_shap_col = RiskPersistenceService._column_exists(
+                conn, "fact_student_academic_risk", "shap_factors_json"
+            )
 
             inserted = 0
             errors   = 0
@@ -125,7 +154,8 @@ class RiskPersistenceService:
                 for pred in predictions:
                     try:
                         RiskPersistenceService._upsert_one(
-                            cur, pred, term_key, model_id, has_factor_col
+                            cur, pred, term_key, model_id,
+                            has_factor_col, has_shap_col,
                         )
                         inserted += 1
                     except Exception as e:
@@ -395,7 +425,8 @@ class RiskPersistenceService:
 
     @staticmethod
     def _upsert_one(cur, pred: dict, term_key: int,
-                    model_id: str, has_factor_col: bool) -> None:
+                    model_id: str, has_factor_col: bool,
+                    has_shap_col: bool = False) -> None:
         from services.data_store import DataStore
         conn = DataStore.get().db_conn
 
@@ -421,56 +452,50 @@ class RiskPersistenceService:
             pred.get("hs_gpa") or pred.get("high_school_gpa"))
 
         primary_factor = _extract_primary_factor(pred)
+        shap_json       = _shap_factors_to_json(pred)
+
+        # ── Build column/value lists dynamically so this still works on
+        #    a DB that hasn't run the shap_factors_json migration yet. ──
+        cols   = [
+            "student_key", "program_key", "term_key", "risk_level_id",
+            "predicted_risk_score", "prediction_confidence",
+            "entrance_exam_score", "high_school_gpa",
+        ]
+        values = [
+            student_key, program_key, term_key, risk_level_id,
+            score_01, score_01,
+            entrance, hs_gpa,
+        ]
+        update_clauses = [
+            "risk_level_id         = EXCLUDED.risk_level_id",
+            "predicted_risk_score  = EXCLUDED.predicted_risk_score",
+            "prediction_confidence = EXCLUDED.prediction_confidence",
+            "entrance_exam_score   = EXCLUDED.entrance_exam_score",
+            "high_school_gpa       = EXCLUDED.high_school_gpa",
+        ]
 
         if has_factor_col:
-            cur.execute("""
-                INSERT INTO public.fact_student_academic_risk (
-                    student_key, program_key, term_key, risk_level_id,
-                    predicted_risk_score, prediction_confidence,
-                    entrance_exam_score, high_school_gpa,
-                    primary_factor, predicted_at
-                ) VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s,
-                    %s, %s,
-                    %s, NOW()
-                )
-                ON CONFLICT (student_key, term_key) DO UPDATE SET
-                    risk_level_id         = EXCLUDED.risk_level_id,
-                    predicted_risk_score  = EXCLUDED.predicted_risk_score,
-                    prediction_confidence = EXCLUDED.prediction_confidence,
-                    entrance_exam_score   = EXCLUDED.entrance_exam_score,
-                    high_school_gpa       = EXCLUDED.high_school_gpa,
-                    primary_factor        = EXCLUDED.primary_factor,
-                    predicted_at          = NOW()
-            """, (
-                student_key, program_key, term_key, risk_level_id,
-                score_01, score_01,
-                entrance, hs_gpa,
-                primary_factor,
-            ))
-        else:
-            cur.execute("""
-                INSERT INTO public.fact_student_academic_risk (
-                    student_key, program_key, term_key, risk_level_id,
-                    predicted_risk_score, prediction_confidence,
-                    entrance_exam_score, high_school_gpa,
-                    predicted_at
-                ) VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s,
-                    %s, %s,
-                    NOW()
-                )
-                ON CONFLICT (student_key, term_key) DO UPDATE SET
-                    risk_level_id         = EXCLUDED.risk_level_id,
-                    predicted_risk_score  = EXCLUDED.predicted_risk_score,
-                    prediction_confidence = EXCLUDED.prediction_confidence,
-                    entrance_exam_score   = EXCLUDED.entrance_exam_score,
-                    high_school_gpa       = EXCLUDED.high_school_gpa,
-                    predicted_at          = NOW()
-            """, (
-                student_key, program_key, term_key, risk_level_id,
-                score_01, score_01,
-                entrance, hs_gpa,
-            ))
+            cols.append("primary_factor")
+            values.append(primary_factor)
+            update_clauses.append("primary_factor = EXCLUDED.primary_factor")
+
+        if has_shap_col:
+            cols.append("shap_factors_json")
+            values.append(shap_json)
+            update_clauses.append(
+                "shap_factors_json = EXCLUDED.shap_factors_json")
+
+        cols.append("predicted_at")
+        placeholders = ", ".join(["%s"] * (len(cols) - 1)) + ", NOW()"
+        update_clauses.append("predicted_at = NOW()")
+
+        sql = f"""
+            INSERT INTO public.fact_student_academic_risk (
+                {", ".join(cols)}
+            ) VALUES (
+                {placeholders}
+            )
+            ON CONFLICT (student_key, term_key) DO UPDATE SET
+                {", ".join(update_clauses)}
+        """
+        cur.execute(sql, values)

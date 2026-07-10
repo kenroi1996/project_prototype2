@@ -14,6 +14,32 @@ it's tightly coupled to this page's own widgets (self._metric_1,
 self._shap_factors_layout, self._heatmap_grid, etc.) — splitting it further
 would mean introducing a controller/presenter layer, which is a design
 change, not a relocation.
+
+Term selector staleness fix
+-----------------------------
+The AY/Semester term combo built in _build_term_bar() is only populated
+once, 200ms after this page opens (via _load_on_open -> load_term_list()).
+It previously had no way to learn about term changes that happened after
+that point, in either direction:
+
+  - Deletion: a term deleted elsewhere (Prediction History page's "Delete
+    Term" button) kept showing in this combo — clicking "Load Term"
+    against it silently returned zero rows instead of the combo ever
+    showing "No data". Fixed via DataStore._notify("terms_changed"),
+    broadcast by PredictionHistoryPage after a successful delete.
+
+  - Creation: a brand-new prediction saved to the DB (e.g. the very first
+    one, when this combo started out showing "No saved predictions in
+    database") never appeared in the combo until the app was restarted.
+    Fixed by reloading the term list on every "predictions" /
+    "last_prediction_run" DataStore event, since both fire right after a
+    prediction run completes and is persisted.
+
+Both paths call self._term_svc.load_term_list() (idempotent / safe to
+call repeatedly — it no-ops if a list load is already in flight), and the
+deletion path additionally re-runs self._refresh_svc.refresh() so
+metrics/charts clear correctly if the deleted term was the last data in
+the database.
 """
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -101,6 +127,13 @@ class DashboardPage(PredictionMixin, QWidget):
 
         if key in ("predictions", "last_prediction_run", "all"):
             self._refresh_prediction_status()
+            # A new prediction run may have just been saved to the DB,
+            # introducing a term that didn't exist when this combo was
+            # first populated at startup. Reload so it stops showing
+            # "No data" / a stale list. load_term_list() is a no-op if a
+            # list load is already in flight, so this is safe to call on
+            # every predictions/last_prediction_run event.
+            self._term_svc.load_term_list()
 
         if key in ("mis", "sao", "guidance", "registrar", "all"):
             self._refresh_coverage()
@@ -110,6 +143,17 @@ class DashboardPage(PredictionMixin, QWidget):
 
         if key in ("db_connected", "all"):
             self._load_intervention_rate()
+
+        if key in ("terms_changed", "all"):
+            # A term was deleted elsewhere (Prediction History page). The
+            # term selector combo here is only populated once at startup,
+            # so it goes stale otherwise — reload it. Also re-run the
+            # existing empty/available check so metrics and charts clear
+            # correctly if the deleted term was the last data in the DB,
+            # instead of silently showing 0%/empty values for a term that
+            # no longer exists.
+            self._term_svc.load_term_list()
+            self._refresh_svc.refresh()
 
     # ── Deferred startup ──────────────────────────────────────────────────────
 
