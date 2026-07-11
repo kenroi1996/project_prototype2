@@ -13,6 +13,24 @@ No logic changes — only relocation and import wiring. Everything else
 here since these methods are tightly bound to this page's own widgets
 (self._pipeline_log, self.file_label, etc.) — splitting them further would
 mean restructuring how they're called, not just relocating code.
+
+Upload History fix
+--------------------
+Previously _add_history_entry() was only called from the "Browse Files ->
+Clean -> Continue" path, so editing an existing dataset or pulling from the
+database left no trace in the Upload History panel, and the history itself
+was never persisted anywhere (in-memory only, reset on every page reload).
+
+_add_history_entry() now takes an explicit `action` label ("Uploaded",
+"Edited", "Pulled from DB") instead of inferring display text purely from
+`level`, and both _on_edit_dataset() and _pull_from_database() call it.
+History is also now persisted via a plain dynamic attribute on the
+DataStore singleton (store.portal_upload_history), following the same
+pattern already used elsewhere in this codebase for state that isn't
+formally modeled in DataStore's class definition (e.g.
+prediction_page.py sets store.trained_model / store.model_ready directly
+as attributes). This assumes DataStore doesn't use __slots__ restricting
+arbitrary attributes — consistent with that existing, working usage.
 """
 from pathlib import Path
 from typing import Optional
@@ -59,7 +77,7 @@ class PortalUploadPage(QWidget):
         self._cleaned_rows = None
 
         # Dynamic state
-        self._upload_history = []  # List of (filename, meta, level, timestamp)
+        self._upload_history = []  # List of (filename, meta, level, action)
         self._last_updated = None
         
         self.setup_ui()
@@ -140,16 +158,48 @@ class PortalUploadPage(QWidget):
         else:
             return "#f59e0b"
 
-    def _add_history_entry(self, filename, row_count, level="success"):
-        """Add an entry to upload history."""
+    def _add_history_entry(self, filename, row_count, level="success", action="Uploaded"):
+        """
+        Add an entry to upload history.
+
+        action is the display label shown in the history panel — e.g.
+        "Uploaded" (new file cleaned & saved), "Edited" (dataset opened
+        and re-saved via the Clean Data window), or "Pulled from DB"
+        (loaded from the portal's PostgreSQL table). level controls the
+        pill color only (success = green, anything else = amber warning),
+        independent of which action produced the entry.
+        """
         from datetime import datetime
         now = datetime.now()
         self._last_updated = now
         meta = f"{now.strftime('%b %d, %Y')} · {row_count:,} rows"
-        self._upload_history.insert(0, (filename, meta, level))
+        self._upload_history.insert(0, (filename, meta, level, action))
         # Keep only last 10 entries
         self._upload_history = self._upload_history[:10]
         self._refresh_history_ui()
+        self._persist_history()
+
+    # ── History persistence (DataStore-backed) ────────────────────
+
+    def _persist_history(self):
+        """
+        Save this portal's upload history onto the DataStore singleton so
+        it survives page reloads. Uses a plain dynamic attribute rather
+        than a formal DataStore method, matching the pattern already used
+        elsewhere in this codebase (e.g. prediction_page.py setting
+        store.trained_model / store.model_ready directly).
+        """
+        store = DataStore.get()
+        if not hasattr(store, "portal_upload_history"):
+            store.portal_upload_history = {}
+        store.portal_upload_history[self._portal_key] = list(self._upload_history)
+
+    def _load_persisted_history(self):
+        """Restore this portal's upload history from DataStore, if any."""
+        store = DataStore.get()
+        saved = getattr(store, "portal_upload_history", {}).get(self._portal_key)
+        if saved:
+            self._upload_history = list(saved)
 
     def _refresh_from_datastore(self):
         """Refresh UI state from DataStore on init."""
@@ -168,6 +218,7 @@ class PortalUploadPage(QWidget):
                 self.file_label.setStyleSheet("color: #34d399; font-size: 12px;")
                 self._save_db_btn.setEnabled(True)
 
+        self._load_persisted_history()
         self._refresh_stats_ui()
         self._refresh_history_ui()
         self._update_dataset_action_buttons()
@@ -237,7 +288,7 @@ class PortalUploadPage(QWidget):
             self._history_layout.addWidget(empty)
             return
         
-        for filename, meta, level in self._upload_history:
+        for filename, meta, level, action in self._upload_history:
             row = QFrame()
             row.setObjectName("portalHistoryRow")
             row_layout = QHBoxLayout(row)
@@ -255,7 +306,7 @@ class PortalUploadPage(QWidget):
             left.addWidget(name_lbl)
             left.addWidget(meta_lbl)
 
-            status_lbl = QLabel("Uploaded" if level == "success" else "Partial")
+            status_lbl = QLabel(action)
             status_lbl.setObjectName(
                 "portalHistorySuccess" if level == "success" else "portalHistoryWarning"
             )
@@ -402,7 +453,18 @@ class PortalUploadPage(QWidget):
             new_headers, new_rows
         )
         self._sync_dataset_state(processed_headers, processed_rows)
-        self._push_dataset_to_database(processed_headers, processed_rows)
+        push_ok = self._push_dataset_to_database(processed_headers, processed_rows)
+
+        name = (
+            self._selected_file.replace("\\", "/").split("/")[-1]
+            if self._selected_file else f"{self._portal_key.upper()} dataset"
+        )
+        self._add_history_entry(
+            name, len(processed_rows),
+            level="success" if push_ok else "warning",
+            action="Edited",
+        )
+
         QMessageBox.information(
             self,
             "Dataset Updated",
@@ -576,6 +638,12 @@ class PortalUploadPage(QWidget):
                     self._update_dataset_action_buttons()
 
                     self._pipeline_log.append(f"✅ Loaded {row_count:,} rows")
+
+                    self._add_history_entry(
+                        result["table"], row_count,
+                        level="success",
+                        action="Pulled from DB",
+                    )
                 else:
                     self._pipeline_log.append("⚠️ No data returned")
 
@@ -711,7 +779,7 @@ class PortalUploadPage(QWidget):
         self.file_label.setText(f"✓  {name}  ·  {row_count:,} rows cleaned & saved")
         self.file_label.setStyleSheet("color: #34d399; font-size: 12px;")
     
-        self._add_history_entry(name, row_count, "success")
+        self._add_history_entry(name, row_count, level="success", action="Uploaded")
 
         self._save_db_btn.setEnabled(True)
         self._pull_db_btn.setEnabled(True)

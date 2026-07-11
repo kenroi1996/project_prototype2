@@ -1,33 +1,52 @@
 """
 ui/pages/data_merge_pipeline_page.py
 ======================================
-Combined Stage 2 + Stage 3 page.
-
-Section A — Data Merge Center
-    Unify all four portal datasets into one clean dataset.
-
-Section B — Data Pipeline
-    Preprocess the unified dataset and train the ML model.
-    The 'Run Pipeline' button is locked until the merge is complete.
+4-step wizard: Data Sources -> Merge Configuration -> Merge Results ->
+Data Pipeline. Each step is a full-width page inside a _SlideStack;
+Back/Next slide between them — same wizard pattern as prediction_page.py,
+reusing the same shared widgets.
 
 Workers, the full-dataset dialog, the spinner widget, and shared render
-helpers used by this page have been split out into their own modules to
-keep this file focused on the page itself:
+helpers used by this page were already split out into their own modules:
   workers/data_merge_workers.py         -> _MergeWorker, PipelineWorker
   ui/dialogs/full_dataset_dialog.py     -> FullDatasetDialog
   ui/widgets/merge_spinner.py           -> _MergeSpinner
   ui/helpers/merge_pipeline_render.py   -> _divider, _quality_badge, _stat_tile
 
-No logic changes — only relocation and import wiring.
+Now also reusing, shared with prediction_page.py:
+  ui/widgets/slide_stack.py             -> _SlideStack
+  ui/widgets/step_indicator.py          -> StepIndicatorBar
+  ui/widgets/wizard_nav.py              -> WizardNavBar
 
-Dialog styling fix
---------------------
-Every QMessageBox in this page (pipeline complete/error, save errors, empty
-states) previously used the raw PyQt6 QMessageBox, which renders with the
-default OS theme and looks out of place against the rest of the dark UI.
-All 8 call sites now go through the app's own show_info / show_warning /
-show_error dialogs (ui/dialogs/confirmation_dialog.py), matching the styled
-dialogs already used throughout the rest of the app.
+Wizard restructuring notes
+-----------------------------
+Previously Section A (merge) and Section B (pipeline) were two stacked
+sections on one long scrolling page, with a "pipeline gate banner" that
+disabled Section B's content until a merge was complete, and a nested
+QStackedWidget inside Section A toggling between an empty placeholder and
+the results view. Both of those are now redundant: the wizard's own
+Next-button gating (you can't reach step 3 "Merge Results" without a
+successful merge, and can't reach step 4 "Data Pipeline" without it
+either) makes the gate banner and the placeholder-vs-results toggle
+unnecessary — removed.
+
+The live Merge Log (self._log) moved from the Results step to the Merge
+Configuration step, since it's genuinely live *during* the Run Merge
+action, not part of the outcome. The "unmatched students" summary
+(self._unmatched_lbl) moved the other way, from the log card into the
+Results step, since it's a result metric (like the quality score), not a
+process log line.
+
+self._stats_row (a QHBoxLayout built and added to the layout but never
+populated anywhere in the previous version) was dead code and has been
+dropped.
+
+What stays here: the step-card builders and all business logic (merge,
+pipeline run, save/download, view dialogs). These methods read and write
+self._merge_result, DataStore, and dialogs directly — splitting them
+further would mean introducing a controller/presenter layer, which is a
+design change, not a relocation (same reasoning as portal_upload_page.py
+and prediction_page.py's refactors).
 """
 from __future__ import annotations
 
@@ -45,9 +64,9 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QAbstractItemView,
     QTextEdit,
-    QStackedWidget,
     QGridLayout,
     QFileDialog,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QColor, QFont
@@ -62,8 +81,21 @@ from ui.dialogs.confirmation_dialog import show_error, show_info, show_warning
 from workers.data_merge_workers import _MergeWorker, PipelineWorker
 from ui.dialogs.full_dataset_dialog import FullDatasetDialog
 from ui.widgets.merge_spinner import _MergeSpinner
+from ui.widgets.slide_stack import _SlideStack
+from ui.widgets.step_indicator import StepIndicatorBar
+from ui.widgets.wizard_nav import WizardNavBar
 from ui.helpers.merge_pipeline_render import _divider, _quality_badge, _stat_tile
 from ui.styles.merge_pipeline_styles import MERGE_PIPELINE_STYLESHEET
+
+
+ACCENT = "#4f8cff"
+
+STEP_META = [
+    ("01", "Data Sources"),
+    ("02", "Merge Configuration"),
+    ("03", "Merge Results"),
+    ("04", "Data Pipeline"),
+]
 
 
 # =====================================
@@ -72,29 +104,38 @@ from ui.styles.merge_pipeline_styles import MERGE_PIPELINE_STYLESHEET
 
 class DataMergePipelinePage(PredictionMixin, QWidget):
     """
-    Combined Stage 2 + Stage 3 page.
-
-    Section A — Data Merge Center
+    Section A — Data Merge (steps 1-3)
         Unify all four portal datasets into one clean dataset.
 
-    Section B — Data Pipeline
+    Section B — Data Pipeline (step 4)
         Preprocess the unified dataset and train the ML model.
-        The 'Run Pipeline' button is locked until the merge is complete.
+        Unreachable until the merge step is complete (wizard-gated).
     """
+
+    _WIZARD_HEIGHT = 560   # generous height for the busiest step (Merge
+                           # Results: quality bar + preview table + footer).
+                           # Each step is wrapped in its own QScrollArea so
+                           # content taller than this scrolls internally
+                           # instead of being clipped.
 
     def __init__(self):
         super().__init__()
         self._merge_result                = None
         self._pipeline_worker: PipelineWorker | None = None
-        self._accent                      = "#4f8cff"
+        self._accent                      = ACCENT
         self._on_proceed_training         = None
         self._pipeline_engineered_dataset = None
+
+        # Wizard navigation state
+        self._current_step  = 0
+        self._furthest_step = 0
+
         self.setup_ui()
         self.overlay = LoadingOverlay(self)
 
         DataStore.get().add_listener(self._on_store_updated)
         self._refresh_source_panel()
-        self._refresh_pipeline_gate()
+        self._refresh_pipeline_quality()
 
     # ==================================================================
     # TOP-LEVEL UI
@@ -104,76 +145,19 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self.setObjectName("page")
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(30, 30, 30, 30)
-        self.main_layout.setSpacing(28)
+        self.main_layout.setSpacing(20)
 
         self.fixed_header_container = self._build_shared_header()
         self.main_layout.addWidget(self.fixed_header_container)
 
-        self.main_layout.addWidget(self._section_divider("🔀", "SECTION A", "Data Merge"))
-        self.main_layout.addWidget(self._build_source_panel())
-        self.main_layout.addWidget(self._build_merge_config_card())
-
-        self._merge_results_stack = QStackedWidget()
-        self._merge_results_stack.addWidget(QWidget())
-        self._merge_results_stack.addWidget(self._build_merge_results_section())
-        self._merge_results_stack.setCurrentIndex(0)
-        self.main_layout.addWidget(self._merge_results_stack)
-
-        self.main_layout.addWidget(self._section_divider("⚙️", "SECTION B", "Data Pipeline"))
-
-        self._pipeline_gate_banner = self._build_pipeline_gate_banner()
-        self.main_layout.addWidget(self._pipeline_gate_banner)
-
-        self._pipeline_content = QWidget()
-        pipeline_content_layout = QVBoxLayout(self._pipeline_content)
-        pipeline_content_layout.setContentsMargins(0, 0, 0, 0)
-        pipeline_content_layout.setSpacing(20)
-
-        preprocess_row = QHBoxLayout()
-        preprocess_row.setSpacing(16)
-
-        preprocess_left = QVBoxLayout()
-        preprocess_left.setSpacing(6)
-
-        section_title = QLabel("Data Preprocessing Pipeline")
-        section_title.setObjectName("pipelineSectionTitle")
-
-        section_desc = QLabel(
-            "Cleans, merges, and normalizes data from all four offices "
-            "into one unified dataset for ML training"
-        )
-        section_desc.setObjectName("pipelineSectionDesc")
-        section_desc.setWordWrap(True)
-
-        preprocess_left.addWidget(section_title)
-        preprocess_left.addWidget(section_desc)
-
-        self._run_pipeline_btn = QPushButton("▶  Run Pipeline")
-        self._run_pipeline_btn.setObjectName("pipelineRunBtn")
-        self._run_pipeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._run_pipeline_btn.setFixedHeight(40)
-        self._run_pipeline_btn.setEnabled(False)
-        self._run_pipeline_btn.clicked.connect(self._run_pipeline)
-
-        preprocess_row.addLayout(preprocess_left, 1)
-        preprocess_row.addWidget(self._run_pipeline_btn, 0, Qt.AlignmentFlag.AlignTop)
-        pipeline_content_layout.addLayout(preprocess_row)
-
-        pipeline_content_layout.addWidget(self._create_pipeline_stages())
-
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(20)
-        bottom_row.addWidget(self._create_quality_report_card(), 1)
-        bottom_row.addWidget(self._create_dataset_preview_card(), 1)
-        pipeline_content_layout.addLayout(bottom_row)
-
-        pipeline_content_layout.addWidget(self._create_pipeline_log_card())
-
-        self.main_layout.addWidget(self._pipeline_content)
+        self.main_layout.addWidget(self._build_wizard())
         self.main_layout.addStretch()
+
         self.setLayout(self.main_layout)
         self.init_prediction()
         self._apply_styles()
+
+        self._init_wizard_state()
 
     def _build_shared_header(self) -> QFrame:
         container = QFrame()
@@ -229,51 +213,145 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
 
         self._sem_pill_lbl = QLabel(f"{SystemConfig.term_label()}  ▾")
         self._sem_pill_lbl.setObjectName("pipelineSemesterPill")
-        self._sem_pill_lbl.setObjectName("pipelineSemesterPill")
-
-        #run_pred_btn = QPushButton("Run Prediction")
-        #run_pred_btn.setObjectName("mergeRunPredBtn")
-        #run_pred_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        #run_pred_btn.setFixedWidth(130)
-        #run_pred_btn.clicked.connect(self.on_run_prediction)
 
         pill_layout.addWidget(dot)
         pill_layout.addWidget(status_lbl)
         pill_layout.addSpacing(8)
         pill_layout.addWidget(self._sem_pill_lbl)
-        #pill_layout.addWidget(run_pred_btn)
         row.addWidget(model_pill)
         layout.addLayout(row)
         return container
 
-    def _section_divider(self, icon: str, tag: str, title: str) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("sectionDividerFrame")
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(0, 4, 0, 4)
-        layout.setSpacing(12)
+    # ==================================================================
+    # WIZARD SHELL: step indicator + slide stack + nav
+    # ==================================================================
 
-        icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet("font-size: 16px;")
+    def _build_wizard(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("mergeWizardCard")
+        card.setStyleSheet("""
+            QFrame#mergeWizardCard {
+                background-color: rgba(255,255,255,0.02);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+            }
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        tag_lbl = QLabel(tag)
-        tag_lbl.setObjectName("sectionTag")
+        self._step_indicator = StepIndicatorBar(steps=STEP_META, accent=self._accent)
+        self._step_indicator.step_clicked.connect(self._on_step_chip_clicked)
+        layout.addWidget(self._step_indicator)
 
-        title_lbl = QLabel(title)
-        title_lbl.setObjectName("sectionDividerTitle")
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(255,255,255,0.07); border: none;")
+        layout.addWidget(sep)
 
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color: rgba(255,255,255,0.08);")
+        self._slide_stack = _SlideStack()
+        self._slide_stack.setObjectName("mergeSlideStack")
+        self._slide_stack.setFixedHeight(self._WIZARD_HEIGHT)
 
-        layout.addWidget(icon_lbl)
-        layout.addWidget(tag_lbl)
-        layout.addWidget(title_lbl)
-        layout.addWidget(line, 1)
-        return frame
+        self._step_pages = [
+            self._wrap_step(self._build_source_panel()),
+            self._wrap_step(self._build_merge_config_step()),
+            self._wrap_step(self._build_merge_results_step()),
+            self._wrap_step(self._build_pipeline_step()),
+        ]
+        for page in self._step_pages:
+            self._slide_stack.add_page(page)
+
+        layout.addWidget(self._slide_stack)
+
+        self._wizard_nav = WizardNavBar()
+        self._wizard_nav.back_clicked.connect(self._go_back)
+        self._wizard_nav.next_clicked.connect(self._go_next)
+        layout.addWidget(self._wizard_nav)
+
+        return card
+
+    @staticmethod
+    def _wrap_step(widget: QWidget) -> QScrollArea:
+        """
+        Each wizard step lives inside its own QScrollArea rather than
+        relying on _WIZARD_HEIGHT being tall enough for every step's
+        content. Steps with dense content (Merge Results' preview table,
+        Data Pipeline's stage cards) scroll internally; sparser steps
+        (Data Sources, Merge Configuration) just show normally with room
+        to spare.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setWidget(widget)
+        return scroll
+
+    # ------------------------------------------------------------------
+    # Wizard navigation state machine
+    # ------------------------------------------------------------------
+
+    def _init_wizard_state(self):
+        self._current_step  = 0
+        self._furthest_step = 0
+        self._update_wizard_nav()
+        self._update_step_indicator()
+
+    def _step_is_complete(self, idx: int) -> bool:
+        if idx == 0:
+            return DataStore.get().all_portals_ready()
+        if idx in (1, 2):
+            return self._merge_result is not None and self._merge_result.success
+        return False   # step 3 (Data Pipeline) is terminal — no "next"
+
+    def _go_next(self):
+        if self._current_step >= len(self._step_pages) - 1:
+            return
+        if not self._step_is_complete(self._current_step):
+            return
+        self._go_to_step(self._current_step + 1)
+
+    def _go_back(self):
+        if self._current_step <= 0:
+            return
+        self._go_to_step(self._current_step - 1)
+
+    def _go_to_step(self, idx: int):
+        idx = max(0, min(idx, len(self._step_pages) - 1))
+        if idx > self._current_step and not self._step_is_complete(self._current_step):
+            return
+        self._current_step  = idx
+        self._furthest_step = max(self._furthest_step, idx)
+        self._slide_stack.slide_to(idx)
+        self._update_wizard_nav()
+        self._update_step_indicator()
+
+    def _on_step_chip_clicked(self, idx: int):
+        if idx <= self._furthest_step:
+            self._go_to_step(idx)
+
+    def _update_wizard_nav(self):
+        if not hasattr(self, "_wizard_nav"):
+            return
+        is_last = self._current_step == len(self._step_pages) - 1
+        self._wizard_nav.set_state(
+            current      = self._current_step,
+            total        = len(self._step_pages),
+            back_visible = self._current_step > 0,
+            next_visible = not is_last,
+            next_enabled = self._step_is_complete(self._current_step),
+        )
+
+    def _update_step_indicator(self):
+        if not hasattr(self, "_step_indicator"):
+            return
+        completed = [self._step_is_complete(i) for i in range(len(self._step_pages))]
+        self._step_indicator.set_state(self._current_step, self._furthest_step, completed)
 
     # ==================================================================
-    # SECTION A — DATA MERGE BUILDERS
+    # STEP 01 — DATA SOURCES
     # ==================================================================
 
     def _build_source_panel(self) -> QFrame:
@@ -399,6 +477,20 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         layout.addWidget(prog_container)
         return card
 
+    # ==================================================================
+    # STEP 02 — MERGE CONFIGURATION (config tiles + Run Merge + live log)
+    # ==================================================================
+
+    def _build_merge_config_step(self) -> QWidget:
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        layout.addWidget(self._build_merge_config_card())
+        layout.addWidget(self._build_merge_log_card())
+        return host
+
     def _build_merge_config_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("mergeCard")
@@ -485,28 +577,61 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         layout.addWidget(body)
         return card
 
-    def _build_merge_results_section(self) -> QWidget:
-        container = QWidget()
-        layout = QVBoxLayout(container)
+    def _build_merge_log_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("mergeCard")
+        layout = QVBoxLayout(card)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(20)
+        layout.setSpacing(0)
+
+        title_bar = QFrame()
+        title_bar.setObjectName("mergeCardTitleBar")
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(24, 14, 24, 14)
+
+        icon = QLabel("📝")
+        icon.setStyleSheet("font-size: 15px;")
+
+        title = QLabel("Merge Log")
+        title.setObjectName("mergeCardTitle")
+
+        title_layout.addWidget(icon)
+        title_layout.addWidget(title)
+        title_layout.addStretch()
+
+        layout.addWidget(title_bar)
+        layout.addWidget(_divider())
+
+        log_container = QWidget()
+        log_container.setObjectName("mergeLogContainer")
+        log_layout = QVBoxLayout(log_container)
+        log_layout.setContentsMargins(24, 16, 24, 16)
+        log_layout.setSpacing(12)
+
+        self._log = QTextEdit()
+        self._log.setObjectName("mergeLog")
+        self._log.setReadOnly(True)
+        self._log.setMinimumHeight(200)
+
+        log_layout.addWidget(self._log, 1)
+        layout.addWidget(log_container, 1)
+        return card
+
+    # ==================================================================
+    # STEP 03 — MERGE RESULTS (quality bar + unmatched summary + preview + footer)
+    # ==================================================================
+
+    def _build_merge_results_step(self) -> QWidget:
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
 
         layout.addWidget(self._build_quality_bar())
-
-        self._stats_row = QHBoxLayout()
-        self._stats_row.setSpacing(12)
-        stats_wrap = QWidget()
-        stats_wrap.setLayout(self._stats_row)
-        layout.addWidget(stats_wrap)
-
-        bottom = QHBoxLayout()
-        bottom.setSpacing(16)
-        bottom.addWidget(self._build_preview_card(), 3)
-        bottom.addWidget(self._build_log_card(), 1)
-        layout.addLayout(bottom, 1)
-
+        layout.addWidget(self._build_unmatched_summary())
+        layout.addWidget(self._build_preview_card())
         layout.addWidget(self._build_result_footer())
-        return container
+        return host
 
     def _build_quality_bar(self) -> QFrame:
         bar = QFrame()
@@ -545,6 +670,21 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         score_wrap.setLayout(score_col)
         layout.addWidget(score_wrap)
         return bar
+
+    def _build_unmatched_summary(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("mergeCard")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(20, 14, 20, 14)
+
+        self._unmatched_lbl = QLabel("Run the merge to see per-portal match coverage.")
+        self._unmatched_lbl.setObjectName("mergeUnmatchedLabel")
+        self._unmatched_lbl.setWordWrap(True)
+        self._unmatched_lbl.setStyleSheet(
+            "color: rgba(255,255,255,0.40); font-size: 12px; background: transparent;"
+        )
+        layout.addWidget(self._unmatched_lbl)
+        return wrap
 
     def _build_preview_card(self) -> QFrame:
         card = QFrame()
@@ -596,52 +736,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         layout.addWidget(table_container, 1)
         return card
 
-    def _build_log_card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("mergeCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        title_bar = QFrame()
-        title_bar.setObjectName("mergeCardTitleBar")
-        title_layout = QHBoxLayout(title_bar)
-        title_layout.setContentsMargins(24, 14, 24, 14)
-
-        icon = QLabel("📝")
-        icon.setStyleSheet("font-size: 15px;")
-
-        title = QLabel("Merge Log")
-        title.setObjectName("mergeCardTitle")
-
-        title_layout.addWidget(icon)
-        title_layout.addWidget(title)
-        title_layout.addStretch()
-
-        layout.addWidget(title_bar)
-        layout.addWidget(_divider())
-
-        log_container = QWidget()
-        log_container.setObjectName("mergeLogContainer")
-        log_layout = QVBoxLayout(log_container)
-        log_layout.setContentsMargins(24, 16, 24, 16)
-        log_layout.setSpacing(12)
-
-        self._log = QTextEdit()
-        self._log.setObjectName("mergeLog")
-        self._log.setReadOnly(True)
-        self._log.setMinimumHeight(200)
-
-        log_layout.addWidget(self._log, 1)
-
-        self._unmatched_lbl = QLabel("")
-        self._unmatched_lbl.setObjectName("mergeUnmatchedLabel")
-        self._unmatched_lbl.setWordWrap(True)
-        log_layout.addWidget(self._unmatched_lbl)
-
-        layout.addWidget(log_container, 1)
-        return card
-
     def _build_result_footer(self) -> QWidget:
         footer = QFrame()
         footer.setObjectName("mergeResultFooter")
@@ -657,8 +751,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._view_full_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._view_full_btn.clicked.connect(self._on_view_full_dataset)
         self._view_full_btn.setEnabled(False)
-
-        print(f">>> View Full Dataset button created, enabled={self._view_full_btn.isEnabled()}")
 
         self._save_btn = QPushButton("Save Unified Dataset")
         self._save_btn.setObjectName("mergeSaveBtn")
@@ -682,29 +774,68 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             self._on_proceed_training()
 
     # ==================================================================
-    # SECTION B — DATA PIPELINE BUILDERS
+    # STEP 04 — DATA PIPELINE
     # ==================================================================
 
-    def _build_pipeline_gate_banner(self) -> QFrame:
-        banner = QFrame()
-        banner.setObjectName("pipelineGateBanner")
-        layout = QHBoxLayout(banner)
-        layout.setContentsMargins(20, 14, 20, 14)
-        layout.setSpacing(14)
+    def _build_pipeline_step(self) -> QWidget:
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(20)
 
-        icon = QLabel("🔒")
-        icon.setStyleSheet("font-size: 18px;")
+        preprocess_row = QHBoxLayout()
+        preprocess_row.setSpacing(16)
 
-        msg = QLabel(
-            "Run the <b>Data Merge</b> above first — "
-            "the pipeline requires a unified dataset to proceed."
+        preprocess_left = QVBoxLayout()
+        preprocess_left.setSpacing(6)
+
+        section_title = QLabel("Data Preprocessing Pipeline")
+        section_title.setObjectName("pipelineSectionTitle")
+
+        section_desc = QLabel(
+            "Cleans, merges, and normalizes data from all four offices "
+            "into one unified dataset for ML training"
         )
-        msg.setObjectName("pipelineGateMsg")
-        msg.setTextFormat(Qt.TextFormat.RichText)
+        section_desc.setObjectName("pipelineSectionDesc")
+        section_desc.setWordWrap(True)
 
-        layout.addWidget(icon)
-        layout.addWidget(msg, 1)
-        return banner
+        preprocess_left.addWidget(section_title)
+        preprocess_left.addWidget(section_desc)
+
+        self._run_pipeline_btn = QPushButton("▶  Run Pipeline")
+        self._run_pipeline_btn.setObjectName("pipelineRunBtn")
+        self._run_pipeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._run_pipeline_btn.setFixedHeight(40)
+        self._run_pipeline_btn.clicked.connect(self._run_pipeline)
+        self._run_pipeline_btn.setStyleSheet("""
+            QPushButton#pipelineRunBtn {
+                background-color: #4f8cff;
+                border: none;
+                border-radius: 8px;
+                color: white;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 0 24px;
+            }
+            QPushButton#pipelineRunBtn:hover {
+                background-color: rgba(79,140,255,0.85);
+            }
+        """)
+
+        preprocess_row.addLayout(preprocess_left, 1)
+        preprocess_row.addWidget(self._run_pipeline_btn, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(preprocess_row)
+
+        layout.addWidget(self._create_pipeline_stages())
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(20)
+        bottom_row.addWidget(self._create_quality_report_card(), 1)
+        bottom_row.addWidget(self._create_dataset_preview_card(), 1)
+        layout.addLayout(bottom_row)
+
+        layout.addWidget(self._create_pipeline_log_card())
+        return host
 
     def _create_pipeline_stages(self) -> QFrame:
         card = QFrame()
@@ -845,7 +976,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self._pipeline_log = QTextEdit()
         self._pipeline_log.setReadOnly(True)
         self._pipeline_log.setPlaceholderText(
-            "Complete the Data Merge above, then click 'Run Pipeline'…"
+            "Click 'Run Pipeline' to start…"
         )
         self._pipeline_log.setMaximumHeight(220)
         self._pipeline_log.setStyleSheet("""
@@ -1002,6 +1133,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
                 }
             """)
 
+        self._update_wizard_nav()
+        self._update_step_indicator()
+
     def _on_run_merge(self):
         self._log.clear()
         self._merge_log_line("Starting merge…", "info")
@@ -1020,11 +1154,12 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
         self.overlay.hide()
         self._merge_result = result
         self._view_full_btn.setEnabled(True)
-        print(f">>> View Full Dataset button enabled={self._view_full_btn.isEnabled()}")
 
         if not result.success:
             for err in result.report.errors:
                 self._merge_log_line(f"ERROR: {err}", "error")
+            self._update_wizard_nav()
+            self._update_step_indicator()
             return
 
         report = result.report
@@ -1139,9 +1274,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             "color: #34d399; font-size: 12px; background: transparent;"
         )
 
-        self._merge_results_stack.setCurrentIndex(1)
-        self._refresh_pipeline_gate()
         self._refresh_pipeline_quality()
+        self._update_wizard_nav()
+        self._update_step_indicator()
 
     def _on_merge_error(self, error_msg: str):
         self.overlay.hide()
@@ -1226,44 +1361,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
     # ==================================================================
     # SECTION B — LOGIC
     # ==================================================================
-
-    def _refresh_pipeline_gate(self):
-        store      = DataStore.get()
-        merge_done = store.unified_dataset is not None
-
-        self._pipeline_gate_banner.setVisible(not merge_done)
-        self._pipeline_content.setEnabled(merge_done)
-
-        self._run_pipeline_btn.setEnabled(merge_done)
-        if merge_done:
-            self._run_pipeline_btn.setStyleSheet("""
-                QPushButton#pipelineRunBtn {
-                    background-color: #4f8cff;
-                    border: none;
-                    border-radius: 8px;
-                    color: white;
-                    font-size: 13px;
-                    font-weight: 600;
-                    padding: 0 24px;
-                }
-                QPushButton#pipelineRunBtn:hover {
-                    background-color: rgba(79,140,255,0.85);
-                }
-            """)
-            self._pipeline_log.setPlaceholderText(
-                "Unified dataset ready. Click 'Run Pipeline' to start…"
-            )
-        else:
-            self._run_pipeline_btn.setStyleSheet("""
-                QPushButton#pipelineRunBtn {
-                    background-color: rgba(255,255,255,0.04);
-                    border: 1px solid rgba(255,255,255,0.10);
-                    border-radius: 8px;
-                    color: rgba(255,255,255,0.25);
-                    font-size: 13px;
-                    padding: 0 24px;
-                }
-            """)
 
     def _run_pipeline(self):
         store = DataStore.get()
@@ -1380,7 +1477,6 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             self._pipeline_engineered_dataset is not None
         )
 
-        # Use the app's own styled dialog instead of a raw QMessageBox.
         show_info(
             self,
             "Pipeline Complete",
@@ -1394,7 +1490,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
 
     def _on_pipeline_error(self, error: str):
         self._pipeline_log.append(f"❌ ERROR: {error}")
-        self._refresh_pipeline_gate()
+        self._run_pipeline_btn.setEnabled(True)
         show_error(self, "Pipeline Error", "The preprocessing pipeline failed.", error)
 
     def _on_view_pipeline_dataset(self):
@@ -1534,8 +1630,9 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
             if hasattr(self, "_sem_pill_lbl"):
                 self._sem_pill_lbl.setText(f"{SystemConfig.term_label()}  ▾")
         self._refresh_source_panel()
-        self._refresh_pipeline_gate()
         self._refresh_pipeline_quality()
+        self._update_wizard_nav()
+        self._update_step_indicator()
 
     # ==================================================================
     # STYLES

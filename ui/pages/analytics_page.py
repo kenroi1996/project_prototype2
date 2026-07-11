@@ -3,32 +3,13 @@ ui/pages/analytics_page.py
 ============================
 Dedicated Level-1 Data Analytics page for EarlyAlert.
 
-Layout
-------
-  ┌─ Header: ANALYTICS + term filter bar ──────────────────────────┐
-  │  AY [combo] Sem [combo] [Load]   status label                  │
-  └────────────────────────────────────────────────────────────────┘
-  ┌─ Metric strip: 3 summary cards ────────────────────────────────┐
-  └────────────────────────────────────────────────────────────────┘
-  ┌─ Row 1 ─────────────────────────────────┬──────────────────────┐
-  │  Primary Risk Factor Frequency (h-bar)  │ Student Origin Map   │
-  └─────────────────────────────────────────┴──────────────────────┘
-  ┌─ Row 1b ────────────────────────────────────────────────────────┐
-  │  Municipality Risk Rate (ranked list, now includes Distance col) │
-  └─────────────────────────────────────────────────────────────────┘
-  ┌─ Row 2 ─────────────────────────────────┬──────────────────────┐
-  │  HS Type vs Risk (grouped bar)          │ Income Bracket Risk   │
-  └─────────────────────────────────────────┴──────────────────────┘
-  ┌─ Row 3 ─────────────────────────────────┬──────────────────────┐
-  │  Term Comparison grouped bar            │ Intervention Coverage │
-  └─────────────────────────────────────────┴──────────────────────┘
 """
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QScrollArea, QComboBox, QSizePolicy,
-    QProgressBar, QToolTip,
+    QProgressBar, QToolTip, QGraphicsDropShadowEffect,
 )
 from PyQt6.QtCore import Qt, QTimer, QMargins
 from PyQt6.QtGui import QColor, QFont, QPainter, QCursor
@@ -36,6 +17,7 @@ from PyQt6.QtCharts import (
     QChart, QChartView,
     QBarSet, QBarSeries, QHorizontalBarSeries,
     QBarCategoryAxis, QValueAxis,
+    QPieSeries,
 )
 
 from services.analytics_service import AnalyticsLoader, AnalyticsTermLoader
@@ -46,37 +28,111 @@ from ui.components.municipality_risk_map import (
     normalize_municipality,     # collapse name variants (e.g. Bogo/Bogo City)
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Visual helpers (cosmetic only — no data/business logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Convert '#rrggbb' + alpha into a QSS rgba(...) string."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _make_shadow(blur: int = 26, y_offset: int = 6, alpha: int = 90) -> QGraphicsDropShadowEffect:
+    """
+    Fresh QGraphicsDropShadowEffect instance — must be created new per
+    widget, since a single QGraphicsEffect can't be shared across widgets.
+    """
+    shadow = QGraphicsDropShadowEffect()
+    shadow.setBlurRadius(blur)
+    shadow.setXOffset(0)
+    shadow.setYOffset(y_offset)
+    shadow.setColor(QColor(0, 0, 0, alpha))
+    return shadow
+
+
+def _icon_badge(icon: str, accent: str, size: int = 28) -> QLabel:
+    badge = QLabel(icon)
+    badge.setFixedSize(size, size)
+    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    badge.setStyleSheet(
+        f"background:{_hex_to_rgba(accent, 0.14)}; "
+        f"border-radius:{size // 3}px; font-size:{max(11, size - 15)}px;"
+    )
+    return badge
+
+
+def _section_label(text: str) -> QLabel:
+    """
+    Uppercase, letter-spaced group header — same visual language as the
+    sidebar's OVERVIEW / PREDICTION / COUNSELING section labels elsewhere
+    in the app, used here to organize the page into readable groups.
+    """
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        "color:rgba(255,255,255,0.32); font-size:10px; font-weight:800; "
+        "letter-spacing:1.5px; background:transparent; padding-top:4px;"
+    )
+    return lbl
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary card
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _SummaryCard(QFrame):
-    def __init__(self, title: str, accent: str = "#4f8cff", parent=None):
+    def __init__(self, title: str, accent: str = "#4f8cff", icon: str = "📈", parent=None):
         super().__init__(parent)
         self._accent = accent
         self.setObjectName("analyticsPanel")
-        lo = QVBoxLayout(self)
-        lo.setContentsMargins(20, 16, 20, 16)
+        self.setGraphicsEffect(_make_shadow(blur=22, y_offset=5, alpha=80))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Colored top accent strip — gives each KPI card a strong color
+        # identity at a glance, consistent with the accent used in its
+        # value text below.
+        strip = QFrame()
+        strip.setFixedHeight(3)
+        strip.setStyleSheet(
+            f"background:{accent}; border-top-left-radius:12px; "
+            f"border-top-right-radius:12px;"
+        )
+        outer.addWidget(strip)
+
+        body = QWidget()
+        body.setStyleSheet("background:transparent;")
+        lo = QVBoxLayout(body)
+        lo.setContentsMargins(20, 14, 20, 16)
         lo.setSpacing(6)
 
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
         self._title_lbl = QLabel(title)
+        self._title_lbl.setWordWrap(True)
         self._title_lbl.setStyleSheet(
             "color:rgba(255,255,255,0.45); font-size:11px; "
             "font-weight:600; letter-spacing:0.5px; background:transparent;")
+        top_row.addWidget(self._title_lbl, 1)
+        top_row.addWidget(_icon_badge(icon, accent))
+        lo.addLayout(top_row)
 
         self._value_lbl = QLabel("—")
         self._value_lbl.setStyleSheet(
-            f"color:{accent}; font-size:28px; font-weight:800; background:transparent;")
+            f"color:{accent}; font-size:30px; font-weight:800; background:transparent;")
 
         self._sub_lbl = QLabel("")
         self._sub_lbl.setWordWrap(True)
         self._sub_lbl.setStyleSheet(
             "color:rgba(255,255,255,0.35); font-size:11px; background:transparent;")
 
-        lo.addWidget(self._title_lbl)
         lo.addWidget(self._value_lbl)
         lo.addWidget(self._sub_lbl)
+        outer.addWidget(body)
 
     def update(self, value: str, sub: str = ""):
         self._value_lbl.setText(value)
@@ -90,6 +146,7 @@ class _SummaryCard(QFrame):
 def _panel(min_height: int = 0) -> QFrame:
     f = QFrame()
     f.setObjectName("analyticsPanel")
+    f.setGraphicsEffect(_make_shadow())
     if min_height:
         f.setMinimumHeight(min_height)
     lo = QVBoxLayout(f)
@@ -98,8 +155,11 @@ def _panel(min_height: int = 0) -> QFrame:
     return f
 
 
-def _panel_header(title: str, hint: str = "") -> QHBoxLayout:
+def _panel_header(title: str, hint: str = "", icon: str = "", accent: str = "#4f8cff") -> QHBoxLayout:
     row = QHBoxLayout()
+    row.setSpacing(10)
+    if icon:
+        row.addWidget(_icon_badge(icon, accent))
     lbl = QLabel(title)
     lbl.setObjectName("cardTitle")
     row.addWidget(lbl)
@@ -194,6 +254,29 @@ def _dist_color(dist_km: float | None) -> str:
     return "#ff5b5b"
 
 
+def _filter_by_distance(rows: list[dict], lo: float | None, hi: float | None) -> list[dict]:
+    """
+    Client-side distance-from-campus filter for municipality rows —
+    100% computed locally on already-loaded dist_km values, no DB
+    round-trip needed. lo is exclusive, hi is inclusive, matching the
+    bucket boundaries _dist_color() already uses (<=20 / <=60 / <=120 /
+    >120), so the filter and the color legend agree with each other.
+    """
+    if lo is None and hi is None:
+        return rows
+    out = []
+    for r in rows:
+        d = r.get("dist_km")
+        if d is None:
+            continue
+        if lo is not None and not (d > lo):
+            continue
+        if hi is not None and not (d <= hi):
+            continue
+        out.append(r)
+    return out
+
+
 def _normalise_muni_rows(rows: list[dict]) -> list[dict]:
     """
     Normalise municipality_risk rows from AnalyticsLoader into the key
@@ -252,11 +335,25 @@ class AnalyticsPage(QWidget):
     Loads fresh from DB on every page visit via _load().
     """
 
+    # (label, lo, hi) — lo exclusive / hi inclusive, matching _dist_color()'s
+    # <=20 / <=60 / <=120 / >120 boundaries.
+    _DISTANCE_BUCKETS = [
+        ("Any Distance",     None, None),
+        ("≤ 20 km (Near)",   None, 20),
+        ("21 – 60 km",       20,   60),
+        ("61 – 120 km",      60,   120),
+        ("> 120 km (Far)",   120,  None),
+    ]
+
+    _LOAD_BTN_IDLE_TEXT = "▶  Load"
+    _LOAD_BTN_BUSY_TEXT = "⏳  Loading…"
+
     def __init__(self):
         super().__init__()
         self._loader:      AnalyticsLoader     | None = None
         self._term_loader: AnalyticsTermLoader | None = None
         self._data:        dict                = {}
+        self._muni_rows_all: list              = []   # unfiltered-by-distance cache
         self._first_show:  bool               = True   # tracks initial visit
         self._setup_ui()
         QTimer.singleShot(200, self._load_terms)
@@ -272,6 +369,10 @@ class AnalyticsPage(QWidget):
 
         # ── Header ────────────────────────────────────────────────────
         hdr = QHBoxLayout()
+        hdr.setSpacing(14)
+
+        hdr.addWidget(_icon_badge("📊", "#4f8cff", size=38))
+
         tc  = QVBoxLayout(); tc.setSpacing(3)
         t1  = QLabel("ANALYTICS")
         t1.setObjectName("header")
@@ -281,17 +382,18 @@ class AnalyticsPage(QWidget):
         hdr.addLayout(tc, 1)
 
         self._refresh_btn = QPushButton("↻  Refresh")
-        self._refresh_btn.setFixedHeight(32)
+        self._refresh_btn.setFixedHeight(34)
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._refresh_btn.setStyleSheet("""
             QPushButton {
                 background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.12); border-radius:7px;
-                color:rgba(255,255,255,0.65); font-size:12px; padding:0 14px;
+                border:1px solid rgba(255,255,255,0.12); border-radius:9px;
+                color:rgba(255,255,255,0.65); font-size:12px; font-weight:600;
+                padding:0 16px;
             }
             QPushButton:hover {
-                background:rgba(79,140,255,0.12);
-                border-color:rgba(79,140,255,0.35); color:#4f8cff;
+                background:rgba(79,140,255,0.14);
+                border-color:rgba(79,140,255,0.40); color:#6eb5ff;
             }
             QPushButton:disabled { color:rgba(255,255,255,0.20); }
         """)
@@ -302,18 +404,19 @@ class AnalyticsPage(QWidget):
         # ── Term filter bar ───────────────────────────────────────────
         fbar = QFrame()
         fbar.setObjectName("dashTermBar")
+        fbar.setGraphicsEffect(_make_shadow(blur=18, y_offset=3, alpha=60))
         fbar.setStyleSheet("""
             QFrame#dashTermBar {
                 background:rgba(255,255,255,0.03);
-                border:1px solid rgba(255,255,255,0.07); border-radius:8px;
+                border:1px solid rgba(255,255,255,0.07); border-radius:10px;
             }
         """)
         flo = QHBoxLayout(fbar)
         flo.setContentsMargins(16, 10, 16, 10); flo.setSpacing(10)
 
-        term_lbl = QLabel("Term Filter:")
+        term_lbl = QLabel("🗓  Term Filter:")
         term_lbl.setStyleSheet(
-            "color:rgba(255,255,255,0.45); font-size:12px; background:transparent;")
+            "color:rgba(255,255,255,0.45); font-size:12px; font-weight:600; background:transparent;")
 
         _combo_ss = """
             QComboBox {
@@ -341,22 +444,23 @@ class AnalyticsPage(QWidget):
         self._sem_combo.addItems(["All Semesters", "1st Semester", "2nd Semester"])
         self._sem_combo.setStyleSheet(_combo_ss)
 
-        self._load_btn = QPushButton("Load")
-        self._load_btn.setFixedHeight(30)
+        self._load_btn = QPushButton(self._LOAD_BTN_IDLE_TEXT)
+        self._load_btn.setFixedHeight(34)
         self._load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._load_btn.setEnabled(False)
+        self._load_btn.setGraphicsEffect(_make_shadow(blur=16, y_offset=3, alpha=110))
         self._load_btn.setStyleSheet("""
             QPushButton {
-                background:rgba(79,140,255,0.15);
-                border:1px solid rgba(79,140,255,0.30);
-                border-radius:6px; color:#4f8cff;
-                font-size:12px; font-weight:600; padding:0 16px;
+                background:#4f8cff;
+                border:none;
+                border-radius:8px; color:white;
+                font-size:12px; font-weight:700; padding:0 20px;
             }
-            QPushButton:hover { background:rgba(79,140,255,0.28); }
+            QPushButton:hover { background:rgba(79,140,255,0.85); }
+            QPushButton:pressed { background:rgba(79,140,255,0.70); }
             QPushButton:disabled {
-                background:rgba(255,255,255,0.04);
-                border-color:rgba(255,255,255,0.08);
-                color:rgba(255,255,255,0.20);
+                background:rgba(255,255,255,0.06);
+                color:rgba(255,255,255,0.25);
             }
         """)
         self._load_btn.clicked.connect(self._load)
@@ -373,6 +477,86 @@ class AnalyticsPage(QWidget):
         flo.addStretch()
         root.addWidget(fbar)
 
+        # ── Advanced filter bar ───────────────────────────────────────
+        # Risk Level / College / Program are backend filters — they take
+        # effect on the next Load click, same as the term filter above.
+        # Distance is purely client-side (dist_km is already computed
+        # after municipality rows load), so it re-filters instantly with
+        # no DB round-trip — see _on_distance_changed().
+        abar = QFrame()
+        abar.setObjectName("dashTermBar")
+        abar.setGraphicsEffect(_make_shadow(blur=18, y_offset=3, alpha=60))
+        abar.setStyleSheet("""
+            QFrame#dashTermBar {
+                background:rgba(255,255,255,0.03);
+                border:1px solid rgba(255,255,255,0.07); border-radius:10px;
+            }
+        """)
+        alo = QHBoxLayout(abar)
+        alo.setContentsMargins(16, 10, 16, 10); alo.setSpacing(10)
+
+        adv_lbl = QLabel("🎛  Advanced:")
+        adv_lbl.setStyleSheet(
+            "color:rgba(255,255,255,0.45); font-size:12px; font-weight:600; background:transparent;")
+
+        self._risk_combo = QComboBox()
+        self._risk_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._risk_combo.addItem("All Risk Levels", userData="")
+        self._risk_combo.addItem("High",     userData="high")
+        self._risk_combo.addItem("Moderate", userData="moderate")
+        self._risk_combo.addItem("Low",      userData="low")
+        self._risk_combo.setStyleSheet(_combo_ss)
+
+        self._gender_combo = QComboBox()
+        self._gender_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._gender_combo.addItem("All Genders")
+        self._gender_combo.setStyleSheet(_combo_ss)
+
+        self._college_combo = QComboBox()
+        self._college_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._college_combo.addItem("All Colleges")
+        self._college_combo.setMinimumWidth(140)
+        self._college_combo.setStyleSheet(_combo_ss)
+
+        self._program_combo = QComboBox()
+        self._program_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._program_combo.addItem("All Programs")
+        self._program_combo.setMinimumWidth(160)
+        self._program_combo.setStyleSheet(_combo_ss)
+
+        self._distance_combo = QComboBox()
+        self._distance_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for label, lo, hi in self._DISTANCE_BUCKETS:
+            self._distance_combo.addItem(label, userData=(lo, hi))
+        self._distance_combo.setStyleSheet(_combo_ss)
+        self._distance_combo.setToolTip(
+            "Filters the Municipality Risk Rate list and map instantly — "
+            "no reload needed.")
+        self._distance_combo.currentIndexChanged.connect(self._on_distance_changed)
+
+        self._clear_filters_btn = QPushButton("✕  Clear")
+        self._clear_filters_btn.setFixedHeight(30)
+        self._clear_filters_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_filters_btn.setStyleSheet("""
+            QPushButton {
+                background:rgba(255,255,255,0.04);
+                border:1px solid rgba(255,255,255,0.10); border-radius:6px;
+                color:rgba(255,255,255,0.50); font-size:11px; padding:0 12px;
+            }
+            QPushButton:hover { background:rgba(255,255,255,0.08); color:#e8eaf0; }
+        """)
+        self._clear_filters_btn.clicked.connect(self._on_clear_filters)
+
+        alo.addWidget(adv_lbl)
+        alo.addWidget(self._risk_combo)
+        alo.addWidget(self._gender_combo)
+        alo.addWidget(self._college_combo)
+        alo.addWidget(self._program_combo)
+        alo.addWidget(self._distance_combo)
+        alo.addWidget(self._clear_filters_btn)
+        alo.addStretch()
+        root.addWidget(abar)
+
         # ── Scrollable content ────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -387,22 +571,27 @@ class AnalyticsPage(QWidget):
         self._content_lo.setSpacing(16)
 
         # ── Metric strip ──────────────────────────────────────────────
+        self._content_lo.addWidget(_section_label("OVERVIEW"))
         self._metric_lo = QHBoxLayout()
         self._metric_lo.setSpacing(16)
-        self._card_total    = _SummaryCard("TOTAL STUDENTS SCORED", "#4f8cff")
-        self._card_atrisk   = _SummaryCard("AT-RISK STUDENTS",      "#f5b335")
-        self._card_coverage = _SummaryCard("INTERVENTION COVERAGE", "#34d399")
-        for c in (self._card_total, self._card_atrisk, self._card_coverage):
+        self._card_total    = _SummaryCard("TOTAL STUDENTS SCORED", "#4f8cff", "🎓")
+        self._card_atrisk   = _SummaryCard("AT-RISK STUDENTS",      "#f5b335", "⚠️")
+        self._card_coverage = _SummaryCard("INTERVENTION COVERAGE", "#34d399", "🛡️")
+        self._card_avg_gpa  = _SummaryCard("AVG HIGH SCHOOL GPA",   "#a78bfa", "📘")
+        for c in (self._card_total, self._card_atrisk,
+                  self._card_coverage, self._card_avg_gpa):
             self._metric_lo.addWidget(c, 1)
         self._content_lo.addLayout(self._metric_lo)
 
         # ── Row 1: Factor chart + Municipality map ────────────────────
+        self._content_lo.addWidget(_section_label("RISK FACTORS & GEOGRAPHIC DISTRIBUTION"))
         row1 = QHBoxLayout(); row1.setSpacing(16)
 
         self._factor_panel = _panel(min_height=280)
         self._factor_panel.layout().addLayout(
             _panel_header("Primary Risk Factor Frequency",
-                          hint="Count of students per top factor"))
+                          hint="Count of students per top factor",
+                          icon="📊", accent="#4f8cff"))
         self._factor_host = QFrame()
         self._factor_host.setStyleSheet("background:transparent;")
         QVBoxLayout(self._factor_host).setContentsMargins(0, 0, 0, 0)
@@ -412,7 +601,8 @@ class AnalyticsPage(QWidget):
         self._map_panel = _panel(min_height=420)
         self._map_panel.layout().addLayout(
             _panel_header("Student Origin Risk Map",
-                          hint="High-risk concentration by home municipality"))
+                          hint="High-risk concentration by home municipality",
+                          icon="🗺️", accent="#a78bfa"))
         self._risk_map = MunicipalityRiskMap()
         self._map_panel.layout().addWidget(self._risk_map, 1)
         row1.addWidget(self._map_panel, 3)
@@ -424,18 +614,21 @@ class AnalyticsPage(QWidget):
         self._muni_panel.layout().addLayout(
             _panel_header(
                 "Municipality Risk Rate",
-                hint="At-risk % · Distance from CTU  (≥5 students shown)"))
+                hint="At-risk % · Distance from CTU  (≥5 students shown)",
+                icon="📍", accent="#f5b335"))
         self._muni_host_lo = QVBoxLayout()
         self._muni_host_lo.setSpacing(4)
         self._muni_panel.layout().addLayout(self._muni_host_lo)
         self._content_lo.addWidget(self._muni_panel)
 
         # ── Row 2: HS Type + Income ───────────────────────────────────
+        self._content_lo.addWidget(_section_label("DEMOGRAPHIC BREAKDOWN"))
         row2 = QHBoxLayout(); row2.setSpacing(16)
 
         self._hs_panel = _panel(min_height=260)
         self._hs_panel.layout().addLayout(
-            _panel_header("HS Type vs Risk", hint="Public vs Private high school"))
+            _panel_header("HS Type vs Risk", hint="Public vs Private high school",
+                          icon="🏫", accent="#34d399"))
         self._hs_host = QFrame()
         self._hs_host.setStyleSheet("background:transparent;")
         QVBoxLayout(self._hs_host).setContentsMargins(0, 0, 0, 0)
@@ -445,7 +638,8 @@ class AnalyticsPage(QWidget):
         self._income_panel = _panel(min_height=260)
         self._income_panel.layout().addLayout(
             _panel_header("Income Bracket vs Risk",
-                          hint="At-risk rate per family income band"))
+                          hint="At-risk rate per family income band",
+                          icon="💰", accent="#f59e0b"))
         self._income_host = QFrame()
         self._income_host.setStyleSheet("background:transparent;")
         QVBoxLayout(self._income_host).setContentsMargins(0, 0, 0, 0)
@@ -453,28 +647,50 @@ class AnalyticsPage(QWidget):
         row2.addWidget(self._income_panel, 1)
         self._content_lo.addLayout(row2)
 
-        # ── Row 3: Term comparison + Intervention coverage ────────────
+        # ── Row 3: Semester Comparison + SHS Strand vs Risk ────────────
+        # Strand donut now paired here (compact, 1:1 with Term
+        # Comparison) instead of sitting as its own full-width row —
+        # matches its scale better than the previous full-bleed panel.
+        self._content_lo.addWidget(_section_label("TRENDS & COMPARISONS"))
         row3 = QHBoxLayout(); row3.setSpacing(16)
 
         self._term_panel = _panel(min_height=260)
         self._term_panel.layout().addLayout(
             _panel_header("Semester Comparison",
-                          hint="High / Moderate / Low count per term"))
+                          hint="High / Moderate / Low count per term",
+                          icon="📈", accent="#4f8cff"))
         self._term_host = QFrame()
         self._term_host.setStyleSheet("background:transparent;")
         QVBoxLayout(self._term_host).setContentsMargins(0, 0, 0, 0)
         self._term_panel.layout().addWidget(self._term_host, 1)
-        row3.addWidget(self._term_panel, 3)
+        row3.addWidget(self._term_panel, 1)
 
-        self._cov_panel = _panel(min_height=260)
+        self._strand_panel = _panel(min_height=260)
+        self._strand_panel.layout().addLayout(
+            _panel_header("SHS Strand vs Risk",
+                          hint="Biggest slice = most risk",
+                          icon="🎒", accent="#a78bfa"))
+        self._strand_host = QFrame()
+        self._strand_host.setStyleSheet("background:transparent;")
+        QVBoxLayout(self._strand_host).setContentsMargins(0, 0, 0, 0)
+        self._strand_panel.layout().addWidget(self._strand_host, 1)
+        row3.addWidget(self._strand_panel, 1)
+
+        self._content_lo.addLayout(row3)
+
+        # ── Dedicated row: Intervention Coverage ───────────────────────
+        # Full-width banner, same dedicated-row treatment already used
+        # for Municipality Risk Rate — gives the coverage percentage
+        # room to breathe instead of being squeezed into a narrow column.
+        self._cov_panel = _panel(min_height=200)
         self._cov_panel.layout().addLayout(
             _panel_header("Intervention Coverage",
-                          hint="Most recent term with predictions"))
+                          hint="Most recent term with predictions",
+                          icon="🛡️", accent="#34d399"))
         self._cov_host_lo = QVBoxLayout()
         self._cov_host_lo.setSpacing(10)
         self._cov_panel.layout().addLayout(self._cov_host_lo)
-        row3.addWidget(self._cov_panel, 1)
-        self._content_lo.addLayout(row3)
+        self._content_lo.addWidget(self._cov_panel)
 
         self._content_lo.addStretch()
         scroll.setWidget(content)
@@ -511,7 +727,12 @@ class AnalyticsPage(QWidget):
         self._status_lbl.setText(f"⚠ {e}")
         self._clear_term_loader()
 
-    def _on_terms_loaded(self, terms: list):
+    def _on_terms_loaded(self, payload: dict):
+        terms    = payload.get("terms", [])
+        colleges = payload.get("colleges", [])
+        programs = payload.get("programs", [])
+        genders  = payload.get("genders", [])
+
         self._ay_combo.blockSignals(True)
         self._ay_combo.clear()
         self._ay_combo.addItem("All Terms", userData=("", 0))
@@ -521,9 +742,39 @@ class AnalyticsPage(QWidget):
                 seen.append(ay)
                 self._ay_combo.addItem(ay, userData=(ay, 0))
         self._ay_combo.blockSignals(False)
+
+        # Preserve the current selection across repeat loads (e.g. the
+        # periodic re-fetch on showEvent) instead of resetting to "All".
+        self._college_combo.blockSignals(True)
+        prev_college = self._college_combo.currentText() or "All Colleges"
+        self._college_combo.clear()
+        self._college_combo.addItem("All Colleges")
+        self._college_combo.addItems(colleges)
+        idx = self._college_combo.findText(prev_college)
+        self._college_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._college_combo.blockSignals(False)
+
+        self._program_combo.blockSignals(True)
+        prev_program = self._program_combo.currentText() or "All Programs"
+        self._program_combo.clear()
+        self._program_combo.addItem("All Programs")
+        self._program_combo.addItems(programs)
+        idx = self._program_combo.findText(prev_program)
+        self._program_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._program_combo.blockSignals(False)
+
+        self._gender_combo.blockSignals(True)
+        prev_gender = self._gender_combo.currentText() or "All Genders"
+        self._gender_combo.clear()
+        self._gender_combo.addItem("All Genders")
+        self._gender_combo.addItems(genders)
+        idx = self._gender_combo.findText(prev_gender)
+        self._gender_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._gender_combo.blockSignals(False)
+
         self._load_btn.setEnabled(True)
         self._status_lbl.setText(
-            f"{len(terms)} term(s) available — select a term and click Load"
+            f"{len(terms)} term(s) available — set filters and click Load"
             if terms else "No prediction data yet")
         self._clear_term_loader()
         # Do NOT auto-load. Wait for the user to click Load or Refresh.
@@ -551,11 +802,24 @@ class AnalyticsPage(QWidget):
         sem_idx = self._sem_combo.currentIndex()
         sem     = sem_idx if sem_idx > 0 else 0
 
+        risk_level = self._risk_combo.currentData() or ""
+        college    = ("" if self._college_combo.currentText() == "All Colleges"
+                      else self._college_combo.currentText())
+        program    = ("" if self._program_combo.currentText() == "All Programs"
+                      else self._program_combo.currentText())
+        gender     = ("" if self._gender_combo.currentText() == "All Genders"
+                      else self._gender_combo.currentText())
+
         self._load_btn.setEnabled(False)
+        self._load_btn.setText(self._LOAD_BTN_BUSY_TEXT)
         self._refresh_btn.setEnabled(False)
         self._status_lbl.setText("Loading analytics…")
 
-        self._loader = AnalyticsLoader(ay=ay, sem=sem)
+        self._loader = AnalyticsLoader(
+            ay=ay, sem=sem,
+            risk_level=risk_level, college=college, program=program,
+            gender=gender,
+        )
         self._loader.finished.connect(self._on_data_loaded)
         self._loader.finished.connect(self._clear_loader)
         self._loader.error.connect(self._on_load_error)
@@ -565,6 +829,7 @@ class AnalyticsPage(QWidget):
     def _on_load_error(self, e: str):
         self._status_lbl.setText(f"⚠ {e}")
         self._load_btn.setEnabled(True)
+        self._load_btn.setText(self._LOAD_BTN_IDLE_TEXT)
         self._refresh_btn.setEnabled(True)
 
     def _clear_loader(self):
@@ -581,6 +846,7 @@ class AnalyticsPage(QWidget):
     def _on_data_loaded(self, data: dict):
         self._data = data
         self._load_btn.setEnabled(True)
+        self._load_btn.setText(self._LOAD_BTN_IDLE_TEXT)
         self._refresh_btn.setEnabled(True)
         self._status_lbl.setText("Updated just now")
 
@@ -590,14 +856,48 @@ class AnalyticsPage(QWidget):
         # Merge variant municipality names (e.g. Bogo / Bogo City) and
         # attach dist_km. Both the ranked list and the map use this
         # single merged dataset so counts/percentages stay consistent.
-        muni_rows_norm = _normalise_muni_rows(data.get("municipality_risk", []))
-        self._render_municipality(muni_rows_norm)
-        self._risk_map._render(muni_rows_norm)
+        # Cached unfiltered so the Distance combo can re-filter instantly
+        # without a DB round-trip — see _apply_distance_filter().
+        self._muni_rows_all = _normalise_muni_rows(data.get("municipality_risk", []))
+        self._apply_distance_filter()
 
         self._render_hs_type(data.get("hs_type_risk", []))
         self._render_income(data.get("income_risk", []))
+        self._render_strand_chart(data.get("shs_strand_risk", []))
         self._render_term_comparison(data.get("term_comparison", []))
         self._render_coverage(data.get("intervention_coverage", {}))
+
+    # ══════════════════════════════════════════════════════════════════
+    # Advanced filters
+    # ══════════════════════════════════════════════════════════════════
+
+    def _apply_distance_filter(self):
+        """
+        Re-filter the already-loaded municipality rows by the currently
+        selected Distance bucket, and re-render both the ranked list and
+        the map from that filtered set. Pure client-side — no DB call.
+        """
+        lo, hi = self._distance_combo.currentData() or (None, None)
+        filtered = _filter_by_distance(self._muni_rows_all, lo, hi)
+        self._render_municipality(filtered)
+        self._risk_map._render(filtered)
+
+    def _on_distance_changed(self, _index: int):
+        # Skip re-rendering before any data has ever loaded — otherwise
+        # fiddling with the combo pre-Load would overwrite the page's
+        # normal "select filters and click Load" empty state with a
+        # slightly different-looking empty state for no reason.
+        if not self._data:
+            return
+        self._apply_distance_filter()
+
+    def _on_clear_filters(self):
+        self._risk_combo.setCurrentIndex(0)
+        self._gender_combo.setCurrentIndex(0)
+        self._college_combo.setCurrentIndex(0)
+        self._program_combo.setCurrentIndex(0)
+        self._distance_combo.setCurrentIndex(0)   # re-applies instantly via signal
+        self._status_lbl.setText("Filters cleared — click Load to apply.")
 
     # ══════════════════════════════════════════════════════════════════
     # Summary cards
@@ -630,6 +930,15 @@ class AnalyticsPage(QWidget):
                 f"{n:,} / {tot:,} high-risk students  ·  {sl} Sem {ay}")
         else:
             self._card_coverage.update("—", "No intervention data yet")
+
+        gpa = data.get("avg_hs_gpa", {})
+        avg = gpa.get("average")
+        n_g = gpa.get("count", 0)
+        if avg is not None:
+            self._card_avg_gpa.update(
+                f"{avg:.2f}", f"Across {n_g:,} student(s) with recorded HS GPA")
+        else:
+            self._card_avg_gpa.update("—", "No HS GPA data yet")
 
     # ══════════════════════════════════════════════════════════════════
     # Chart 1 — Primary factor frequency
@@ -724,7 +1033,7 @@ class AnalyticsPage(QWidget):
         slo.setSpacing(4)
         slo.setContentsMargins(0, 0, 0, 0)
 
-        for r in norm_rows:
+        for i, r in enumerate(norm_rows):
             muni     = r["municipality"]
             total    = r["total"]
             high     = r["high_risk"]
@@ -734,10 +1043,15 @@ class AnalyticsPage(QWidget):
             d_color  = _dist_color(dist_km)
             dist_txt = f"{dist_km:.1f} km" if dist_km is not None else "—"
 
-            row_widget = QWidget()
-            row_widget.setStyleSheet("background:transparent;")
+            # Subtle alternating row tint for readability — purely visual,
+            # same widgets/order/widths as before.
+            row_widget = QFrame()
+            row_widget.setStyleSheet(
+                f"background:{'rgba(255,255,255,0.02)' if i % 2 else 'transparent'}; "
+                "border-radius:6px;"
+            )
             rlo = QHBoxLayout(row_widget)
-            rlo.setContentsMargins(0, 2, 0, 2)
+            rlo.setContentsMargins(6, 4, 6, 4)
             rlo.setSpacing(8)
 
             name = QLabel(muni[:24])
@@ -769,10 +1083,13 @@ class AnalyticsPage(QWidget):
                 + (f"  ·  📍 {dist_km:.1f} km from CTU"
                    if dist_km is not None else ""))
 
+            # Percentage as a rounded pill badge instead of plain text.
             pct_lbl = QLabel(f"{rate:.0f}%")
+            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             pct_lbl.setStyleSheet(
-                f"color:{risk_color}; font-size:11px; "
-                f"font-weight:700; background:transparent;")
+                f"color:{risk_color}; font-size:11px; font-weight:700; "
+                f"background:{_hex_to_rgba(risk_color, 0.12)}; "
+                f"border-radius:8px; padding:1px 0;")
             pct_lbl.setFixedWidth(36)
 
             cnt_lbl = QLabel(str(total))
@@ -923,6 +1240,77 @@ class AnalyticsPage(QWidget):
         lo.addWidget(_chart_view(chart, min_h=max(180, len(labels) * 28)))
 
     # ══════════════════════════════════════════════════════════════════
+    # Chart 4b — SHS Strand vs Risk
+    # ══════════════════════════════════════════════════════════════════
+
+    def _render_strand_chart(self, rows: list):
+        """
+        Donut chart — share of AT-RISK (high+moderate) students by SHS
+        strand. Slice size directly encodes "number of at-risk students",
+        so the biggest slice is visually the strand with the most risk —
+        matching the "classify which strand has the most risk" goal more
+        directly than a bar chart would, since it's inherently a
+        share-of-total question rather than a magnitude comparison.
+
+        Strands are ranked by absolute at-risk COUNT (not rate), since a
+        small strand with a high percentage but few students isn't what
+        "most number of risk" is asking about.
+        """
+        _clear_host(self._strand_host)
+        if not rows:
+            self._strand_host.layout().addWidget(
+                _empty_label(
+                    "No SHS strand data.\n"
+                    "Ensure shs_strand is populated in dim_student."))
+            return
+
+        at_risk_rows = [r for r in rows if (r["high"] + r["moderate"]) > 0]
+        if not at_risk_rows:
+            self._strand_host.layout().addWidget(
+                _empty_label("No at-risk students in any SHS strand for this selection."))
+            return
+
+        total_at_risk = sum(r["high"] + r["moderate"] for r in at_risk_rows)
+
+        series = QPieSeries()
+        series.setHoleSize(0.40)
+
+        palette = ["#ff5b5b", "#f5b335", "#4f8cff", "#34d399",
+                   "#a78bfa", "#f59e0b", "#22d3ee", "#f472b6"]
+
+        for i, r in enumerate(at_risk_rows):
+            cnt         = r["high"] + r["moderate"]
+            pct         = round(cnt / max(total_at_risk, 1) * 100, 1)
+            strand_name = r["strand"][:12]
+
+            slice_ = series.append(f"{strand_name}  ·  {pct}%", cnt)
+            slice_.setBrush(QColor(palette[i % len(palette)]))
+            slice_.setPen(QColor("#13172a"))
+            slice_.setLabelVisible(False)
+
+            slice_.hovered.connect(
+                lambda state, name=r["strand"], c=cnt, p=pct,
+                       hi=r["high"], mo=r["moderate"], tot=r["total"]:
+                QToolTip.showText(QCursor.pos(),
+                    f"<b>{name}</b><br>"
+                    f"{c:,} at-risk students ({p}% of all at-risk)"
+                    f"<br>High: {hi:,}  ·  Moderate: {mo:,}  ·  "
+                    f"Total in strand: {tot:,}")
+                if state else QToolTip.hideText()
+            )
+
+        chart = _base_chart()
+        chart.addSeries(series)
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        chart.legend().setLabelColor(QColor("#c9d0e0"))
+        chart.legend().setFont(QFont("Segoe UI", 8))
+
+        lo = self._strand_host.layout()
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.addWidget(_chart_view(chart, min_h=200))
+
+    # ══════════════════════════════════════════════════════════════════
     # Chart 5 — Term comparison
     # ══════════════════════════════════════════════════════════════════
 
@@ -1007,13 +1395,22 @@ class AnalyticsPage(QWidget):
                  "#f5b335" if pct >= 40 else "#ff5b5b")
 
         term_lbl = QLabel(f"{sem_s}  ·  AY {ay}" if sem_s else ay)
+        term_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         term_lbl.setStyleSheet(
             "color:rgba(255,255,255,0.40); font-size:11px; background:transparent;")
 
+        # Circular accent badge behind the headline percentage, instead
+        # of plain centered text — same value, same position in the
+        # layout, just a rounder, more "dashboard-y" presentation.
         big_pct = QLabel(f"{pct:.0f}%")
-        big_pct.setStyleSheet(
-            f"color:{color}; font-size:48px; font-weight:800; background:transparent;")
         big_pct.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        big_pct.setFixedSize(116, 116)
+        big_pct.setStyleSheet(f"""
+            color:{color}; font-size:28px; font-weight:800;
+            background:{_hex_to_rgba(color, 0.10)};
+            border:3px solid {_hex_to_rgba(color, 0.35)};
+            border-radius:58px;
+        """)
 
         sub = QLabel("of high-risk students received an AI intervention")
         sub.setWordWrap(True)
@@ -1051,7 +1448,7 @@ class AnalyticsPage(QWidget):
 
         self._cov_host_lo.addWidget(term_lbl)
         self._cov_host_lo.addStretch()
-        self._cov_host_lo.addWidget(big_pct)
+        self._cov_host_lo.addWidget(big_pct, 0, Qt.AlignmentFlag.AlignHCenter)
         self._cov_host_lo.addWidget(sub)
         self._cov_host_lo.addSpacing(8)
         self._cov_host_lo.addWidget(bar)
@@ -1064,8 +1461,9 @@ class AnalyticsPage(QWidget):
 
     def _show_empty_all(self):
         msg = "Select a term and click Load, or wait for auto-load."
+        self._muni_rows_all = []
         for host in (self._factor_host, self._hs_host,
-                     self._income_host, self._term_host):
+                     self._income_host, self._strand_host, self._term_host):
             _clear_host(host)
             lo = host.layout()
             if lo:

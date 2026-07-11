@@ -340,10 +340,7 @@ class LoginDialog(QDialog):
     # ── Authentication ────────────────────────────────────────────────────────
 
     def _on_login(self) -> None:
-        # Guard: don't fire again if already authenticating.
-        # Check None only — never call .isRunning() on a potentially
-        # deleted C++ object. self._worker is set to None in _clear_worker
-        # before deleteLater fires, so this is always safe.
+
         if self._worker is not None:
             return
 
