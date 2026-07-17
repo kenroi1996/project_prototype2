@@ -27,8 +27,12 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QProgressBar, QSizePolicy, QToolTip, QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
 )
-from PyQt6.QtCore import Qt, QMargins, QPointF, pyqtSignal, QPoint
+from PyQt6.QtCore import (
+    Qt, QMargins, QPointF, pyqtSignal, QPoint,
+    QEasingCurve, QPropertyAnimation,
+)
 from PyQt6.QtGui import (
     QColor, QFont, QBrush, QPainter, QCursor,
 )
@@ -52,6 +56,29 @@ _CATEGORY_KEYS = {
     "Moderate Risk": "moderate_risk",
     "Low Risk":      "low_risk",
 }
+
+
+def _play_fade_in(widget: QWidget, duration: int = 420) -> None:
+    """
+    Subtle fade + rise entrance for a chart widget, played whenever it
+    loads or refreshes with new data. Cleans up after itself so repeated
+    calls (e.g. every update_chart()) don't leak effects/animations.
+    """
+    effect = QGraphicsOpacityEffect(widget)
+    widget.setGraphicsEffect(effect)
+
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def _cleanup():
+        widget.setGraphicsEffect(None)
+
+    anim.finished.connect(_cleanup)
+    widget._entrance_anim = anim   # keep a reference so it isn't garbage-collected
+    anim.start()
 
 
 # =============================================================================
@@ -100,6 +127,9 @@ class RiskDistributionChart(QChartView):
         chart.legend().setFont(QFont("Segoe UI", 9))
         chart.layout().setContentsMargins(0, 0, 0, 0)
         chart.setMargins(QMargins(0, 0, 0, 0))
+        chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+        chart.setAnimationDuration(650)
+        chart.setAnimationEasingCurve(QEasingCurve.Type.OutCubic)
 
         self.setChart(chart)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -174,6 +204,7 @@ class RiskDistributionChart(QChartView):
         self._centre_lbl.setText(f"{total:,}")
         self._centre_sub.setText("students")
         self._reposition_centre_labels()
+        _play_fade_in(self)
 
     def _on_slice_hovered(self, sl: QPieSlice, state: bool):
         if state:
@@ -285,6 +316,9 @@ class RiskAnalyticsChart(QChartView):
         chart.legend().setAlignment(Qt.AlignmentFlag.AlignTop)
         chart.legend().setLabelColor(QColor("#c9d0e0"))
         chart.legend().setFont(QFont("Segoe UI", 9))
+        chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+        chart.setAnimationDuration(650)
+        chart.setAnimationEasingCurve(QEasingCurve.Type.OutCubic)
         return chart
 
     def show_empty(self):
@@ -390,6 +424,7 @@ class RiskAnalyticsChart(QChartView):
         series.attachAxis(ax)
         series.attachAxis(ay)
         self._axis_x, self._axis_y = ax, ay
+        _play_fade_in(self)
 
     def _on_bar_hovered(self, state: bool, idx: int,
                          label: str, vals: list):

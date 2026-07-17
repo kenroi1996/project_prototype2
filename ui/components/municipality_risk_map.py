@@ -17,7 +17,10 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRectF, QPointF, QTimer
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QRectF, QPointF, QTimer,
+    QVariantAnimation, QEasingCurve,
+)
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QSizePolicy,
     QVBoxLayout, QWidget, QToolTip,
@@ -260,6 +263,8 @@ class _MapCanvas(QWidget):
         self._data:       list[dict] = []
         self._bubbles:    list[dict] = []    # pre-computed screen positions
         self._show_lines: bool       = True  # Option 2 toggle
+        self._reveal:     float      = 1.0   # 0→1 grow-in progress for bubbles
+        self._reveal_anim: QVariantAnimation | None = None
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
@@ -268,11 +273,38 @@ class _MapCanvas(QWidget):
     def set_data(self, data: list[dict]):
         self._data = data
         self._reproject()
+        self._start_reveal_animation()
         self.update()
 
+    def _start_reveal_animation(self):
+        """Grow the bubbles in from nothing with a soft overshoot, each
+        time fresh data loads onto the map."""
+        if self._reveal_anim is not None:
+            self._reveal_anim.stop()
+
+        self._reveal = 0.0
+        anim = QVariantAnimation(self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(550)
+        anim.setEasingCurve(QEasingCurve.Type.OutBack)
+
+        def _step(value):
+            # OutBack can overshoot past 1.0; clamp only the alpha use,
+            # let radius keep the slight bounce for a springy feel.
+            self._reveal = value
+            self.update()
+
+        anim.valueChanged.connect(_step)
+        self._reveal_anim = anim
+        anim.start()
+
     def clear(self):
+        if self._reveal_anim is not None:
+            self._reveal_anim.stop()
         self._data    = []
         self._bubbles = []
+        self._reveal  = 1.0
         self.update()
 
     def set_show_lines(self, show: bool):
@@ -407,26 +439,30 @@ class _MapCanvas(QWidget):
 
         # ── Bubbles ───────────────────────────────────────────────────
         # Draw shadow ring first, then fill
+        reveal = max(0.0, self._reveal)          # clamp negative overshoot only
+        alpha_reveal = min(1.0, reveal)           # alpha must stay in [0,1]
         for b in self._bubbles:
-            x, y, r = b["x"], b["y"], b["r"]
+            x, y, r = b["x"], b["y"], b["r"] * reveal
             col: QColor = b["color"]
 
             # Outer glow ring
             glow = QColor(col)
-            glow.setAlpha(40)
+            glow.setAlpha(int(40 * alpha_reveal))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(glow))
             p.drawEllipse(QRectF(x - r*1.6, y - r*1.6, r*3.2, r*3.2))
 
             # Fill
             fill = QColor(col)
-            fill.setAlpha(160)
+            fill.setAlpha(int(160 * alpha_reveal))
             p.setBrush(QBrush(fill))
-            p.setPen(QPen(col, 1.5))
+            pen_col = QColor(col)
+            pen_col.setAlpha(int(255 * alpha_reveal))
+            p.setPen(QPen(pen_col, 1.5))
             p.drawEllipse(QRectF(x - r, y - r, r*2, r*2))
 
-            # Label (only for larger bubbles)
-            if r >= 14:
+            # Label (only for larger bubbles, once mostly grown in)
+            if r >= 14 and reveal >= 0.85:
                 p.setPen(QPen(QColor("#ffffff"), 1))
                 f = QFont("Segoe UI", 8, QFont.Weight.Bold)
                 p.setFont(f)

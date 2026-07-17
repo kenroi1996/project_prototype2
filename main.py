@@ -1,10 +1,6 @@
 import os
 import sys
 
-# ── MUST be first — before any other import ──────────────────────────────────
-# On Windows + Python 3.8+, setting PATH alone is not enough for DLL loading.
-# os.add_dll_directory() registers the Qt6/bin folder with the Windows DLL
-# loader so QtWebEngineWidgets.dll and its dependencies are found at import time.
 if sys.platform == "win32":
     try:
         import PyQt6 as _p
