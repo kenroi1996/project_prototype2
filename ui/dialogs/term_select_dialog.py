@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from services.data_store import DataStore
+from services.interventions_service import get_available_terms
 
 
 class _TermSelectDialog(QDialog):
@@ -64,10 +65,7 @@ class _TermSelectDialog(QDialog):
         if not conn:
             self._status_lbl.setText("No database connection."); return
         try:
-            with conn.cursor() as cur:
-                cur.execute("""SELECT DISTINCT academic_year, semester
-                    FROM public.interventions ORDER BY academic_year DESC, semester DESC""")
-                terms = cur.fetchall()
+            terms = get_available_terms(conn)
         except Exception as e:
             self._status_lbl.setText(f"Error: {e}"); return
         self._term_combo.clear()

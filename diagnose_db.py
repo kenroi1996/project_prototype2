@@ -6,6 +6,8 @@ Tests DB connection, staging table populations, and a mock prediction save.
 
 import sys
 
+from services.prediction_engine import RISK_HIGH_LABEL
+
 print("=" * 70)
 print("DATABASE PERSISTENCE DIAGNOSTIC  (EarlyAlert v2)")
 print("=" * 70)
@@ -100,7 +102,7 @@ try:
         "college":                "CITE",
         "score":                  75.5,        # 0-100 scale
         "category":               "high_risk",
-        "label":                  "High Risk",
+        "label":                  RISK_HIGH_LABEL,
         "factor":                 "final_avg_grd",
         "gwa":                    "2.85",
         "absences":               "15",

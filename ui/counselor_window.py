@@ -36,6 +36,7 @@ from PyQt6.QtGui import QColor, QPainter, QPixmap, QIcon
 from services.auth_service  import AuthService
 from services.data_store    import DataStore
 from services.system_config import SystemConfig
+from services.prediction_engine import RISK_LOW_LABEL
 
 
 # ── Page index ────────────────────────────────────────────────────────────────
@@ -86,14 +87,14 @@ class _CounselorTermLoader(QThread):
     finished = pyqtSignal(object)   # PredictionResult-like
     error    = pyqtSignal(str)
 
-    _SQL = """
+    _SQL = f"""
         SELECT
             ds.student_id,
             ds.first_name,
             ds.last_name,
             COALESCE(dp.program_name, 'Unknown')         AS program,
             COALESCE(dp.college,      '—')               AS college,
-            COALESCE(rl.risk_label,   'Low Risk')        AS risk_label,
+            COALESCE(rl.risk_label,   '{RISK_LOW_LABEL}')        AS risk_label,
             fsr.predicted_risk_score,
             fsr.entrance_exam_score,
             fsr.high_school_gpa,

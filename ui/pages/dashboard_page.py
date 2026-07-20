@@ -70,6 +70,7 @@ from services.data_store import DataStore
 from services.system_config import SystemConfig
 from services.dashboard_refresh_service import DashboardRefreshService
 from services.dashboard_term_service import DashboardTermService
+from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL
 
 from workers.dashboard_workers import _InterventionRateLoader
 
@@ -205,17 +206,17 @@ class DashboardPage(PredictionMixin, QWidget):
 
         self._metric_1.update_values(
             value   = f"{s.avg_score}%",
-            status  = "High Risk" if s.avg_score >= 70 else "Moderate Risk",
+            status  = RISK_HIGH_LABEL if s.avg_score >= 70 else RISK_MODERATE_LABEL,
             remarks = f"Average across {s.total:,} students",
         )
         self._metric_2.update_values(
             value   = f"{s.high_risk + s.moderate_risk:,}",
-            status  = "High Risk" if s.high_risk_pct >= 30 else "Moderate Risk",
+            status  = RISK_HIGH_LABEL if s.high_risk_pct >= 30 else RISK_MODERATE_LABEL,
             remarks = f"{s.high_risk_pct}% of total cohort",
         )
         self._metric_3.update_values(
             value   = f"{s.high_risk:,}",
-            status  = "High Risk",
+            status  = RISK_HIGH_LABEL,
             remarks = (
                 f"{round(s.high_risk / s.total * 100, 1)}% flagged this run"
                 if s.total else "—"
@@ -358,9 +359,9 @@ class DashboardPage(PredictionMixin, QWidget):
         parts = []
         if self._active_risk_filter:
             label = {
-                "high_risk":     "High Risk",
-                "moderate_risk": "Moderate Risk",
-                "low_risk":      "Low Risk",
+                "high_risk":     RISK_HIGH_LABEL,
+                "moderate_risk": RISK_MODERATE_LABEL,
+                "low_risk":      RISK_LOW_LABEL,
             }.get(self._active_risk_filter, "")
             parts.append(label)
         if self._active_college_filter:
@@ -719,11 +720,11 @@ class DashboardPage(PredictionMixin, QWidget):
         self._clear_host(self._trend_chart_host)
 
         high_series = QSplineSeries()
-        high_series.setName("High Risk")
+        high_series.setName(RISK_HIGH_LABEL)
         high_series.setColor(QColor("#ff5b5b"))
 
         mod_series = QSplineSeries()
-        mod_series.setName("Moderate Risk")
+        mod_series.setName(RISK_MODERATE_LABEL)
         mod_series.setColor(QColor("#f5b335"))
 
         for i, (h, m) in enumerate(zip(high_vals, mod_vals)):
@@ -732,11 +733,11 @@ class DashboardPage(PredictionMixin, QWidget):
 
         high_series.hovered.connect(
             lambda pt, state, lbl=labels, vals=high_vals:
-            self._on_trend_hovered(pt, state, lbl, vals, "High Risk")
+            self._on_trend_hovered(pt, state, lbl, vals, RISK_HIGH_LABEL)
         )
         mod_series.hovered.connect(
             lambda pt, state, lbl=labels, vals=mod_vals:
-            self._on_trend_hovered(pt, state, lbl, vals, "Moderate Risk")
+            self._on_trend_hovered(pt, state, lbl, vals, RISK_MODERATE_LABEL)
         )
 
         chart = QChart()

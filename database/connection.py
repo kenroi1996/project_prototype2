@@ -19,3 +19,20 @@ def get_connection():
         print("Database connection error:")
         print(e)
         return None
+
+
+def get_server_version(conn) -> str:
+    """
+    Short PostgreSQL server version string, e.g. 'PostgreSQL 16.2'.
+    Moved here from ui/pages/settings/about_tab.py — a UI page has no
+    business opening its own cursor against the connection.
+    """
+    if not conn:
+        return "Not connected"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT version()")
+            ver = cur.fetchone()[0]
+        return ver.split(",")[0]
+    except Exception:
+        return "Connected"

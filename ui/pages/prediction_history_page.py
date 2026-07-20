@@ -32,6 +32,8 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 
 from services.data_store import DataStore
+from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL
+from ui.styles.risk_colors import RISK_HIGH_HEX, RISK_MODERATE_HEX, RISK_LOW_HEX
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,14 +71,14 @@ class _HistoryLoader(QThread):
     finished = pyqtSignal(list, str)
     error    = pyqtSignal(str)
 
-    _SQL = """
+    _SQL = f"""
         SELECT
             ds.student_id,
             ds.first_name,
             ds.last_name,
             COALESCE(dp.program_name, 'Unknown')          AS program,
             COALESCE(dp.college,      '—')                AS college,
-            COALESCE(rl.risk_label,   'Low Risk')         AS risk_label,
+            COALESCE(rl.risk_label,   '{RISK_LOW_LABEL}')         AS risk_label,
             fsr.predicted_risk_score,
             fsr.prediction_confidence,
             fsr.entrance_exam_score,
@@ -404,9 +406,9 @@ class PredictionHistoryPage(QWidget):
         tiles_row = QHBoxLayout()
         tiles_row.setSpacing(12)
         tile1, self._stat_total    = _stat_tile("—", "Total Students")
-        tile2, self._stat_high     = _stat_tile("—", "High Risk",     "#ff5b5b")
-        tile3, self._stat_moderate = _stat_tile("—", "Moderate Risk", "#f5b335")
-        tile4, self._stat_low      = _stat_tile("—", "Low Risk",      "#34d399")
+        tile2, self._stat_high     = _stat_tile("—", RISK_HIGH_LABEL,     RISK_HIGH_HEX)
+        tile3, self._stat_moderate = _stat_tile("—", RISK_MODERATE_LABEL, RISK_MODERATE_HEX)
+        tile4, self._stat_low      = _stat_tile("—", RISK_LOW_LABEL,      RISK_LOW_HEX)
         tile5, self._stat_avg      = _stat_tile("—", "Avg Risk Score","#4f8cff")
         for tile, _ in [(tile1, None),(tile2, None),(tile3, None),
                         (tile4, None),(tile5, None)]:

@@ -6,6 +6,8 @@ from typing import Optional, List, Dict, Any
 import logging
 import os
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,11 +92,11 @@ class DatabaseService:
     def __init__(self, host=None, port=None, database=None,
                  user=None, password=None):
         self.conn_params = {
-            "host": host or os.getenv("DB_HOST", "localhost"),
-            "port": port or int(os.getenv("DB_PORT", "5432")),
-            "database": database or os.getenv("DB_NAME", "testDB"),
-            "user": user or os.getenv("DB_USER", "postgres"),
-            "password": password or os.getenv("DB_PASSWORD", "admin123"),
+            "host": host or config.DB_HOST,
+            "port": port or config.DB_PORT,
+            "database": database or config.DB_NAME,
+            "user": user or config.DB_USER,
+            "password": password if password is not None else config.DB_PASSWORD,
         }
         self._conn: Optional[psycopg2.extensions.connection] = None
 

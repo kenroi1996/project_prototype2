@@ -33,6 +33,7 @@ import json
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from services.data_store import DataStore
+from services.prediction_engine import RISK_LOW_LABEL
 
 
 # ---------------------------------------------------------------------------
@@ -79,14 +80,14 @@ class _TermDataWorker(QThread):
     finished = pyqtSignal(object)   # PredictionResult-like
     error    = pyqtSignal(str)
 
-    _SQL = """
+    _SQL = f"""
         SELECT
             ds.student_id,
             ds.first_name,
             ds.last_name,
             COALESCE(dp.program_name, 'Unknown')         AS program,
             COALESCE(dp.college,      '—')               AS college,
-            COALESCE(rl.risk_label,   'Low Risk')        AS risk_label,
+            COALESCE(rl.risk_label,   '{RISK_LOW_LABEL}')        AS risk_label,
             fsr.predicted_risk_score,
             fsr.predicted_at,
             fsr.primary_factor,

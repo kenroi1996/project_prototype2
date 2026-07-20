@@ -1,0 +1,25 @@
+
+# --- UI framework ---
+PyQt6>=6.4.0
+PyQt6-Charts>=6.4.0          # QtCharts submodule — used in chart_widgets.py, analytics/dashboard/model_training pages
+
+# --- Database ---
+psycopg2-binary>=2.9.9       # PostgreSQL driver (database/connection.py, services/database_service.py)
+
+# --- Data & ML pipeline ---
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0          # Random Forest classifier
+imbalanced-learn>=0.11.0     # SMOTE (imported as `imblearn`)
+
+# --- Security ---
+bcrypt>=4.0.0                # password + security-answer hashing
+cryptography>=41.0.0         # Fernet field-level encryption (student name/address/birthdate)
+python-dotenv>=1.0.0         # loads .env into config.py
+
+# --- File I/O / exports ---
+openpyxl>=3.1.0              # Excel dataset dictionary workbooks, xlsx uploads
+reportlab>=4.0.0             # intervention log PDF export
+
+# --- Local AI advisor (interventions page) ---
+requests>=2.31.0             # calls local Ollama HTTP API (qwen3:4b)

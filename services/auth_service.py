@@ -12,6 +12,14 @@ from typing import Optional
 
 _SESSION: Optional[dict] = None
 
+# ── Login throttling ────────────────────────────────────────────────────
+# After MAX_FAILED_ATTEMPTS failed logins for the same username within
+# LOCKOUT_WINDOW_MINUTES, further attempts are rejected until the window
+# rolls past the oldest of those attempts. Counted against the existing
+# activity_log rather than a new table.
+MAX_FAILED_ATTEMPTS   = 5
+LOCKOUT_WINDOW_MINUTES = 15
+
 
 class AuthService:
 
@@ -24,6 +32,18 @@ class AuthService:
 
         try:
             import bcrypt
+
+            recent_failures = _recent_failed_attempts(conn, username.strip())
+            if recent_failures >= MAX_FAILED_ATTEMPTS:
+                _log_failed_attempt(
+                    conn, username,
+                    f"Locked out — {recent_failures} failed attempts in "
+                    f"the last {LOCKOUT_WINDOW_MINUTES} min",
+                )
+                return False, (
+                    f"Too many failed login attempts. "
+                    f"Please try again in {LOCKOUT_WINDOW_MINUTES} minutes."
+                )
 
             with conn.cursor() as cur:
                 cur.execute(
@@ -100,6 +120,94 @@ class AuthService:
         except Exception as exc:
             print(f"[AuthService] Login error: {exc}")
             return False, f"Database error during login: {exc}"
+
+    # ── Admin user management ───────────────────────────────────────────
+    # Moved here from ui/pages/settings/user_management_tab.py — data
+    # access belongs in the service layer, not in a UI page.
+
+    @staticmethod
+    def create_user(conn, username: str, password_hash: str, full_name: str,
+                     email: str | None, role: str, office: str | None) -> tuple[bool, str]:
+        """Insert a new user account. Returns (ok, error_message)."""
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.users
+                        (username, password_hash, full_name, email, role, office)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (username, password_hash, full_name, email, role, office),
+                )
+            conn.commit()
+            return True, ""
+        except Exception as exc:
+            conn.rollback()
+            if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+                return False, f"Username '{username}' already exists."
+            return False, str(exc)
+
+    @staticmethod
+    def set_user_role(conn, user_id: int, role: str) -> tuple[bool, str]:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.users SET role=%s WHERE user_id=%s",
+                    (role, user_id),
+                )
+            conn.commit()
+            return True, ""
+        except Exception as exc:
+            conn.rollback()
+            return False, str(exc)
+
+    @staticmethod
+    def set_user_active(conn, user_id: int, active: bool) -> tuple[bool, str]:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.users SET is_active=%s WHERE user_id=%s",
+                    (active, user_id),
+                )
+            conn.commit()
+            return True, ""
+        except Exception as exc:
+            conn.rollback()
+            return False, str(exc)
+
+    @staticmethod
+    def change_own_password(conn, user_id: int, current_password: str,
+                             new_password: str) -> tuple[bool, str]:
+        """
+        Self-service password change — verifies the current password
+        before setting the new one. Distinct from change_password()
+        below, which is the admin-forced reset flow with no current-
+        password check. Moved here from ui/pages/settings/security_tab.py.
+        """
+        try:
+            import bcrypt
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT password_hash FROM public.users WHERE user_id=%s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+
+            if not row or not bcrypt.checkpw(current_password.encode(), row[0].encode()):
+                return False, "Current password is incorrect."
+
+            new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.users SET password_hash=%s WHERE user_id=%s",
+                    (new_hash, user_id),
+                )
+            conn.commit()
+            return True, ""
+        except Exception as exc:
+            conn.rollback()
+            return False, str(exc)
 
     @staticmethod
     def logout(conn=None) -> None:
@@ -414,9 +522,37 @@ def _log_failed_attempt(conn, username: str, reason: str) -> None:
             conn,
             action      = "LOGIN_FAILED",
             entity_type = "SESSION",
+            entity_id   = (username or "").strip()[:50],
             description = f"Failed login for '{username}': {reason}.",
             status      = "FAILURE",
         )
         conn.commit()
     except Exception as exc:
         print(f"[AuthService] Could not log failed attempt: {exc}")
+
+
+def _recent_failed_attempts(conn, username: str) -> int:
+    """
+    Count LOGIN_FAILED entries for this exact username within the
+    lockout window. Applies equally whether or not the username maps
+    to a real account, so it doesn't add a new way to enumerate users.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM   public.activity_log
+                WHERE  action        = 'LOGIN_FAILED'
+                  AND  entity_id     = %s
+                  AND  log_timestamp > NOW() - (%s || ' minutes')::interval
+                """,
+                (username[:50], LOCKOUT_WINDOW_MINUTES),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception as exc:
+        print(f"[AuthService] Could not check recent failed attempts: {exc}")
+        # Fail open on a query error rather than locking everyone out
+        # because of an unrelated DB hiccup.
+        return 0

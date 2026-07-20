@@ -1,13 +1,27 @@
 from __future__ import annotations
 import random
 
+from services.system_config import SystemConfig
+
 
 # =====================================
 # RISK THRESHOLDS
 # =====================================
+# These used to be hardcoded here, which meant SystemConfig's admin-
+# configurable risk_high_threshold / risk_moderate_threshold (Settings
+# page) had no actual effect on classification — a saved threshold was
+# never consulted. classify_risk() now reads the live values on every
+# call so an admin's change takes effect immediately, no restart needed.
+#
+# Defaults (50 / 25) match SystemConfig's own fallback defaults, so
+# behavior is unchanged for anyone who has never touched the setting.
 
-RISK_HIGH     = 50
-RISK_MODERATE = 25
+def _risk_high_threshold() -> float:
+    return SystemConfig.risk_high_threshold()
+
+
+def _risk_moderate_threshold() -> float:
+    return SystemConfig.risk_moderate_threshold()
 
 
 def classify_risk(score: float, binary_pred=None) -> str:
@@ -15,23 +29,31 @@ def classify_risk(score: float, binary_pred=None) -> str:
     Classify a student's risk level from probability score and binary prediction.
     Handles both integer (0/1) and string ('at_risk'/'not_at_risk') predictions.
     """
+    risk_high     = _risk_high_threshold()
+    risk_moderate = _risk_moderate_threshold()
+
     _POSITIVE = {1, '1', 'at_risk', 'at-risk', True}
     is_positive = binary_pred in _POSITIVE
 
     if is_positive:
-        return "high_risk" if score >= RISK_HIGH else "moderate_risk"
-    if score >= RISK_HIGH:
+        return "high_risk" if score >= risk_high else "moderate_risk"
+    if score >= risk_high:
         return "high_risk"
-    elif score >= RISK_MODERATE:
+    elif score >= risk_moderate:
         return "moderate_risk"
     return "low_risk"
 
 
+RISK_HIGH_LABEL     = "High Risk"
+RISK_MODERATE_LABEL = "Moderate Risk"
+RISK_LOW_LABEL      = "Low Risk"
+
+
 def risk_label(category: str) -> str:
     return {
-        "high_risk":     "High Risk",
-        "moderate_risk": "Moderate Risk",
-        "low_risk":      "Low Risk",
+        "high_risk":     RISK_HIGH_LABEL,
+        "moderate_risk": RISK_MODERATE_LABEL,
+        "low_risk":      RISK_LOW_LABEL,
     }.get(category, "Unknown")
 
 

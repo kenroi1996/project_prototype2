@@ -31,6 +31,7 @@ from PyQt6.QtGui import (
 )
 
 from services.data_store import DataStore
+from ui.styles.risk_colors import risk_qcolor
 
 
 # ── Cebu municipality coordinates (lat, lon) ──────────────────────────────────
@@ -375,11 +376,11 @@ class _MapCanvas(QWidget):
             x, y     = _px(row["lat"], row["lon"])
 
             if risk_pct >= 50:
-                color = QColor("#ff5b5b")
+                color = risk_qcolor("high")
             elif risk_pct >= 25:
-                color = QColor("#f5b335")
+                color = risk_qcolor("moderate")
             else:
-                color = QColor("#34d399")
+                color = risk_qcolor("low")
 
             self._bubbles.append({
                 "x": x, "y": y, "r": radius,
@@ -570,9 +571,9 @@ class _MapCanvas(QWidget):
 
     def _paint_legend(self, p: QPainter):
         bubble_entries = [
-            (QColor("#ff5b5b"), "High ≥ 50%"),
-            (QColor("#f5b335"), "Moderate 25–50%"),
-            (QColor("#34d399"), "Low < 25%"),
+            (risk_qcolor("high"),     "High ≥ 50%"),
+            (risk_qcolor("moderate"), "Moderate 25–50%"),
+            (risk_qcolor("low"),      "Low < 25%"),
         ]
         line_entries = [
             (QColor("#4f8cff"), "≤ 20 km"),

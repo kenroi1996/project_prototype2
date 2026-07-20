@@ -12,6 +12,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QGridLayout
 
 from services.data_store import DataStore
+from database.connection import get_server_version
 from ui.helpers.settings_render import _DEFAULT_INSTITUTION, _section_title, _card
 
 
@@ -95,16 +96,7 @@ class _AboutTab(QWidget):
 
     @staticmethod
     def _db_info() -> str:
-        conn = DataStore.get().db_conn
-        if not conn:
-            return "Not connected"
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT version()")
-                ver = cur.fetchone()[0]
-            return ver.split(",")[0]
-        except Exception:
-            return "Connected"
+        return get_server_version(DataStore.get().db_conn)
 
     @staticmethod
     def _pkg_version(mod: str) -> str:

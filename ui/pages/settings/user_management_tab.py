@@ -320,18 +320,11 @@ class _UserManagementTab(QWidget):
             self._set_add_feedback("No database connection.", error=True)
             return
 
-        try:
-            pw_hash = _hash_password(pw)
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO public.users
-                        (username, password_hash, full_name, email, role, office)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (un, pw_hash, fn, em or None, role, off or None),
-                )
-            conn.commit()
+        pw_hash = _hash_password(pw)
+        ok, err_msg = AuthService.create_user(
+            conn, un, pw_hash, fn, em or None, role, off or None,
+        )
+        if ok:
             self._set_add_feedback(
                 f"✓  User '{un}' created successfully.", error=False)
             for w in (self._new_fullname, self._new_username,
@@ -340,13 +333,8 @@ class _UserManagementTab(QWidget):
                 w.clear()
             self._new_role.setCurrentIndex(0)
             self.load_users()
-        except Exception as e:
-            conn.rollback()
-            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-                self._set_add_feedback(
-                    f"Username '{un}' already exists.", error=True)
-            else:
-                self._set_add_feedback(str(e), error=True)
+        else:
+            self._set_add_feedback(err_msg, error=True)
 
     def _set_add_feedback(self, text: str, error: bool = False):
         self._add_feedback.setText(text)
@@ -369,17 +357,11 @@ class _UserManagementTab(QWidget):
         if not dlg.exec():
             return
         conn = DataStore.get().db_conn
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE public.users SET role=%s WHERE user_id=%s",
-                    (new_role, user_id),
-                )
-            conn.commit()
+        ok, err_msg = AuthService.set_user_role(conn, user_id, new_role)
+        if ok:
             self.load_users()
-        except Exception as e:
-            conn.rollback()
-            show_error(self, "Error", "Could not update role.", str(e))
+        else:
+            show_error(self, "Error", "Could not update role.", err_msg)
 
     def _disable_user(self, user_id: int, name: str):
         dlg = ConfirmationDialog(
@@ -397,17 +379,11 @@ class _UserManagementTab(QWidget):
 
     def _set_active(self, user_id: int, active: bool):
         conn = DataStore.get().db_conn
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE public.users SET is_active=%s WHERE user_id=%s",
-                    (active, user_id),
-                )
-            conn.commit()
+        ok, err_msg = AuthService.set_user_active(conn, user_id, active)
+        if ok:
             self.load_users()
-        except Exception as e:
-            conn.rollback()
-            show_error(self, "Error", "Could not update account status.", str(e))
+        else:
+            show_error(self, "Error", "Could not update account status.", err_msg)
 
     # ── Remove user (permanent) ───────────────────────────────────────
 

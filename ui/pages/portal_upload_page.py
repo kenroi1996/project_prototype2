@@ -569,13 +569,10 @@ class PortalUploadPage(QWidget):
         return clean_headers, clean_rows
 
     def _get_db_service(self):
-        return DatabaseService(
-            host="localhost",
-            port=5432,
-            database="testDB",
-            user="postgres",
-            password="admin123",
-        )
+        # No connection params here — DatabaseService() falls back to
+        # config.py, which loads everything from .env. Never hardcode
+        # credentials in a UI page.
+        return DatabaseService()
 
     def _save_to_database(self):
         data = self._get_loaded_dataset()

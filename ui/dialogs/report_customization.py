@@ -51,6 +51,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL
+
 
 # ── Shared style tokens ───────────────────────────────────────────────────────
 
@@ -253,7 +255,7 @@ class _CohortTab(QWidget):
         # ── Filter: risk levels ───────────────────────────────────────
         lo.addWidget(_section_label("Filter by Risk Level"))
         risk_host, self._risk_chips = _chip_group(
-            ["High Risk", "Moderate Risk", "Low Risk"], "#ff5b5b")
+            [RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL], "#ff5b5b")
         lo.addWidget(risk_host)
 
         lo.addStretch()
@@ -275,9 +277,9 @@ class _CohortTab(QWidget):
 
         # Risk levels
         _risk_map = {
-            "High Risk":     "high_risk",
-            "Moderate Risk": "moderate_risk",
-            "Low Risk":      "low_risk",
+            RISK_HIGH_LABEL:     "high_risk",
+            RISK_MODERATE_LABEL: "moderate_risk",
+            RISK_LOW_LABEL:      "low_risk",
         }
         selected_risk = [
             _risk_map[lbl] for lbl, btn in self._risk_chips.items()

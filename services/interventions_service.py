@@ -20,6 +20,45 @@ from services.data_store    import DataStore
 from services.system_config import SystemConfig
 
 
+def get_recommendations(conn, intervention_id: int) -> list:
+    """
+    Lazy-load the recommendations JSON for a single intervention record.
+    Moved here from ui/dialogs/intervention_log_dialog.py.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT recommendations FROM public.interventions "
+                "WHERE intervention_id = %s",
+                (intervention_id,),
+            )
+            row = cur.fetchone()
+        recs = row[0] if row else []
+    except Exception:
+        return []
+
+    if isinstance(recs, str):
+        try:
+            return json.loads(recs)
+        except Exception:
+            return []
+    return recs or []
+
+
+def get_available_terms(conn) -> list[tuple]:
+    """
+    Distinct (academic_year, semester) pairs that have intervention
+    records, newest first. Moved here from ui/dialogs/term_select_dialog.py.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT DISTINCT academic_year, semester
+               FROM public.interventions
+               ORDER BY academic_year DESC, semester DESC"""
+        )
+        return cur.fetchall()
+
+
 def _safe_cleanup(worker: QThread) -> None:
     """
     Safely destroy a QThread worker regardless of which signal triggered

@@ -44,25 +44,34 @@ from PyQt6.QtCharts import (
 
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-_HIGH    = QColor("#ff5b5b")
-_MOD     = QColor("#f5b335")
-_LOW     = QColor("#34d399")
+from ui.styles.risk_colors import RISK_HIGH_HEX, RISK_MODERATE_HEX, RISK_LOW_HEX
+from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL
+
+_HIGH    = QColor(RISK_HIGH_HEX)
+_MOD     = QColor(RISK_MODERATE_HEX)
+_LOW     = QColor(RISK_LOW_HEX)
 _MUTED   = QColor("#a0aabe")
 _BG      = QColor("#13172a")
 _SURFACE = QColor("rgba(255,255,255,0.04)")
 
 _CATEGORY_KEYS = {
-    "High Risk":     "high_risk",
-    "Moderate Risk": "moderate_risk",
-    "Low Risk":      "low_risk",
+    RISK_HIGH_LABEL:     "high_risk",
+    RISK_MODERATE_LABEL: "moderate_risk",
+    RISK_LOW_LABEL:      "low_risk",
 }
 
 
-def _play_fade_in(widget: QWidget, duration: int = 420) -> None:
+def _play_fade_in(widget: QWidget, duration: int = 420, restore_effect=None) -> None:
     """
     Subtle fade + rise entrance for a chart widget, played whenever it
     loads or refreshes with new data. Cleans up after itself so repeated
     calls (e.g. every update_chart()) don't leak effects/animations.
+
+    Qt only allows one QGraphicsEffect per widget at a time, so widgets
+    that already carry their own effect (e.g. a drop shadow on a summary
+    card) should pass `restore_effect`, a zero-arg callable that builds a
+    fresh replacement effect (e.g. `lambda: _make_shadow(...)`) to
+    reapply once the fade finishes.
     """
     effect = QGraphicsOpacityEffect(widget)
     widget.setGraphicsEffect(effect)
@@ -74,7 +83,7 @@ def _play_fade_in(widget: QWidget, duration: int = 420) -> None:
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
     def _cleanup():
-        widget.setGraphicsEffect(None)
+        widget.setGraphicsEffect(restore_effect() if restore_effect else None)
 
     anim.finished.connect(_cleanup)
     widget._entrance_anim = anim   # keep a reference so it isn't garbage-collected
@@ -169,9 +178,9 @@ class RiskDistributionChart(QChartView):
         total = high_risk + moderate_risk + low_risk
         self._total_students = total
         self._totals = {
-            "High Risk":     high_risk,
-            "Moderate Risk": moderate_risk,
-            "Low Risk":      low_risk,
+            RISK_HIGH_LABEL:     high_risk,
+            RISK_MODERATE_LABEL: moderate_risk,
+            RISK_LOW_LABEL:      low_risk,
         }
         self._active_filter = ""
 
@@ -180,9 +189,9 @@ class RiskDistributionChart(QChartView):
         series.setPieSize(0.78)
 
         data = [
-            ("High Risk",     high_risk,     _HIGH),
-            ("Moderate Risk", moderate_risk, _MOD),
-            ("Low Risk",      low_risk,      _LOW),
+            (RISK_HIGH_LABEL,     high_risk,     _HIGH),
+            (RISK_MODERATE_LABEL, moderate_risk, _MOD),
+            (RISK_LOW_LABEL,      low_risk,      _LOW),
         ]
         for label, count, color in data:
             pct = round(count / total * 100, 1) if total else 0
@@ -259,9 +268,9 @@ class RiskDistributionChart(QChartView):
 
     def _reset_slice_opacity(self):
         colors = {
-            "High Risk":     _HIGH,
-            "Moderate Risk": _MOD,
-            "Low Risk":      _LOW,
+            RISK_HIGH_LABEL:     _HIGH,
+            RISK_MODERATE_LABEL: _MOD,
+            RISK_LOW_LABEL:      _LOW,
         }
         series = self.chart().series()
         if not series:
@@ -370,11 +379,11 @@ class RiskAnalyticsChart(QChartView):
             mod_vals.append(max(mod, 0))
             max_val = max(max_val, total)
 
-        set_high = QBarSet("High Risk")
+        set_high = QBarSet(RISK_HIGH_LABEL)
         set_high.setColor(_HIGH)
         set_high.append(high_vals)
 
-        set_mod = QBarSet("Moderate Risk")
+        set_mod = QBarSet(RISK_MODERATE_LABEL)
         set_mod.setColor(_MOD)
         set_mod.append(mod_vals)
 
@@ -398,10 +407,10 @@ class RiskAnalyticsChart(QChartView):
         )
         # Hover tooltip
         set_high.hovered.connect(
-            lambda state, idx: self._on_bar_hovered(state, idx, "High Risk", high_vals)
+            lambda state, idx: self._on_bar_hovered(state, idx, RISK_HIGH_LABEL, high_vals)
         )
         set_mod.hovered.connect(
-            lambda state, idx: self._on_bar_hovered(state, idx, "Moderate Risk", mod_vals)
+            lambda state, idx: self._on_bar_hovered(state, idx, RISK_MODERATE_LABEL, mod_vals)
         )
 
         ax = QBarCategoryAxis()

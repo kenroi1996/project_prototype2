@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QFrame, QScrollArea, QComboBox, QSizePolicy,
     QProgressBar, QToolTip, QGraphicsDropShadowEffect,
 )
-from PyQt6.QtCore import Qt, QTimer, QMargins
+from PyQt6.QtCore import Qt, QTimer, QMargins, QEasingCurve
 from PyQt6.QtGui import QColor, QFont, QPainter, QCursor
 from PyQt6.QtCharts import (
     QChart, QChartView,
@@ -27,6 +27,8 @@ from ui.components.municipality_risk_map import (
     distance_from_campus_km,    # Option 3 — precompute distance per row
     normalize_municipality,     # collapse name variants (e.g. Bogo/Bogo City)
 )
+from ui.components.chart_widgets import _play_fade_in
+from ui.styles.risk_colors import RISK_HIGH_HEX, RISK_MODERATE_HEX, RISK_LOW_HEX, risk_hex
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Visual helpers (cosmetic only — no data/business logic)
@@ -137,6 +139,10 @@ class _SummaryCard(QFrame):
     def update(self, value: str, sub: str = ""):
         self._value_lbl.setText(value)
         self._sub_lbl.setText(sub)
+        _play_fade_in(
+            self,
+            restore_effect=lambda: _make_shadow(blur=22, y_offset=5, alpha=80),
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -205,6 +211,9 @@ def _base_chart() -> QChart:
     chart.setPlotAreaBackgroundVisible(False)
     chart.setMargins(QMargins(0, 0, 0, 0))
     chart.legend().setVisible(False)
+    chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+    chart.setAnimationDuration(650)
+    chart.setAnimationEasingCurve(QEasingCurve.Type.OutCubic)
     return chart
 
 
@@ -213,6 +222,7 @@ def _chart_view(chart: QChart, min_h: int = 200) -> QChartView:
     view.setRenderHint(QPainter.RenderHint.Antialiasing)
     view.setStyleSheet("background:transparent; border:none;")
     view.setMinimumHeight(min_h)
+    _play_fade_in(view)
     return view
 
 
@@ -1060,8 +1070,8 @@ class AnalyticsPage(QWidget):
             name.setMinimumWidth(110)
 
             risk_color = (
-                "#ff5b5b" if rate >= 60 else
-                "#f5b335" if rate >= 35 else "#4f8cff"
+                RISK_HIGH_HEX if rate >= 60 else
+                RISK_MODERATE_HEX if rate >= 35 else "#4f8cff"
             )
             bar = QProgressBar()
             bar.setRange(0, 100)
@@ -1139,9 +1149,9 @@ class AnalyticsPage(QWidget):
             for r in rows
         ]
 
-        high_set = QBarSet("High");     high_set.setColor(QColor("#ff5b5b"))
-        mod_set  = QBarSet("Moderate"); mod_set.setColor(QColor("#f5b335"))
-        low_set  = QBarSet("Low");      low_set.setColor(QColor("#34d399"))
+        high_set = QBarSet("High");     high_set.setColor(QColor(RISK_HIGH_HEX))
+        mod_set  = QBarSet("Moderate"); mod_set.setColor(QColor(RISK_MODERATE_HEX))
+        low_set  = QBarSet("Low");      low_set.setColor(QColor(RISK_LOW_HEX))
 
         for h, m, l in zip(highs, mods, lows):
             high_set.append(h); mod_set.append(m); low_set.append(l)
@@ -1196,9 +1206,9 @@ class AnalyticsPage(QWidget):
         mods   = [r["moderate"] for r in rows]
         totals = [r["total"]    for r in rows]
 
-        high_set = QBarSet("High");     high_set.setColor(QColor("#ff5b5b"))
-        mod_set  = QBarSet("Moderate"); mod_set.setColor(QColor("#f5b335"))
-        rest_set = QBarSet("Low");      rest_set.setColor(QColor("#34d399"))
+        high_set = QBarSet("High");     high_set.setColor(QColor(RISK_HIGH_HEX))
+        mod_set  = QBarSet("Moderate"); mod_set.setColor(QColor(RISK_MODERATE_HEX))
+        rest_set = QBarSet("Low");      rest_set.setColor(QColor(RISK_LOW_HEX))
 
         for h, m, t in zip(highs, mods, totals):
             high_set.append(h)
@@ -1328,9 +1338,9 @@ class AnalyticsPage(QWidget):
         mods   = [r["moderate"] for r in rows]
         lows   = [r["low"]      for r in rows]
 
-        high_set = QBarSet("High");     high_set.setColor(QColor("#ff5b5b"))
-        mod_set  = QBarSet("Moderate"); mod_set.setColor(QColor("#f5b335"))
-        low_set  = QBarSet("Low");      low_set.setColor(QColor("#34d399"))
+        high_set = QBarSet("High");     high_set.setColor(QColor(RISK_HIGH_HEX))
+        mod_set  = QBarSet("Moderate"); mod_set.setColor(QColor(RISK_MODERATE_HEX))
+        low_set  = QBarSet("Low");      low_set.setColor(QColor(RISK_LOW_HEX))
 
         for h, m, l in zip(highs, mods, lows):
             high_set.append(h); mod_set.append(m); low_set.append(l)
@@ -1391,8 +1401,8 @@ class AnalyticsPage(QWidget):
         sem   = cov.get("term_sem", 0)
         sem_s = "1st Semester" if sem == 1 else "2nd Semester" if sem == 2 else ""
 
-        color = ("#34d399" if pct >= 75 else
-                 "#f5b335" if pct >= 40 else "#ff5b5b")
+        color = (RISK_LOW_HEX if pct >= 75 else
+                 RISK_MODERATE_HEX if pct >= 40 else RISK_HIGH_HEX)
 
         term_lbl = QLabel(f"{sem_s}  ·  AY {ay}" if sem_s else ay)
         term_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)

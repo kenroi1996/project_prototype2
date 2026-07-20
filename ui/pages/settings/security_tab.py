@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 from services.data_store import DataStore
 from services.auth_service import AuthService
 from services.password_utils import (
-    _validate_password, _hash_password, _check_password, _PW_RULES_TXT,
+    _validate_password, _PW_RULES_TXT,
 )
 from workers.settings_workers import _AuditLoader
 from ui.helpers.settings_render import (
@@ -181,33 +181,14 @@ class _SecurityTab(QWidget):
             self._set_pw_feedback("Session error. Please log in again.", error=True)
             return
 
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT password_hash FROM public.users WHERE user_id=%s",
-                    (user["user_id"],),
-                )
-                row = cur.fetchone()
-            if not row or not _check_password(cur_pw, row[0]):
-                self._set_pw_feedback("Current password is incorrect.", error=True)
-                return
-
-            new_hash = _hash_password(new_pw)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE public.users SET password_hash=%s WHERE user_id=%s",
-                    (new_hash, user["user_id"]),
-                )
-            conn.commit()
-
+        ok, err_msg = AuthService.change_own_password(conn, user["user_id"], cur_pw, new_pw)
+        if ok:
             self._cur_pw.clear()
             self._new_pw1.clear()
             self._new_pw2.clear()
             self._set_pw_feedback("✓  Password changed successfully.", error=False)
-
-        except Exception as e:
-            conn.rollback()
-            self._set_pw_feedback(str(e), error=True)
+        else:
+            self._set_pw_feedback(err_msg, error=True)
 
     def _set_pw_feedback(self, text: str, error: bool = False):
         self._pw_feedback.setText(text)

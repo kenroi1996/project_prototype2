@@ -32,9 +32,16 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.flowables import Flowable
 
+from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL
+
 # ── Palette ───────────────────────────────────────────────────────────────────
 C_NAVY     = colors.HexColor("#1e2540")
 C_ACCENT   = colors.HexColor("#4f8cff")
+# Risk tier colors intentionally stay as local literals here rather than
+# importing ui.styles.risk_colors — this module has zero PyQt dependency
+# (pure reportlab), and importing from ui/ would pull PyQt6 into a
+# service that shouldn't need it. Keep these three in sync with
+# ui/styles/risk_colors.py by hand if the palette ever changes.
 C_HIGH     = colors.HexColor("#ff5b5b")
 C_MODERATE = colors.HexColor("#f5b335")
 C_LOW      = colors.HexColor("#34d399")
@@ -410,9 +417,9 @@ class CohortReportGenerator:
             "by_college":   dict(by_col),
             "top_programs": top10,
             "tier": {
-                "High Risk":     tier_vals(high),
-                "Moderate Risk": tier_vals(mod),
-                "Low Risk":      tier_vals(low),
+                RISK_HIGH_LABEL:     tier_vals(high),
+                RISK_MODERATE_LABEL: tier_vals(mod),
+                RISK_LOW_LABEL:      tier_vals(low),
             },
         }
 
@@ -492,9 +499,9 @@ class CohortReportGenerator:
             story.append(Spacer(1, 3*mm))
             story.append(_StatRow([
                 (f"{s['total']:,}",    "Total Students",  C_ACCENT),
-                (f"{s['high']:,}",     "High Risk",       C_HIGH),
-                (f"{s['moderate']:,}", "Moderate Risk",   C_MODERATE),
-                (f"{s['low']:,}",      "Low Risk",        C_LOW),
+                (f"{s['high']:,}",     RISK_HIGH_LABEL,     C_HIGH),
+                (f"{s['moderate']:,}", RISK_MODERATE_LABEL, C_MODERATE),
+                (f"{s['low']:,}",      RISK_LOW_LABEL,      C_LOW),
             ]))
             story.append(Spacer(1, 7*mm))
 
@@ -526,7 +533,7 @@ class CohortReportGenerator:
                 "INDICATOR AVERAGES BY RISK TIER", _s("section")))
             story.append(Spacer(1, 3*mm))
             tier_rows = []
-            for lbl in ["High Risk", "Moderate Risk", "Low Risk"]:
+            for lbl in [RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL]:
                 td = s["tier"].get(lbl, {})
                 tier_rows.append([
                     lbl,

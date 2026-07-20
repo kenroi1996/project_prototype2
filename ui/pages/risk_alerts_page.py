@@ -10,12 +10,13 @@ from ui.components.loading_overlay import LoadingOverlay
 from ui.mixins.prediction_mixin import PredictionMixin
 from services.data_store import DataStore
 from services.system_config import SystemConfig
+from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL
 
 
 TAB_FILTERS = [
     ("all",           "All Alerts",   0),
-    ("high_risk",     "High Risk",    0),
-    ("moderate_risk", "Moderate Risk",0),
+    ("high_risk",     RISK_HIGH_LABEL,    0),
+    ("moderate_risk", RISK_MODERATE_LABEL,0),
 ]
 
 
@@ -61,8 +62,8 @@ class RiskAlertsPage(PredictionMixin, QWidget):
                 for tid, btn in self._tab_buttons.items():
                     labels = {
                         "all": "All Alerts",
-                        "high_risk": "High Risk",
-                        "moderate_risk": "Moderate Risk",
+                        "high_risk": RISK_HIGH_LABEL,
+                        "moderate_risk": RISK_MODERATE_LABEL,
                     }
                     btn.setText(f"{labels[tid]} (0)")
 
@@ -112,8 +113,8 @@ class RiskAlertsPage(PredictionMixin, QWidget):
         }
         labels = {
             "all":           "All Alerts",
-            "high_risk":     "High Risk",
-            "moderate_risk": "Moderate Risk",
+            "high_risk":     RISK_HIGH_LABEL,
+            "moderate_risk": RISK_MODERATE_LABEL,
         }
         for tid, btn in self._tab_buttons.items():
             text = f"{labels[tid]} ({counts[tid]})"

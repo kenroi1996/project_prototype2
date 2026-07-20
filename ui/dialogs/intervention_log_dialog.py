@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont
 
 from services.interventions_service import (
-    LogLoader, LogDeleter, BatchLogDeleter, _safe_cleanup,
+    LogLoader, LogDeleter, BatchLogDeleter, _safe_cleanup, get_recommendations,
 )
 from services.data_store import DataStore
 from ui.dialogs.intervention_detail_dialog import _InterventionDetailDialog
@@ -405,14 +405,7 @@ class InterventionLogDialog(QDialog):
         iid = row.get("intervention_id"); recs = row.get("recommendations")
         if recs is None:
             conn = DataStore.get().db_conn
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT recommendations FROM public.interventions "
-                        "WHERE intervention_id = %s", (iid,))
-                    dr = cur.fetchone(); recs = dr[0] if dr else []
-            except Exception:
-                recs = []
+            recs = get_recommendations(conn, iid) if conn else []
         if isinstance(recs, str):
             try: recs = json.loads(recs)
             except Exception: recs = []
