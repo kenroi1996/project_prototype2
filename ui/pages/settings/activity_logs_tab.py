@@ -8,12 +8,12 @@ Extracted verbatim from ui/pages/settings_page.py — no logic changes.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QDate
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView,
+    QHeaderView, QAbstractItemView, QDateEdit,
 )
 
 from ui.dialogs.confirmation_dialog import ConfirmationDialog
@@ -33,6 +33,9 @@ class _ActivityLogsTab(QWidget):
         "USER_CREATED", "ROLE_CHANGED", "USER_DISABLED",
     ]
     _STATUSES = ["All Statuses", "SUCCESS", "FAILED", "INFO", "WARNING"]
+
+    # Sentinel "no filter" date — see _date_picker() below.
+    _NO_DATE = QDate(2000, 1, 1)
 
     def __init__(self):
         super().__init__()
@@ -80,9 +83,9 @@ class _ActivityLogsTab(QWidget):
         self._f_status.setFixedHeight(32)
         self._f_status.setStyleSheet(_cb_ss)
 
-        self._f_date_from = _input("From (YYYY-MM-DD)")
+        self._f_date_from = self._date_picker("From date")
         self._f_date_from.setFixedHeight(32)
-        self._f_date_to   = _input("To (YYYY-MM-DD)")
+        self._f_date_to   = self._date_picker("To date")
         self._f_date_to.setFixedHeight(32)
 
         clear_btn = _ghost_btn("✕  Clear")
@@ -299,6 +302,48 @@ class _ActivityLogsTab(QWidget):
                 cb.setChecked(False)
         self._update_batch_bar()
 
+    def _date_picker(self, placeholder: str) -> QDateEdit:
+        d = QDateEdit()
+        d.setCalendarPopup(True)
+        d.setDisplayFormat("yyyy-MM-dd")
+        d.setMinimumDate(self._NO_DATE)
+        d.setMaximumDate(QDate(2100, 1, 1))
+        d.setSpecialValueText(placeholder)
+        d.setDate(self._NO_DATE)   # starts unset, shows `placeholder`
+        d.setStyleSheet("""
+            QDateEdit {
+                background-color: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 8px;
+                color: #e8eaf0;
+                font-size: 12px;
+                padding: 0 8px;
+            }
+            QDateEdit:focus { border-color: rgba(79,140,255,0.40); }
+            QDateEdit::drop-down {
+                subcontrol-origin: padding; subcontrol-position: right center;
+                width: 22px; border-left: 1px solid rgba(255,255,255,0.10);
+            }
+            QDateEdit::down-arrow { width: 10px; height: 10px; }
+            QCalendarWidget { background: #1a1f35; }
+            QCalendarWidget QToolButton {
+                color: #e8eaf0; background: transparent; font-size: 12px;
+            }
+            QCalendarWidget QMenu { background: #1a1f35; color: #e8eaf0; }
+            QCalendarWidget QSpinBox { background: #13172a; color: #e8eaf0; }
+            QCalendarWidget QAbstractItemView:enabled {
+                background: #13172a; color: #e8eaf0;
+                selection-background-color: rgba(79,140,255,0.30);
+                selection-color: #e8eaf0;
+            }
+            QCalendarWidget QAbstractItemView:disabled { color: rgba(255,255,255,0.25); }
+        """)
+        return d
+
+    def _date_str(self, picker: QDateEdit) -> str:
+        """'' if the picker is still at its unset sentinel, else 'yyyy-MM-dd'."""
+        return "" if picker.date() == self._NO_DATE else picker.date().toString("yyyy-MM-dd")
+
     def _build_filters(self) -> dict:
         action = self._f_action.currentText()
         status = self._f_status.currentText()
@@ -306,14 +351,14 @@ class _ActivityLogsTab(QWidget):
             "username":  self._f_username.text().strip(),
             "action":    action if action != "All Actions"  else "",
             "status":    status if status != "All Statuses" else "",
-            "date_from": self._f_date_from.text().strip(),
-            "date_to":   self._f_date_to.text().strip(),
+            "date_from": self._date_str(self._f_date_from),
+            "date_to":   self._date_str(self._f_date_to),
         }
 
     def _clear_filters(self):
         self._f_username.clear()
-        self._f_date_from.clear()
-        self._f_date_to.clear()
+        self._f_date_from.setDate(self._NO_DATE)
+        self._f_date_to.setDate(self._NO_DATE)
         self._f_action.setCurrentIndex(0)
         self._f_status.setCurrentIndex(0)
         self._load()

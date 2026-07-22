@@ -13,9 +13,9 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QComboBox, QLineEdit, QScrollArea, QDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QMessageBox,
+    QMessageBox, QDateEdit,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QDate
 from PyQt6.QtGui import QColor, QFont
 
 from services.interventions_service import (
@@ -98,8 +98,8 @@ class InterventionLogDialog(QDialog):
         self._ay_filter   = self._cb(["All Terms"])
         self._sem_filter  = self._cb(["All Semesters","1st Semester","2nd Semester"])
         self._mode_filter = self._cb(["All Types","per_student","cohort"])
-        self._date_from   = self._inp("From (YYYY-MM-DD)", 148)
-        self._date_to     = self._inp("To (YYYY-MM-DD)",   148)
+        self._date_from   = self._date_picker("From date")
+        self._date_to     = self._date_picker("To date")
         clr = QPushButton("✕  Clear"); clr.setObjectName("logClearBtn")
         clr.setFixedHeight(32); clr.setCursor(Qt.CursorShape.PointingHandCursor)
         clr.clicked.connect(self._clear_filters)
@@ -110,9 +110,9 @@ class InterventionLogDialog(QDialog):
         f1.addStretch()
         self._count_lbl = QLabel(""); self._count_lbl.setObjectName("logCount")
         f1.addWidget(self._count_lbl); root.addLayout(f1)
-        for w in (self._sid_search,
-                  self._date_from, self._date_to):
-            w.textChanged.connect(self._on_filter_changed)
+        self._sid_search.textChanged.connect(self._on_filter_changed)
+        for d in (self._date_from, self._date_to):
+            d.dateChanged.connect(self._on_filter_changed)
         for c in (self._ay_filter, self._sem_filter, self._mode_filter):
             c.currentIndexChanged.connect(self._on_filter_changed)
 
@@ -214,6 +214,25 @@ class InterventionLogDialog(QDialog):
         e = QLineEdit(); e.setObjectName("logSearch")
         e.setPlaceholderText(ph); e.setFixedWidth(w); return e
 
+    # Sentinel "no filter" date — QDateEdit always holds a real date, it
+    # has no concept of "empty" like QLineEdit does, so a fixed minimum
+    # stands in for "not set". setSpecialValueText makes that minimum
+    # display as a placeholder-style label instead of an actual date.
+    _NO_DATE = QDate(2000, 1, 1)
+
+    @classmethod
+    def _date_picker(cls, placeholder: str) -> QDateEdit:
+        d = QDateEdit()
+        d.setObjectName("logSearch")
+        d.setCalendarPopup(True)
+        d.setDisplayFormat("yyyy-MM-dd")
+        d.setMinimumDate(cls._NO_DATE)
+        d.setMaximumDate(QDate(2100, 1, 1))
+        d.setSpecialValueText(placeholder)
+        d.setDate(cls._NO_DATE)          # starts unset, shows `placeholder`
+        d.setFixedWidth(148)
+        return d
+
     @staticmethod
     def _cb(items: list) -> QComboBox:
         c = QComboBox(); c.setObjectName("logCombo")
@@ -268,9 +287,14 @@ class InterventionLogDialog(QDialog):
             "semester":      sem  if sem  != 0            else "",
             "mode":          mode if mode != "All Types"  else "",
             "student_id":    self._sid_search.text().strip(),
-            "date_from":     self._date_from.text().strip(),
-            "date_to":       self._date_to.text().strip(),
+            "date_from":     self._date_str(self._date_from),
+            "date_to":       self._date_str(self._date_to),
         }
+
+    def _date_str(self, picker: QDateEdit) -> str:
+        """'' if the picker is still at its unset sentinel, else 'yyyy-MM-dd' —
+        matches exactly what LogLoader's SQL WHERE clause expects."""
+        return "" if picker.date() == self._NO_DATE else picker.date().toString("yyyy-MM-dd")
 
     def _load(self):
         self._status_lbl.setText("Loading…")
@@ -309,9 +333,9 @@ class InterventionLogDialog(QDialog):
         self._ft.start(400)
 
     def _clear_filters(self):
-        for w in (self._sid_search,
-                  self._date_from, self._date_to):
-            w.blockSignals(True); w.clear(); w.blockSignals(False)
+        self._sid_search.blockSignals(True); self._sid_search.clear(); self._sid_search.blockSignals(False)
+        for d in (self._date_from, self._date_to):
+            d.blockSignals(True); d.setDate(self._NO_DATE); d.blockSignals(False)
         for c in (self._ay_filter, self._sem_filter, self._mode_filter):
             c.blockSignals(True); c.setCurrentIndex(0); c.blockSignals(False)
         self._load()
@@ -550,6 +574,24 @@ class InterventionLogDialog(QDialog):
                 border:1px solid rgba(255,255,255,0.10); border-radius:8px;
                 color:#e8eaf0; font-size:12px; padding:6px 10px; }
             QLineEdit#logSearch:focus { border-color:rgba(52,211,153,0.40); }
+            QDateEdit#logSearch { background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.10); border-radius:8px;
+                color:#e8eaf0; font-size:12px; padding:6px 8px; }
+            QDateEdit#logSearch:focus { border-color:rgba(52,211,153,0.40); }
+            QDateEdit#logSearch::drop-down {
+                subcontrol-origin:padding; subcontrol-position:right center;
+                width:22px; border-left:1px solid rgba(255,255,255,0.10); }
+            QDateEdit#logSearch::down-arrow { width:10px; height:10px; }
+            QCalendarWidget { background:#1a1f35; }
+            QCalendarWidget QToolButton { color:#e8eaf0; background:transparent;
+                font-size:12px; icon-size:14px,14px; }
+            QCalendarWidget QMenu { background:#1a1f35; color:#e8eaf0; }
+            QCalendarWidget QSpinBox { background:#13172a; color:#e8eaf0; }
+            QCalendarWidget QAbstractItemView:enabled {
+                background:#13172a; color:#e8eaf0;
+                selection-background-color:rgba(52,211,153,0.30);
+                selection-color:#e8eaf0; }
+            QCalendarWidget QAbstractItemView:disabled { color:rgba(255,255,255,0.25); }
             QComboBox#logCombo { background:rgba(255,255,255,0.06);
                 border:1px solid rgba(255,255,255,0.12); border-radius:8px;
                 color:#e8eaf0; font-size:12px; padding:5px 10px; min-height:30px; }
