@@ -506,7 +506,7 @@ class PredictionEngine:
             import pandas as pd
             import numpy as np
 
-            _CATEGORICAL = {"Program", "Age_Group", "Distance_Bucket"}
+            _CATEGORICAL = {"Program", "Age_Group", "Distance_Bucket", "Strand_Program_Match"}
 
             try:
                 df_raw = pd.DataFrame(X_raw, columns=feature_names)

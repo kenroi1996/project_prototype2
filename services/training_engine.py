@@ -227,7 +227,7 @@ class TrainingEngine:
         # column per unique value (e.g. Entrance_Exam_Score_88.00) producing
         # 400+ features where the model memorises individual scores rather than
         # learning that higher scores are protective.
-        _CATEGORICAL = {"Program", "Age_Group", "Distance_Bucket"}
+        _CATEGORICAL = {"Program", "Age_Group", "Distance_Bucket", "Strand_Program_Match"}
 
         cat_cols = [f for f in available if f in _CATEGORICAL]
         num_cols = [f for f in available if f not in _CATEGORICAL]
@@ -609,7 +609,7 @@ class TrainingEngine:
         ]
         shap_values.sort(key=lambda x: x[1], reverse=True)
 
-        self.progress_cb("Done ✅", 100)
+        self.progress_cb("Done", 100)
 
         return TrainingResult(
             success            = True,
@@ -642,7 +642,6 @@ class TrainingEngine:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
     @staticmethod
     def _get_feature_importance(model, feature_names) -> list[tuple]:
         try:
@@ -687,7 +686,7 @@ class TrainingEngine:
             ("", "muted"),
             (f"── Stratified {self.n_folds}-Fold CV"
              f"{' + SMOTE@0.40' if smote_applied else ''} ──", "muted"),
-        ]
+        ]   
 
         for i, (r, f, p) in enumerate(zip(fold_recalls, fold_f1s, fold_pr_aucs), 1):
             lines.append(

@@ -38,6 +38,50 @@ missing, and defaulted to "at_risk" when both were missing. Both were bugs:
      safety net (valid_mask) had nothing to catch — these fabricated rows
      silently entered training as if they were real at-risk students.
 
+CHANGELOG — post real-data audit
+---------------------------------
+Three confirmed bugs fixed after auditing against real institutional data
+(3,358 first-year students, MIS/Guidance/Registrar/SAO):
+
+  1. Gap_Years always computed as 0 for every student. Root cause: the
+     formula subtracted an extra 1 on top of (Year_Enrolled - Year_Graduated).
+     Philippine HS graduation (Mar/Apr) and college enrollment (Jun/Aug) fall
+     in the SAME calendar year for immediate enrollees, so
+     Year_Enrolled - Year_Graduated == 0 already means "no gap." The old
+     "- 1" pushed that 0 down to -1, which clip(lower=0) then flattened back
+     to 0 — indistinguishable from a genuine 1-year gap. Fixed by removing
+     the extra "- 1".
+
+  2. Strand_Program_Match returned an integer (0 / 1 / 2) that looked
+     ordinal but wasn't: 1 (TVL/GAS credit) and 2 (verified alignment) are
+     two DIFFERENT kinds of match, not "more" of the same thing. Feeding
+     that into StandardScaler implied a false 2 > 1 > 0 ordering. Fixed by
+     returning explicit string categories ("full_match" / "partial_match" /
+     "no_match" / "unknown") so DataPipeline.encode_categorical() treats it
+     as a category, not a magnitude — and "unknown" (missing/unmapped
+     strand) is now a distinct, visible case instead of falling through
+     silently.
+
+  3. First_Name / Last_Name / Full_Name were never in COLS_TO_DROP, so the
+     TRAINING path (drop_raw_columns -> DataPipeline.encode_categorical)
+     had no exclusion for them. encode_categorical() auto-encodes every
+     object column except the target, so raw student names were being
+     label-encoded into arbitrary per-student integers and used as model
+     inputs — a privacy problem and a leakage risk (a near-unique ID
+     hiding in the feature matrix). Fixed by adding all three to
+     COLS_TO_DROP. This only affects run_full_feature_pipeline() (training)
+     — run_prediction_pipeline() never calls drop_raw_columns(), so names
+     still pass through for display via PASSTHROUGH_COLUMNS, unchanged.
+
+  NOTE ON SCHEMA VERSIONING: FEATURE_SCHEMA_VERSION hashes the *names* in
+  TRAINING_FEATURES, not their dtypes. Strand_Program_Match's name didn't
+  change (int -> str), so this fix does NOT bump the hash automatically.
+  Any model artifact trained before this change must be retrained — a
+  saved model expecting numeric 0/1/2 will silently misread the new string
+  categories rather than raising a schema mismatch. Retrain and verify
+  ModelRegistry metadata manually after pulling this update; do not rely
+  on FEATURE_SCHEMA_VERSION to catch this specific case.
+
 Two-phase usage
 ---------------
   Phase 1 — Training (historical data that has Final_Avg_GRD):
@@ -235,6 +279,16 @@ COLS_TO_DROP: list[str] = [
     "Birthdate",
     "Home_Address",
     "Municipality",
+    # FIX: PII — was never dropped from the training path. encode_categorical()
+    # auto-encodes every remaining object column except the target, so these
+    # were being label-encoded into arbitrary per-student integers and fed
+    # to the model. Full_Name is also 100% null in every real export seen
+    # so far. Prediction-time display still works: run_prediction_pipeline()
+    # never calls drop_raw_columns(), so PASSTHROUGH_COLUMNS still carries
+    # names through for the UI.
+    "First_Name",
+    "Last_Name",
+    "Full_Name",
 ]
 
 TRAINING_FEATURES = [
@@ -284,6 +338,11 @@ FINAL_FEATURES = TRAINING_FEATURES
 # load — a mismatch means the artifact was trained on a different feature set
 # and must be rejected rather than served silently.
 # Updates automatically whenever TRAINING_FEATURES changes; no manual bump needed.
+#
+# CAUTION: this hash only tracks feature *names*, not dtypes. The
+# Strand_Program_Match int->str change (see CHANGELOG above) does NOT change
+# this hash. Retrain and manually verify ModelRegistry metadata after pulling
+# that fix — don't rely on this version check to catch it.
 import hashlib as _hashlib, json as _json
 FEATURE_SCHEMA_VERSION: str = _hashlib.sha1(
     _json.dumps(sorted(TRAINING_FEATURES)).encode()
@@ -297,7 +356,11 @@ PREDICTION_ID_COLUMN = "Student_ID"
 PREDICTION_FEATURES: list[str] = [PREDICTION_ID_COLUMN] + TRAINING_FEATURES
 
 _PREDICTION_FEATURE_DEFAULTS: dict[str, Any] = {
-    "Strand_Program_Match":    0.5,
+    # FIX: was 0.5 (a numeric midpoint) under the old int-coded scheme.
+    # Strand_Program_Match is now a string category — "unknown" is the
+    # correct default for a prediction row with no strand data, matching
+    # what _strand_match() itself returns for missing/unmapped strands.
+    "Strand_Program_Match":    "unknown",
     "Financial_Stress":        3,
     "First_Gen_Student":       0,
     "Has_Scholarship":         0,
@@ -468,6 +531,13 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["HS_Performance_Tier"] = hs_gpa.apply(_hs_tier)
 
     # ── 3. Strand–Program Alignment ───────────────────────────────────────────
+    # FIX: now returns a string category ("full_match" / "partial_match" /
+    # "no_match" / "unknown") instead of an int (0/1/2). The old integers
+    # implied a false ordinal relationship (2 > 1 > 0) between two kinds of
+    # match that aren't actually ordered, and had no distinct signal for a
+    # genuinely missing/unmapped strand. DataPipeline.encode_categorical()
+    # will now one-hot / label-encode this as a category, not scale it as
+    # a continuous number. See CHANGELOG in the module docstring.
     df["Strand_Program_Match"] = df.apply(
         lambda r: _strand_match(r.get("SHS_Strand", ""), r.get("Program", "")),
         axis=1,
@@ -502,10 +572,9 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Financial_Stress"] = stress.fillna(3).clip(lower=1, upper=10).astype(int)
 
     # ── 7. Gap Years ──────────────────────────────────────────────────────────
-    # FIX: Year_Enrolled stores plain 4-digit integers (e.g. 2023), not date
-    # strings. pd.to_datetime("2023") silently coerces many values to NaT,
-    # producing NaN years that crash the subsequent .astype(int).
-    # pd.to_numeric correctly parses year integers from all portal formats.
+    # Year_Enrolled stores plain 4-digit integers (e.g. 2023), not date
+    # strings. pd.to_numeric correctly parses year integers from all portal
+    # formats (pd.to_datetime("2023") would silently coerce many to NaT).
     yr_grad = pd.to_numeric(
         df.get("Year_Graduated", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
@@ -514,8 +583,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         df.get("Year_Enrolled", pd.Series(dtype=float, index=df.index)),
         errors="coerce",
     )
+    # FIX: removed the extra "- 1". Philippine HS graduation (Mar/Apr) and
+    # college enrollment (Jun/Aug) fall in the SAME calendar year for
+    # immediate enrollees, so Year_Enrolled - Year_Graduated == 0 already
+    # means "no gap." The old "- 1" treated same-year enrollment as a gap,
+    # so after clip(lower=0) every student — gap or no gap — collapsed to
+    # the same value (confirmed: 100% of a 3,358-student real cohort came
+    # out as 0 under the old formula). See CHANGELOG in the module docstring.
     df["Gap_Years"] = (
-        (yr_enrl - yr_grad - 1).clip(lower=0).fillna(0).astype(int)
+        (yr_enrl - yr_grad).clip(lower=0).fillna(0).astype(int)
     )
 
     # ── 8. Private HS ─────────────────────────────────────────────────────────
@@ -539,7 +615,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     age_median = age_raw.median()
     age_filled = age_raw.fillna(age_median if pd.notna(age_median) else 18)
 
-    # FIX: pd.cut is called on the already-filled series so there are no NaN
+    # pd.cut is called on the already-filled series so there are no NaN
     # inputs that would produce NaN categories. Without this, students with
     # missing Birthdate got NaN Age_Group, breaking encode_categorical() later.
     df["Age_Group"] = pd.cut(
@@ -551,6 +627,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Age_At_Enrollment"] = age_filled.astype(float)
 
     # ── 11. Distance from campus ──────────────────────────────────────────────
+    # NOTE: audited against real data — the low cardinality of Distance_KM
+    # (as few as 3 unique values in a single-campus catchment) reflects the
+    # real number of distinct municipalities in the source data, not a
+    # geocoding bug. Left unchanged.
     municipality = pd.Series("", index=df.index)
 
     def _normalise_muni(raw: str) -> str:
@@ -845,18 +925,29 @@ def _hs_tier(v: Any) -> int:
     return 2
 
 
-def _strand_match(strand, program) -> int:
+def _strand_match(strand, program) -> str:
+    """
+    Classify strand-program alignment as an explicit category, not a
+    number. See CHANGELOG in the module docstring for why this replaced
+    the old int-returning version (0/1/2 falsely implied ordinality, and
+    missing/unmapped strands had no distinct signal).
+
+    Returns one of: "full_match", "partial_match", "no_match", "unknown".
+    """
     s = str(strand).upper().strip()
     p = str(program).upper().strip()
 
+    if not s or s in ("NAN", "NONE", "N/A", ""):
+        return "unknown"
+
     aligned = _STRAND_MAP.get(s)
     if aligned is None:
-        return -1
+        return "unknown"
     if p in aligned:
-        return 2
+        return "full_match"
     if s in {"TVL", "GAS"}:
-        return 1
-    return 0
+        return "partial_match"
+    return "no_match"
 
 
 def _is_truthy(v: Any) -> bool:

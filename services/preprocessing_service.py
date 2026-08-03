@@ -74,6 +74,15 @@ class CleaningEngine:
                         if not row[idx].strip():
                             row[idx] = fill
 
+            elif op == "fill_missing_none":
+                col = step["params"].get("col")
+                if col in h:
+                    idx = h.index(col)
+                    for row in r:
+                        if not row[idx].strip():
+                            row[idx] = "None"
+
+
             elif op == "fill_missing_value":
                 col = step["params"].get("col")
                 value = step["params"].get("value", "")

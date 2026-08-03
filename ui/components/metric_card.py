@@ -38,6 +38,7 @@ class MetricCard(QFrame):
 
         self._title_lbl = QLabel(title)
         self._title_lbl.setObjectName("metricTitle")
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title_lbl.setStyleSheet(
             f"color:{accent}; font-size:11px; font-weight:700; "
             "letter-spacing:0.6px; background:transparent; "
@@ -55,11 +56,13 @@ class MetricCard(QFrame):
 
         self._value_lbl = QLabel(value)
         self._value_lbl.setObjectName("metricValue")
+        self._value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._value_lbl)
 
         if status:
             self._status_lbl = QLabel(status)
             self._status_lbl.setObjectName("metricStatus")
+            self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(self._status_lbl)
         else:
             self._status_lbl = None
@@ -67,6 +70,7 @@ class MetricCard(QFrame):
         if remarks:
             self._remarks_lbl = QLabel(remarks)
             self._remarks_lbl.setObjectName("metricRemarks")
+            self._remarks_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(self._remarks_lbl)
         else:
             self._remarks_lbl = None

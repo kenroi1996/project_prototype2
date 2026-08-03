@@ -568,7 +568,7 @@ class ModelTrainingPage(PredictionMixin, QWidget):
         rf_name = QLabel("Random Forest")
         rf_name.setObjectName("mlModelName")
         rf_tags = QLabel(
-            "Ensemble · Handles class imbalance · Interpretable feature importances"
+            "Interpretable feature importances"
         )
         rf_tags.setObjectName("mlModelTags")
         rf_title_col.addWidget(rf_name)

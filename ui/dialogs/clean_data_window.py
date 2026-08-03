@@ -375,14 +375,15 @@ class CleanDataWindow(QDialog):
         # added: the correct listwise-deletion action for a missing target
         # (e.g. Final_Avg_GRD) or any other column you consider required.
         actions = [
-            ("⬜  Fill Missing — Mean", self._act_fill_mean),
-            ("⬜  Fill Missing — Median", self._act_fill_median),
-            ("⬜  Fill Missing — Mode", self._act_fill_mode),
-            ("🗑  Drop Rows — Missing Value", self._act_drop_missing_rows),
-            ("🗑  Remove Duplicates", self._act_remove_dupes),
-            ("🗑  Remove Empty Rows", self._act_remove_empty),
-            ("📊  Remove Outliers (3σ)", self._act_outliers),
-            ("✂  Drop Column", self._act_drop_col),
+            ("Fill Missing — Mean", self._act_fill_mean),
+            ("Fill Missing — Median", self._act_fill_median),
+            ("Fill Missing — Mode", self._act_fill_mode),
+            ("Fill Missing — None", self._act_fill_none),   # NEW
+            ("Drop Rows — Missing Value", self._act_drop_missing_rows),
+            ("Remove Duplicates", self._act_remove_dupes),
+            ("Remove Empty Rows", self._act_remove_empty),
+            ("Remove Outliers (3σ)", self._act_outliers),
+            ("Drop Column", self._act_drop_col),
         ]
         for label, slot in actions:
             btn = QPushButton(label)
@@ -932,6 +933,15 @@ class CleanDataWindow(QDialog):
             return
         self._run_step({"op": "fill_missing_mode", "params": {"col": col},
                         "label": f"Fill Missing (Mode) → {col}"})
+
+    def _act_fill_none(self):
+            col = self._selected_col()
+            if not col:
+                self._toast("Select a target column first.")
+                return
+            self._run_step({"op": "fill_missing_none", "params": {"col": col},
+                            "label": f"Fill Missing (None) → {col}"})
+
 
     def _act_drop_missing_rows(self):
         col = self._selected_col()

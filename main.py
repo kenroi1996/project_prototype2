@@ -41,3 +41,5 @@ if __name__ == "__main__":
     from ui.counselor_window import _launch_for_role
     _launch_for_role(dialog.db_conn)
     sys.exit(app.exec())
+
+    
