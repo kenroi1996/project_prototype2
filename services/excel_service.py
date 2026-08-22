@@ -1,4 +1,3 @@
-"""Excel reading utilities using pandas."""
 
 import pandas as pd
 from pathlib import Path

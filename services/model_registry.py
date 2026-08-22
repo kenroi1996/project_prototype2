@@ -47,35 +47,22 @@ def _current_schema_version() -> str:
     """
     Return the feature schema version fingerprint.
 
-    Tries to import FEATURE_SCHEMA_VERSION from feature_engineering first.
-    If the import fails (e.g. due to a path issue), recomputes the fingerprint
-    directly from TRAINING_FEATURES so schema versioning never silently falls
-    back to "unknown".
+    FIX: previously fell back to a hardcoded, duplicate copy of
+    TRAINING_FEATURES when the bare `import feature_engineering` failed —
+    which it always does under the app's real entry point (main.py runs
+    from the project root and imports everything as `services.X`, so
+    `feature_engineering` is only reachable as `services.feature_engineering`,
+    never bare). That stale fallback list still had "Sex_code" in it,
+    producing a schema hash that never matched the real TRAINING_FEATURES —
+    every model trained through the actual app was carrying a wrong
+    fingerprint. Mirrors the same two-step import already used correctly
+    in TrainingEngine._prepare_features().
     """
     try:
         from feature_engineering import FEATURE_SCHEMA_VERSION
-        return FEATURE_SCHEMA_VERSION
     except ImportError:
-        pass
-
-    # Fallback: recompute from the canonical feature list directly.
-    # Must stay in sync with TRAINING_FEATURES in feature_engineering.py.
-    import hashlib, json
-    _TRAINING_FEATURES = [
-        "Entrance_Exam_Score", "HS_GPA", "Strand_Program_Match",
-        "Financial_Stress", "First_Gen_Student", "Has_Scholarship",
-        "Gap_Years", "Private_HS", "Has_HS_Honors", "Age_At_Enrollment",
-        "Age_Group", "Distance_KM", "Distance_Bucket", "Program", "Sex_code",
-    ]
-    version = hashlib.sha1(
-        json.dumps(sorted(_TRAINING_FEATURES)).encode()
-    ).hexdigest()[:8]
-    print(
-        f"[ModelRegistry] WARNING: could not import FEATURE_SCHEMA_VERSION "
-        f"from feature_engineering — computed fallback: {version}. "
-        f"Check that feature_engineering.py is on the Python path."
-    )
-    return version
+        from services.feature_engineering import FEATURE_SCHEMA_VERSION
+    return FEATURE_SCHEMA_VERSION
 
 
 class ModelRegistry:

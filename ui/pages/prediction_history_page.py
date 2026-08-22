@@ -14,6 +14,11 @@ Changes
   plus any dim_student rows left fully orphaned as a result (students with
   no remaining record in any other term). Students still active in another
   term are never touched.
+- _DeleteTermWorker now also deletes every LLM-generated intervention
+  record logged against the deleted term (public.interventions, matched
+  directly on academic_year/semester — that table isn't term_key-scoped,
+  so no orphan-check is needed, unlike the dim_student step). The
+  confirmation dialog and success message now disclose this.
 - Removed the "Name" column from the table (and the full_name field from
   each row dict) per data privacy requirements — the Student ID is the
   sole displayed identifier. NOTE: if CohortReportGenerator (used by
@@ -161,10 +166,11 @@ class _DeleteTermWorker(QThread):
     Deletes all fact_student_academic_risk rows for a given term, then
     also deletes any dim_student rows that become fully orphaned as a
     result — i.e. students who have NO remaining fact_student_academic_risk
-    rows left in ANY term after this deletion.
+    rows left in ANY term after this deletion. Also deletes every
+    LLM-generated intervention record logged against this term.
 
-    Does NOT delete the dim_academic_term row itself — just the fact data
-    and any now-orphaned student dimension rows.
+    Does NOT delete the dim_academic_term row itself — just the fact data,
+    any now-orphaned student dimension rows, and this term's interventions.
 
     IMPORTANT: dim_student is NOT term-scoped — one row is shared across
     every term a student appears in. A student with records in multiple
@@ -174,8 +180,17 @@ class _DeleteTermWorker(QThread):
     enforced with a single atomic CTE query, not two separate statements,
     so a crash between steps can't leave the database in a half-deleted
     state.
+
+    INTERVENTIONS: unlike fact_student_academic_risk, public.interventions
+    stores academic_year/semester directly on each row rather than through
+    a term_key foreign key (see InterventionsService — it filters the same
+    way). That means no orphan-check is needed here: every intervention
+    row matching this term's (academic_year, semester) was generated from
+    predictions in this term, and gets removed unconditionally alongside
+    them, in the same transaction as the fact/student deletes above.
     """
-    finished = pyqtSignal(int, int)   # (fact rows deleted, dim_student rows deleted)
+    finished = pyqtSignal(int, int, int)
+    # (fact rows deleted, dim_student rows deleted, interventions deleted)
     error    = pyqtSignal(str)
 
     def __init__(self, academic_year: str, semester: int):
@@ -226,8 +241,22 @@ class _DeleteTermWorker(QThread):
                     """, (affected_keys,))
                     students_deleted = cur.rowcount
 
+                # Step 3: delete this term's LLM-generated interventions.
+                # No join/orphan-check needed — academic_year/semester are
+                # stored directly on public.interventions (see
+                # InterventionsService's own search queries, which filter
+                # the same way), so every row matching this term belongs
+                # to it unconditionally.
+                cur.execute("""
+                    DELETE FROM public.interventions
+                    WHERE academic_year = %s
+                      AND semester      = %s
+                    RETURNING intervention_id
+                """, (self._ay, self._sem))
+                interventions_deleted = cur.rowcount
+
             conn.commit()
-            self.finished.emit(facts_deleted, students_deleted)
+            self.finished.emit(facts_deleted, students_deleted, interventions_deleted)
         except Exception as exc:
             try:
                 conn.rollback()
@@ -704,10 +733,11 @@ class PredictionHistoryPage(QWidget):
         )
         msg.setInformativeText(
             f"This will remove {len(self._rows):,} student records from the "
-            f"database. Students with no remaining predictions in any other "
-            f"term will also be removed from the system; students who still "
-            f"have records in another term are kept. This action cannot be "
-            f"undone."
+            f"database, along with any AI-generated intervention "
+            f"recommendations logged for this term. Students with no "
+            f"remaining predictions in any other term will also be removed "
+            f"from the system; students who still have records in another "
+            f"term are kept. This action cannot be undone."
         )
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setStandardButtons(
@@ -762,7 +792,8 @@ class PredictionHistoryPage(QWidget):
         self._delete_worker.error.connect(self._delete_worker.deleteLater)
         self._delete_worker.start()
 
-    def _on_delete_done(self, deleted: int, students_deleted: int):
+    def _on_delete_done(self, deleted: int, students_deleted: int,
+                        interventions_deleted: int):
         ay  = self._ay_combo.currentText().strip()
         sem = self._sem_combo.currentIndex() + 1
         sem_label = "1st" if sem == 1 else "2nd"
@@ -788,28 +819,24 @@ class PredictionHistoryPage(QWidget):
         # Notify other pages (Dashboard, Counselor window) that the term
         # list changed, since their own term selectors are populated once
         # at startup and would otherwise keep showing the now-deleted term.
+        # Interventions page listens for this too, so it drops the deleted
+        # term's now-gone logs from its own view without a manual refresh.
         DataStore.get()._notify("terms_changed")
-
-        student_note = (
-           # f"{students_deleted:,} student(s) with no remaining records in "
-            #f"any other term were also removed from the system."
-            #if students_deleted > 0 else
-            #"No students were fully removed — all affected students still "
-            #"have records in another term."
-        )
 
         # Use the app's own styled dialog (matches every other success/error
         # dialog in this file) instead of a raw QMessageBox, which renders
         # with the default OS theme and looks out of place against the
         # rest of the dark UI.
         from ui.dialogs.confirmation_dialog import show_info
+        interventions_note = (
+            f" and {interventions_deleted:,} intervention log(s)"
+            if interventions_deleted > 0 else ""
+        )
         show_info(
             self,
             "Deleted",
-            f"Successfully deleted {deleted:,} prediction records for "
-            f"{ay} — {sem_label} Semester.",
-            #f"The academic term entry is kept; only the prediction data "
-            #f"was removed.\n\n{student_note}",
+            f"Successfully deleted {deleted:,} prediction records"
+            f"{interventions_note} for {ay} — {sem_label} Semester.",
         )
 
     def _on_delete_error(self, msg: str):

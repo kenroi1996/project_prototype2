@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-01T11:55:44.761925",
+  "timestamp": "2026-08-03T22:00:54.971223",
   "model_id": "rf",
   "model_name": "Random Forest",
   "feature_names": [
@@ -29,9 +29,9 @@
     "Program_BSIT"
   ],
   "feature_count": 24,
-  "feature_schema_version": "a1273cb3",
-  "pkl_path": "D:\\project_prototype_2\\ml\\saved_models\\model_20260801_115544.pkl",
-  "saved_at": "model_20260801_115544.pkl",
+  "feature_schema_version": "759237da",
+  "pkl_path": "D:\\project_prototype_2\\ml\\saved_models\\model_20260803_220054.pkl",
+  "saved_at": "model_20260803_220054.pkl",
   "has_preprocessor": false,
   "model_size_bytes": 6414587,
   "stored_in_db": true
