@@ -649,7 +649,7 @@ class DataMergePipelinePage(PredictionMixin, QWidget):
 
         score_header = QHBoxLayout()
         score_lbl = QLabel("DATA QUALITY SCORE")
-        score_lbl.setObjectName("mergeQualityLabel")
+        score_lbl.setObjectName("pipelineCardTitle")
         self._quality_pct = QLabel("—%")
         self._quality_pct.setObjectName("mergeQualityPct")
         score_header.addWidget(score_lbl)

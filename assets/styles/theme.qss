@@ -112,7 +112,20 @@
                 background-color: rgba(0, 0, 0, 0.2);
                 border-radius: 15px;
                 padding: 15px;
-                border-top: 4px solid #FFFF00;
+                border-top: 4px solid rgba(255,255,255,0.15);
+            }
+            #metricStatus {
+                font-size: 12px;
+                font-weight: 600;
+                color: rgba(255, 255, 255, 0.40);
+            }
+            #metricRemarks {
+                font-size: 11px;
+                color: rgba(255, 255, 255, 0.30);
+            }
+            #analyticsText {
+                font-size: 12px;
+                color: rgba(255, 255, 255, 0.35);
             }
             #metricValue {
                 font-size: 20px;
@@ -180,14 +193,12 @@
                 border-radius: 24px;
                 border: 1px solid rgba(255,255,255,0.08);
             }
-
-            #coverageTitle {
-                font-size: 15px;
+            #portalCardTitle {
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 11px;
                 font-weight: bold;
-                color: rgba(255,255,255,0.65);
                 letter-spacing: 1px;
             }
-
             #sourceHeader {
                 font-size: 14px;
                 font-weight: bold;
@@ -237,12 +248,6 @@
                 background-color: rgba(0, 0, 0, 0.2);
                 border-radius: 15px;
                 border-top: 4px solid #4f8cff;
-            }
-            #activityTitle {
-                font-size: 14px;
-                font-weight: bold;
-                color: rgba(255,255,255,0.7);
-                letter-spacing: 1px;
             }
             #activityLiveDot {
                 color: #34d399;

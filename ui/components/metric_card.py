@@ -81,14 +81,21 @@ class MetricCard(QFrame):
 
     def update_values(
         self,
-        value:   str = None,
-        status:  str = None,
-        remarks: str = None,
+        value:        str = None,
+        status:       str = None,
+        remarks:      str = None,
+        status_color: str = None,
     ):
         """Update displayed values without rebuilding the widget."""
         if value is not None:
             self._value_lbl.setText(value)
         if status is not None and self._status_lbl is not None:
             self._status_lbl.setText(status)
+            if status_color:
+                self._status_lbl.setStyleSheet(
+                    f"color:{status_color}; font-weight:700; "
+                    "font-size:12px; background:transparent;")
+            else:
+                self._status_lbl.setStyleSheet("")   # fall back to dimmed #metricStatus default
         if remarks is not None and self._remarks_lbl is not None:
             self._remarks_lbl.setText(remarks)

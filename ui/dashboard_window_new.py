@@ -1,4 +1,5 @@
 import sys
+import math
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -21,6 +22,7 @@ from PyQt6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     QRect,
+    QRectF,
     QTimer,
     QSize,
     QMargins,
@@ -30,6 +32,7 @@ from PyQt6.QtGui import (
     QColor,
     QFont,
     QLinearGradient,
+    QRadialGradient,
     QPainter,
     QBrush,
     QPixmap,
@@ -76,12 +79,59 @@ _PAGE_IDX = {
 
 
 class AnimatedBackground(QWidget):
+    
+    _COLORS = ["#4f8cff", "#a78bfa", "#34d399"]
+
     def __init__(self):
         super().__init__()
+        self._t = 0.0
+        self._bg_timer = QTimer(self)
+        self._bg_timer.timeout.connect(self._tick)
+        self._bg_timer.start(60)   # ~16 fps
+
+    def _tick(self) -> None:
+        self._t += 0.010
+        self.update()
 
     def paintEvent(self, event):
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#13172a"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        base = QLinearGradient(0, 0, w, h)
+        base.setColorAt(0.0, QColor("#0d1020"))
+        base.setColorAt(1.0, QColor("#161b32"))
+        painter.fillRect(self.rect(), base)
+
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+        specs = [
+            (0.20, 0.30, 1.00, 0.7, 0.0),
+            (0.75, 0.65, 0.80, 1.0, 2.1),
+            (0.45, 0.80, 1.30, 0.6, 4.2),
+        ]
+        for i, (cx, cy, fx, fy, phase) in enumerate(specs):
+            dx = math.sin(self._t * fx + phase) * 0.10
+            dy = math.cos(self._t * fy + phase) * 0.10
+            x  = (cx + dx) * w
+            y  = (cy + dy) * h
+            r  = min(w, h) * 0.35
+
+            color = QColor(self._COLORS[i % len(self._COLORS)])
+            glow  = QColor(color); glow.setAlpha(50)
+            edge  = QColor(color); edge.setAlpha(0)
+
+            grad = QRadialGradient(x, y, r)
+            grad.setColorAt(0.0, glow)
+            grad.setColorAt(1.0, edge)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(grad)
+            painter.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
+
+        painter.end()
 
 
 class DashboardWindow(AnimatedBackground):
@@ -179,7 +229,7 @@ class DashboardWindow(AnimatedBackground):
         # Logo
         title_layout = QHBoxLayout()
         logo_label = QLabel()
-        pixmap = QPixmap("assets/main_logo.png")
+        pixmap = QPixmap("assets/images/Cebu_Technological_University_Logo-removebg-preview.png")
         logo_label.setPixmap(
             pixmap.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio)
         )
@@ -218,14 +268,14 @@ class DashboardWindow(AnimatedBackground):
         sidebar_layout.setContentsMargins(0, 10, 4, 10)
         sidebar_layout.setSpacing(12)
 
-        # ── OVERVIEW ─────────────────────────────────────────────────
+         # ── OVERVIEW ─────────────────────────────────────────────────
         sidebar_layout.addWidget(self._section_label("OVERVIEW SECTION"))
 
         for text, icon, key in [
-            ("Dashboard",     "assets/icons/dashboard.svg",       "Dashboard"),
-            ("Data Analytics","assets/icons/analytics.png",       "Data Analytics"),
-            ("Risk Alerts",   "assets/icons/risk-alerts.svg",     "Risk Alerts"),
-            ("Student Cohort","assets/icons/student-cohorts.svg", "Student Cohort"),
+            ("Dashboard",      "assets/icons/dashboard.svg",       "Dashboard"),
+            ("Data Analytics", "assets/icons/analytics.png",       "Data Analytics"),
+            ("Risk Alerts",    "assets/icons/risk-alerts.svg",     "Risk Alerts"),
+            ("Student Cohort", "assets/icons/student-cohorts.svg", "Student Cohort"),
         ]:
             idx = _PAGE_IDX[key]
             btn = self.create_nav_button(text, icon)
@@ -240,14 +290,14 @@ class DashboardWindow(AnimatedBackground):
         # ── DATA UPLOADS ──────────────────────────────────────────────
         sidebar_layout.addWidget(self._section_label("DATA UPLOADS"))
 
-        for text, key in [
-            ("MIS Portal",       "MIS Portal"),
-            ("SAO Portal",       "SAO Portal"),
-            ("Guidance Portal",  "Guidance Portal"),
-            ("Registrar Portal", "Registrar Portal"),
+        for text, icon, key in [
+            ("MIS Portal",       "assets/icons/mis-portal.svg",       "MIS Portal"),
+            ("SAO Portal",       "assets/icons/sao-portal.svg",       "SAO Portal"),
+            ("Guidance Portal",  "assets/icons/guidance-portal.svg",  "Guidance Portal"),
+            ("Registrar Portal", "assets/icons/registrar-portal.svg", "Registrar Portal"),
         ]:
             idx = _PAGE_IDX[key]
-            btn = self.create_nav_button(text, "assets/icons/check.svg")
+            btn = self.create_nav_button(text, icon)
             self.nav_buttons[key] = btn
             btn.clicked.connect(
                 lambda _, i=idx, k=key: self.on_nav_button_clicked(k, i)
@@ -277,8 +327,8 @@ class DashboardWindow(AnimatedBackground):
         sidebar_layout.addWidget(self._section_label("PREDICTION"))
 
         for text, icon, key in [
-            ("Prediction",         "assets/icons/play.svg",    "Prediction"),
-            ("Prediction History", "assets/icons/play.svg",    "Prediction History"),  # ← NEW
+            ("Prediction",         "assets/icons/play.svg",              "Prediction"),
+            ("Prediction History", "assets/icons/prediction-history.svg","Prediction History"),
         ]:
             idx = _PAGE_IDX[key]
             btn = self.create_nav_button(text, icon)
@@ -295,7 +345,7 @@ class DashboardWindow(AnimatedBackground):
             sidebar_layout.addWidget(self._section_label("ADMINISTRATION"))
             idx  = _PAGE_IDX["Settings"]
             key  = "Settings"
-            btn  = self.create_nav_button("Settings", "assets/icons/check.svg")
+            btn  = self.create_nav_button("Settings", "assets/icons/settings-gear.svg")
             self.nav_buttons[key] = btn
             btn.clicked.connect(
                 lambda _, i=idx, k=key: self.on_nav_button_clicked(k, i)
@@ -424,6 +474,7 @@ class DashboardWindow(AnimatedBackground):
 
     def closeEvent(self, event):
         """Clean up page listeners and workers before window is destroyed."""
+        self._bg_timer.stop()
         try:
             from services.data_store import DataStore
             store = DataStore.get()

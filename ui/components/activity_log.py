@@ -77,8 +77,8 @@ class ActivityLogPanel(QFrame):
         header = QHBoxLayout()
         header.setSpacing(10)
 
-        title = QLabel("RECENT ACTIVITY")
-        title.setObjectName("activityTitle")
+        title = QLabel("Recent Activity")
+        title.setObjectName("cardTitle")
 
         live_dot = QLabel("●")
         live_dot.setObjectName("activityLiveDot")
@@ -97,7 +97,7 @@ class ActivityLogPanel(QFrame):
         self._scroll.setObjectName("activityScroll")
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setFixedHeight(150)
+        self._scroll.setFixedHeight(130)
 
         self._list_host = QWidget()
         self._list_host.setObjectName("activityListHost")

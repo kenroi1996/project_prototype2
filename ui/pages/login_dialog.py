@@ -28,9 +28,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, QTimer,
-    QThread, pyqtSignal, QRectF,
+    QThread, pyqtSignal, QRectF, QPointF,
 )
-from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen
+from PyQt6.QtGui import (
+    QFont, QKeyEvent, QPainter, QColor, QPen,
+    QPainterPath, QLinearGradient, QRadialGradient, QPixmap,
+)
+
 
 
 # ── Background auth worker ────────────────────────────────────────────────────
@@ -114,6 +118,157 @@ class _Spinner(QWidget):
         p.drawArc(rect, (-self._angle) * 16, 270 * 16)
 
 
+# ── Password visibility toggle ──────────────────────────────────────────────
+
+class _EyeToggleButton(QPushButton):
+    """
+    Password-visibility toggle drawn with QPainter instead of an emoji
+    glyph (👁 / 🙈). Emoji rendering varies by OS/font and reads as
+    informal; a hand-drawn line icon looks consistent everywhere and
+    matches the QPainter-only approach already used for _Spinner and
+    the ambient background.
+
+    Unchecked (password hidden)  -> plain open-eye icon  ("click to reveal")
+    Checked   (password visible) -> eye icon with a slash ("click to hide")
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setText("")   # icon-only; no glyph/text drawn by QPushButton
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)   # QSS background/border/hover chrome
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        color = QColor("#ffffff") if self.underMouse() else QColor(255, 255, 255, 140)
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        cx, cy   = self.width() / 2, self.height() / 2
+        eye_w    = 17.0
+        eye_h    = 9.5
+
+        outline = QPainterPath()
+        outline.moveTo(cx - eye_w / 2, cy)
+        outline.quadTo(cx, cy - eye_h, cx + eye_w / 2, cy)
+        outline.quadTo(cx, cy + eye_h, cx - eye_w / 2, cy)
+        p.drawPath(outline)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QRectF(cx - 2.1, cy - 2.1, 4.2, 4.2))
+
+        if self.isChecked():
+            # Password currently visible — slash through the eye,
+            # matching the standard eye / eye-off icon pairing.
+            p.setPen(pen)
+            p.drawLine(
+                QPointF(cx - eye_w / 2 - 1, cy + eye_h / 2 + 1),
+                QPointF(cx + eye_w / 2 + 1, cy - eye_h / 2 - 1),
+            )
+
+        p.end()
+
+
+# ── Ambient background ────────────────────────────────────────────────────────
+
+class _AmbientGlow(QWidget):
+    """
+    Soft, slow-drifting glow behind the login card — three translucent
+    blobs in the app's existing accent colors (blue / purple / green,
+    same palette as the Analytics page), each following its own gentle
+    sine path so they never move in lockstep. Purely decorative and
+    intentionally subtle: WA_TransparentForMouseEvents so it never
+    intercepts clicks or the frameless-window drag handled by
+    LoginDialog itself. No external assets, no WebEngine — same
+    QPainter-only approach already used for _Spinner and the
+    Municipality Risk Map.
+    """
+
+    _COLORS = ["#4f8cff", "#a78bfa", "#34d399"]
+
+    def __init__(self, parent=None, radius: int = 20):
+        super().__init__(parent)
+        self._radius = radius
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._t = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(40)   # ~25 fps — smooth but easy on CPU
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _tick(self) -> None:
+        self._t += 0.015
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Clip everything to a rounded rect matching the login card so
+        # the whole window reads as one cohesive floating panel.
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, w, h), self._radius, self._radius)
+        p.setClipPath(path)
+
+        # Base panel — same dark-navy family as #loginCard, with a
+        # faint diagonal shift so it isn't perfectly flat.
+        base = QLinearGradient(0, 0, w, h)
+        base.setColorAt(0.0, QColor("#0d1020"))
+        base.setColorAt(1.0, QColor("#161b32"))
+        p.fillRect(QRectF(0, 0, w, h), base)
+
+        # Three drifting glow blobs on independent Lissajous-style paths.
+        # Additive blending gives the overlaps a soft "light" bloom
+        # instead of muddying into grey.
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+        specs = [
+            (0.30, 0.35, 1.00, 0.7, 0.0),
+            (0.72, 0.62, 0.80, 1.0, 2.1),
+            (0.48, 0.22, 1.30, 0.6, 4.2),
+        ]
+        for i, (cx, cy, fx, fy, phase) in enumerate(specs):
+            dx = math.sin(self._t * fx + phase) * 0.16
+            dy = math.cos(self._t * fy + phase) * 0.12
+            x  = (cx + dx) * w
+            y  = (cy + dy) * h
+            r  = min(w, h) * 0.38
+
+            color = QColor(self._COLORS[i % len(self._COLORS)])
+            glow  = QColor(color); glow.setAlpha(70)
+            edge  = QColor(color); edge.setAlpha(0)
+
+            grad = QRadialGradient(x, y, r)
+            grad.setColorAt(0.0, glow)
+            grad.setColorAt(1.0, edge)
+
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(grad)
+            p.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
+
+        p.end()
+
+
 # ── Login Dialog ──────────────────────────────────────────────────────────────
 
 class LoginDialog(QDialog):
@@ -126,7 +281,7 @@ class LoginDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("EarlyAlert — Login")
         self.setModal(True)
-        self.setFixedSize(440, 560)
+        self.setFixedSize(440, 640)              # ← was (440, 560)
         self.setWindowFlags(
             Qt.WindowType.Dialog |
             Qt.WindowType.FramelessWindowHint
@@ -138,6 +293,13 @@ class LoginDialog(QDialog):
         self._worker: _AuthWorker | None = None
         self._build_ui()
         self._apply_styles()
+
+        # Ambient animated backdrop — fills the whole dialog, sits behind
+        # the card. Not part of the layout (manual geometry) since it's
+        # purely decorative and the window is fixed-size.
+        self._bg = _AmbientGlow(self, radius=20)
+        self._bg.setGeometry(0, 0, 440, 640)     # ← was (0, 0, 440, 560)
+        self._bg.lower()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -169,9 +331,20 @@ class LoginDialog(QDialog):
         # Logo
         logo_row = QHBoxLayout()
         logo_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo = QLabel("🎓")
+        logo = QLabel()
         logo.setObjectName("loginLogo")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap("assets/images/Cebu_Technological_University_Logo-removebg-preview.png")
+        if not pixmap.isNull():
+            pixmap = pixmap.scaledToHeight(
+                120, Qt.TransformationMode.SmoothTransformation)
+            logo.setPixmap(pixmap)
+        else:
+            logo.setText("🎓")   # fallback if the file is ever missing/renamed
+        logo_row.addWidget(logo)
+        layout.addLayout(logo_row)
+        layout.addSpacing(12)
+
         logo_row.addWidget(logo)
         layout.addLayout(logo_row)
         layout.addSpacing(12)
@@ -209,7 +382,7 @@ class LoginDialog(QDialog):
         self._password.setEchoMode(QLineEdit.EchoMode.Password)
         self._password.returnPressed.connect(self._on_login)
 
-        self._toggle_btn = QPushButton("👁")
+        self._toggle_btn = _EyeToggleButton()
         self._toggle_btn.setObjectName("loginToggleBtn")
         self._toggle_btn.setFixedSize(36, 38)
         self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -270,12 +443,9 @@ class LoginDialog(QDialog):
         return lbl
 
     def _toggle_password_visibility(self, checked: bool) -> None:
-        if checked:
-            self._password.setEchoMode(QLineEdit.EchoMode.Normal)
-            self._toggle_btn.setText("🙈")
-        else:
-            self._password.setEchoMode(QLineEdit.EchoMode.Password)
-            self._toggle_btn.setText("👁")
+        self._password.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
 
     # ── Loading state ─────────────────────────────────────────────────────────
 
@@ -425,6 +595,13 @@ class LoginDialog(QDialog):
 
     # ── Window guards ─────────────────────────────────────────────────────────
 
+    def done(self, r) -> None:
+        # Stop the background animation timer once the dialog is
+        # accepted/rejected so it doesn't keep ticking after the login
+        # screen is gone.
+        self._bg.stop()
+        super().done(r)
+
     def closeEvent(self, event) -> None:
         if self.result() == QDialog.DialogCode.Rejected and not self.isVisible():
             super().closeEvent(event)
@@ -483,7 +660,7 @@ class LoginDialog(QDialog):
                 color: #ff5b5b;
             }
 
-            #loginLogo    { font-size: 48px; background: transparent; }
+            #loginLogo    {background: transparent; }
             #loginAppName {
                 color: #e8eaf0; font-size: 26px; font-weight: 800;
                 letter-spacing: 1px; background: transparent;

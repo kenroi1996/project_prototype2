@@ -628,7 +628,7 @@ class CounselorWindow(_Bg):
         # PREDICTION
         nav_lo.addWidget(self._section_label("PREDICTION"))
         btn = self.create_nav_button(
-            "Prediction History", "assets/icons/play.svg")
+            "Prediction History", "assets/icons/prediction-history.svg")
         self.nav_buttons["Prediction History"] = btn
         btn.clicked.connect(
             lambda: self.on_nav_button_clicked(
@@ -640,7 +640,7 @@ class CounselorWindow(_Bg):
         # COUNSELING
         nav_lo.addWidget(self._section_label("COUNSELING"))
         btn = self.create_nav_button(
-            "Interventions", "assets/icons/check.svg")
+            "Interventions", "assets/icons/interventions.svg")
         self.nav_buttons["Interventions"] = btn
         btn.clicked.connect(
             lambda: self.on_nav_button_clicked(
@@ -651,7 +651,7 @@ class CounselorWindow(_Bg):
 
         # ACCOUNT
         nav_lo.addWidget(self._section_label("ACCOUNT"))
-        btn = self.create_nav_button("Settings", "assets/icons/check.svg")
+        btn = self.create_nav_button("Settings", "assets/icons/settings-gear.svg")
         self.nav_buttons["Settings"] = btn
         btn.clicked.connect(
             lambda: self.on_nav_button_clicked(

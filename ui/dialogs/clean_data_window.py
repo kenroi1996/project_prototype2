@@ -233,7 +233,7 @@ class CleanDataWindow(QDialog):
 
         prog_header = QHBoxLayout()
         prog_lbl = QLabel("DATA QUALITY SCORE")
-        prog_lbl.setObjectName("cleanQualityLabel")
+        prog_lbl.setObjectName("pipelineCardTitle")
         self._quality_pct = QLabel("—%")
         self._quality_pct.setObjectName("cleanQualityPct")
         prog_header.addWidget(prog_lbl)
@@ -435,7 +435,7 @@ class CleanDataWindow(QDialog):
         # Table label
         tbl_header_row = QHBoxLayout()
         tbl_lbl = QLabel("DATASET PREVIEW")
-        tbl_lbl.setObjectName("cleanTableLabel")
+        tbl_lbl.setObjectName("pipelineCardTitle")
 
         self._row_count_lbl = QLabel("")
         self._row_count_lbl.setObjectName("cleanMutedLabel")

@@ -133,9 +133,10 @@ class _SummaryCard(QFrame):
 # Shared panel / chart helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _panel(min_height: int = 0) -> QFrame:
+def _panel(min_height: int = 0, accent: str = "#4f8cff") -> QFrame:
     f = QFrame()
     f.setObjectName("analyticsPanel")
+    f.setStyleSheet(f"#analyticsPanel {{ border-top: 4px solid {accent}; }}")
     f.setGraphicsEffect(_make_shadow())
     if min_height:
         f.setMinimumHeight(min_height)
@@ -143,7 +144,6 @@ def _panel(min_height: int = 0) -> QFrame:
     lo.setContentsMargins(20, 16, 20, 16)
     lo.setSpacing(10)
     return f
-
 
 def _panel_header(title: str, hint: str = "") -> QHBoxLayout:
     row = QHBoxLayout()

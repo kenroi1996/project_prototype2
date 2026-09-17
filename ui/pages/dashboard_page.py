@@ -43,8 +43,8 @@ the database.
 """
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFrame, QSizePolicy, QGraphicsOpacityEffect, QProgressBar,
-    QScrollArea, QGridLayout, QToolTip, QComboBox,
+    QFrame, QSizePolicy, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
+    QProgressBar, QScrollArea, QGridLayout, QToolTip, QComboBox,
 )
 from PyQt6.QtCore import (
     QTimer, Qt, QPropertyAnimation, QEasingCurve, QMargins,
@@ -71,6 +71,8 @@ from services.system_config import SystemConfig
 from services.dashboard_refresh_service import DashboardRefreshService
 from services.dashboard_term_service import DashboardTermService
 from services.prediction_engine import RISK_HIGH_LABEL, RISK_MODERATE_LABEL, RISK_LOW_LABEL
+from ui.styles.risk_colors import RISK_HIGH_HEX, RISK_MODERATE_HEX
+
 
 from workers.dashboard_workers import _InterventionRateLoader
 
@@ -190,7 +192,8 @@ class DashboardPage(PredictionMixin, QWidget):
             remarks = f"{per_student:,} per-student  (all terms)"
 
         self._metric_4.update_values(
-            value=f"{total:,}", status=status, remarks=remarks)
+            value=f"{total:,}", status=status, remarks=remarks,
+            status_color="#34d399" if status == "Active" else None)
 
     # ── Term label pill ───────────────────────────────────────────────────────
 
@@ -204,26 +207,32 @@ class DashboardPage(PredictionMixin, QWidget):
         s = result.summary
         self._all_predictions = result.predictions
 
+        m1_high = s.avg_score >= 70
         self._metric_1.update_values(
-            value   = f"{s.avg_score}%",
-            status  = RISK_HIGH_LABEL if s.avg_score >= 70 else RISK_MODERATE_LABEL,
-            remarks = f"Average across {s.total:,} students",
+            value        = f"{s.avg_score}%",
+            status       = RISK_HIGH_LABEL if m1_high else RISK_MODERATE_LABEL,
+            remarks      = f"Average across {s.total:,} students",
+            status_color = RISK_HIGH_HEX if m1_high else RISK_MODERATE_HEX,
         )
+        m2_high = s.high_risk_pct >= 30
         self._metric_2.update_values(
-            value   = f"{s.high_risk + s.moderate_risk:,}",
-            status  = RISK_HIGH_LABEL if s.high_risk_pct >= 30 else RISK_MODERATE_LABEL,
-            remarks = f"{s.high_risk_pct}% of total cohort",
+            value        = f"{s.high_risk + s.moderate_risk:,}",
+            status       = RISK_HIGH_LABEL if m2_high else RISK_MODERATE_LABEL,
+            remarks      = f"{s.high_risk_pct}% of total cohort",
+            status_color = RISK_HIGH_HEX if m2_high else RISK_MODERATE_HEX,
         )
         self._metric_3.update_values(
-            value   = f"{s.high_risk:,}",
-            status  = RISK_HIGH_LABEL,
-            remarks = (
+            value        = f"{s.high_risk:,}",
+            status       = RISK_HIGH_LABEL,
+            remarks      = (
                 f"{round(s.high_risk / s.total * 100, 1)}% flagged this run"
                 if s.total else "—"
             ),
+            status_color = RISK_HIGH_HEX,
         )
 
         self._load_intervention_rate()
+        self._update_model_status_card(result)
 
         self._risk_distribution_chart.update_chart(
             high_risk=s.high_risk,
@@ -906,6 +915,7 @@ class DashboardPage(PredictionMixin, QWidget):
 
     def _show_empty_state(self) -> None:
         self._reset_metric_cards()
+        self._show_empty_model_status()
         self._risk_distribution_chart.show_empty()
         self._risk_analytics_chart.show_empty()
         self._show_empty_shap()
@@ -963,7 +973,7 @@ class DashboardPage(PredictionMixin, QWidget):
         self.main_layout.setSpacing(20)
 
         self.main_layout.addWidget(self._build_header())
-        self.main_layout.addWidget(self._activity_log_widget())
+        self.main_layout.addLayout(self._build_activity_row())
         self.main_layout.addLayout(self._build_metric_cards())
         self.main_layout.addLayout(self._build_row1())
         self.main_layout.addLayout(self._build_row2())
@@ -1001,7 +1011,7 @@ class DashboardPage(PredictionMixin, QWidget):
         lbl_header = QLabel("DASHBOARD")
         lbl_header.setObjectName("header")
 
-        lbl_sub = QLabel("AI-powered student risk monitoring overview")
+        lbl_sub = QLabel("")
         lbl_sub.setObjectName("subHeader")
 
         self._last_run_lbl = QLabel("Last prediction run: Not yet run")
@@ -1230,6 +1240,110 @@ class DashboardPage(PredictionMixin, QWidget):
         self._activity_log = ActivityLogPanel()
         return self._activity_log
 
+    def _build_activity_row(self) -> QHBoxLayout:
+        """Recent Activity (left) + Model Status (right), side by side —
+        Recent Activity used to run full-width and take up too much
+        vertical space; splitting the row like this both shrinks its
+        footprint and gives the model/last-run info a home instead of
+        being buried only in the header pill."""
+        row = QHBoxLayout()
+        row.setSpacing(20)
+        row.addWidget(self._activity_log_widget(), 2)
+        row.addWidget(self._build_model_status_card(), 1)
+        return row
+
+    def _build_model_status_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("activityCard")   # reuse Recent Activity's exact card style
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(24, 18, 24, 18)
+        outer.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title = QLabel("Model Status")
+        title.setObjectName("cardTitle")
+        self._model_status_dot = QLabel("●")
+        self._model_status_text = QLabel("Idle")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self._model_status_dot)
+        header.addWidget(self._model_status_text)
+        outer.addLayout(header)
+
+        self._model_term_lbl = QLabel("")
+        self._model_term_lbl.setObjectName("analyticsText")
+        outer.addWidget(self._model_term_lbl)
+
+        self._model_lastrun_lbl = QLabel("")
+        self._model_lastrun_lbl.setObjectName("analyticsText")
+        outer.addWidget(self._model_lastrun_lbl)
+
+        outer.addSpacing(6)
+
+        strip_label = QLabel("RECENT SCORES")
+        strip_label.setStyleSheet(
+            "color:rgba(255,255,255,0.30); font-size:10px; font-weight:700; "
+            "letter-spacing:0.8px; background:transparent;")
+        outer.addWidget(strip_label)
+
+        self._score_strip_host = QFrame()
+        strip_lo = QHBoxLayout(self._score_strip_host)
+        strip_lo.setContentsMargins(0, 4, 0, 0)
+        strip_lo.setSpacing(6)
+        self._score_strip_host.setFixedHeight(48)
+        outer.addWidget(self._score_strip_host)
+
+        self._show_empty_model_status()
+        return card
+
+    def _update_model_status_card(self, result) -> None:
+        self._model_status_dot.setStyleSheet(
+            "color:#34d399; font-size:11px; background:transparent;")
+        self._model_status_text.setText("Active")
+        self._model_status_text.setStyleSheet(
+            "color:#34d399; font-size:12px; font-weight:600; background:transparent;")
+        self._model_term_lbl.setText(f"Term: {SystemConfig.term_label()}")
+
+        last_run = DataStore.get().last_prediction_run
+        self._model_lastrun_lbl.setText(
+            f"Last run: {last_run}" if last_run else "Last run: Just now")
+
+        self._clear_layout(self._score_strip_host.layout())
+        preds = (result.predictions or [])[:10]
+        if not preds:
+            empty = QLabel("No scores yet.")
+            empty.setObjectName("analyticsText")
+            self._score_strip_host.layout().addWidget(empty)
+        else:
+            colors = {"high_risk": "#ff5b5b", "moderate_risk": "#f5b335"}
+            for p in preds:
+                score = p.get("score", 0)
+                color = colors.get(p.get("category", "low_risk"), "#34d399")
+                bar = QFrame()
+                bar.setFixedWidth(14)
+                bar.setFixedHeight(max(6, int(40 * min(score, 100) / 100)))
+                bar.setStyleSheet(f"background:{color}; border-radius:3px;")
+                bar.setToolTip(f"{p.get('name', '—')}: {score:.1f}%")
+                self._score_strip_host.layout().addWidget(
+                    bar, 0, Qt.AlignmentFlag.AlignBottom)
+            self._score_strip_host.layout().addStretch()
+
+    def _show_empty_model_status(self) -> None:
+        self._model_status_dot.setStyleSheet(
+            "color:rgba(255,255,255,0.25); font-size:11px; background:transparent;")
+        self._model_status_text.setText("Idle")
+        self._model_status_text.setStyleSheet(
+            "color:rgba(255,255,255,0.40); font-size:12px; background:transparent;")
+        self._model_term_lbl.setText(f"Term: {SystemConfig.term_label()}")
+        self._model_lastrun_lbl.setText("Last run: Not yet run")
+        self._clear_layout(self._score_strip_host.layout())
+        empty = QLabel("No predictions yet.")
+        empty.setObjectName("analyticsText")
+        self._score_strip_host.layout().addWidget(empty)
+
+
+
     # ── Metric cards ──────────────────────────────────────────────────────────
 
     def _build_metric_cards(self) -> QHBoxLayout:
@@ -1402,8 +1516,8 @@ class DashboardPage(PredictionMixin, QWidget):
         outer.setSpacing(14)
 
         title_row = QHBoxLayout()
-        cov_title = QLabel("DATA SOURCE COVERAGE")
-        cov_title.setObjectName("coverageTitle")
+        cov_title = QLabel("Data Source Coverage")
+        cov_title.setObjectName("cardTitle")
         title_row.addWidget(cov_title)
         title_row.addStretch()
 
@@ -1500,9 +1614,18 @@ class DashboardPage(PredictionMixin, QWidget):
     # ── UI factory helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def _analytics_panel(min_height: int = 0) -> QFrame:
+    def _analytics_panel(min_height: int = 0, accent: str = "#4f8cff") -> QFrame:
         panel = QFrame()
         panel.setObjectName("analyticsPanel")
+        panel.setStyleSheet(f"#analyticsPanel {{ border-top: 4px solid {accent}; }}")
+
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(26)
+        shadow.setXOffset(0)
+        shadow.setYOffset(6)
+        shadow.setColor(QColor(0, 0, 0, 90))
+        panel.setGraphicsEffect(shadow)
+
         if min_height:
             panel.setMinimumHeight(min_height)
         lo = QVBoxLayout(panel)
